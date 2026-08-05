@@ -659,6 +659,9 @@ struct llama_model {
     const float * tensor_split() const;
 
     uint32_t n_gpu_layers() const;
+
+    // number of leading layers whose MoE experts stay in VRAM; -1 when unset
+    int32_t n_cache_layers() const;
     llama_split_mode split_mode() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;

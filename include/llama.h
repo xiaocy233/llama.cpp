@@ -331,6 +331,16 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // MoE expert caching. n_cache_layers is the number of leading layers whose experts stay in
+        // VRAM; the rest stream from host memory, and setting it (>= 0) also turns on prefetching of
+        // those streamed weights. -1 leaves the placement to the tensor overrides and keeps the
+        // upstream behaviour of copying the weights synchronously before each use.
+        int32_t n_cache_layers;
+
+        // number of expert slots to keep in VRAM for each layer whose experts live in host memory.
+        // 0 disables the slot cache, so every expert a token uses is copied for that token.
+        int32_t n_cache_slots;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data

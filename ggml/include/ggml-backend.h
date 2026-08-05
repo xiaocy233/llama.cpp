@@ -317,6 +317,13 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // Enable prefetching of host-resident MoE expert weights onto an auxiliary stream, so the copies
+    // overlap the compute instead of being serialized before it. ring_depth is the number of expert
+    // tensors kept in flight; 0 disables it. Values below the internal minimum are raised.
+    //
+    // Must be called before the first reserve: the ring changes the graph and the compute buffer size.
+    GGML_API void                 ggml_backend_sched_set_weight_prefetch(ggml_backend_sched_t sched, int ring_depth);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success

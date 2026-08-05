@@ -137,6 +137,14 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph);
+
+        // (optional) select an auxiliary stream for subsequent async operations issued on this backend
+        // (set_tensor_async / event_record / event_wait). returns the previously selected stream index,
+        // or -1 if the backend does not support multiple streams - the caller must then keep everything
+        // on the default stream.
+        // used by the scheduler to overlap host->device weight copies with compute
+        // note: must be added at the end of this struct, the backend ifaces are positionally initialized
+        int                       (*select_stream)     (ggml_backend_t backend, int stream);
     };
 
     struct ggml_backend {

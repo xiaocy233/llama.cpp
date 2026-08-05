@@ -515,6 +515,12 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
+    // MoE expert placement. --n-cpu-moe keeps the *last* layers fully in VRAM; --n-cache-layers is
+    // its mirror image and keeps the *first* N there instead. Layers that are in neither set stream
+    // their experts from the host, and --n-cache-slots sizes the per-layer VRAM cache for those.
+    int32_t n_cache_layers = -1;   // shallow layers kept fully in VRAM, -1 = unset
+    int32_t n_cache_slots  = 0;    // expert slots per streaming layer, 0 = no slot cache
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
@@ -1087,6 +1093,59 @@ const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 //
 
 const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+
+// upper bound on block indices when generating per-layer patterns before the model is loaded
+constexpr int LLAMA_MAX_BLOCK_INDEX = 512;
+
+// One pattern matching every block index from `first` upwards.
+//
+// The loader rebuilds a std::regex for each (tensor, override) pair, so both the number of overrides
+// and the size of each pattern cost load time. Enumerating every index either way is expensive -
+// measured 4.0 s as one override per block and 7.7 s as a single 496-branch alternation, against
+// 1.8 s for the ~24 overrides that --n-cpu-moe emits.
+//
+// So decompose ">= first" into digit ranges instead: a handful of branches, no upper bound needed.
+// For first = 16 this yields (16|1[7-9]|[2-9][0-9]|[0-9]{3,}).
+inline std::string llm_ffn_exps_blocks_from_regex(int first) {
+    if (first <= 0) {
+        return string_format("blk\\.[0-9]+%s", LLM_FFN_EXPS_REGEX);
+    }
+
+    const std::string n = std::to_string(first);
+    const size_t      d = n.size();
+
+    std::vector<std::string> alts;
+    alts.push_back(n);   // first itself
+
+    // same digit count, strictly greater: fix a prefix, raise one digit, wildcard the rest
+    for (size_t i = d; i-- > 0; ) {
+        if (n[i] == '9') {
+            continue;
+        }
+        std::string alt = n.substr(0, i);
+        // a leading digit cannot be 0, and n[0] != '0' already holds for a value >= 1
+        alt += string_format("[%c-9]", n[i] + 1);
+        alt += std::string(d - i - 1, 'x');
+        // replace the placeholders with digit classes
+        std::string expanded;
+        for (char c : alt) {
+            expanded += (c == 'x') ? std::string("[0-9]") : std::string(1, c);
+        }
+        alts.push_back(expanded);
+    }
+
+    // anything with more digits is necessarily larger
+    alts.push_back(string_format("[0-9]{%zu,}", d + 1));
+
+    std::string joined;
+    for (const auto & a : alts) {
+        if (!joined.empty()) {
+            joined += "|";
+        }
+        joined += a;
+    }
+    return string_format("blk\\.(%s)%s", joined.c_str(), LLM_FFN_EXPS_REGEX);
+}
 
 inline std::string llm_ffn_exps_block_regex(int idx) {
     return string_format("blk\\.%d%s", idx, LLM_FFN_EXPS_REGEX);

@@ -31,6 +31,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <set>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1664,6 +1665,113 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Report where the MoE expert weights ended up, grouped by the buffer holding them, so the
+    // memory split can be checked against the plan up front instead of inferred from an OOM later.
+    // Has to come after load_all_data: with mmap the tensor -> buffer binding is only complete here.
+    //
+    // Grouping by buffer name rather than by a host/device predicate is deliberate: on a unified
+    // memory backend every buffer is host-accessible, so is_host() cannot tell a resident layer from
+    // a streaming one. The name is unambiguous everywhere and matches the "model buffer size" lines.
+    {
+        struct expert_group {
+            int    n_layers   = 0;
+            size_t bytes      = 0;
+            int    first      = -1;
+            int    last       = -1;
+            size_t max_tensor = 0;   // largest single tensor; this is what a prefetch ring must hold
+            bool   is_host    = false;
+        };
+        std::map<std::string, expert_group> groups;
+        std::set<std::pair<std::string, int>> seen;   // (buffer, layer), so a layer counts once each
+
+        int64_t n_expert = 0;
+
+        // Walk the tensors the loader actually placed rather than the typed per-layer fields: the
+        // field set differs between architectures (separate gate/up/down, fused gate_up, chexps),
+        // and missing one silently drops those layers from the report. The name is ground truth.
+        for (const auto & [name, t] : tensors_by_name) {
+            if (t == nullptr || t->buffer == nullptr) {
+                continue;
+            }
+            int il = -1;
+            if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < 0) {
+                continue;
+            }
+            if (name.find("ffn_") == std::string::npos || name.find("_exps") == std::string::npos) {
+                continue;
+            }
+            // the per-expert bias and scale companions are tiny and are not what gets streamed
+            if (name.find("_exps_b") != std::string::npos || name.find("_exps_s") != std::string::npos) {
+                continue;
+            }
+
+            const char * bname = ggml_backend_buffer_name(t->buffer);
+            const std::string buf = bname ? bname : "?";
+
+            expert_group & g = groups[buf];
+            g.is_host = ggml_backend_buffer_is_host(t->buffer);
+            g.bytes  += ggml_nbytes(t);
+            n_expert  = std::max(n_expert, t->ne[2]);
+
+            if (seen.insert({ buf, il }).second) {
+                g.n_layers++;
+                g.first = g.first < 0 ? il : std::min(g.first, il);
+                g.last  = std::max(g.last, il);
+            }
+            g.max_tensor = std::max(g.max_tensor, ggml_nbytes(t));
+        }
+
+        // an empty map means this is not a MoE model, or its expert tensors are named in a way the
+        // filter above does not cover - either way there is nothing to report
+        if (!groups.empty()) {
+            const double mib = 1024.0 * 1024.0;
+
+            size_t host_bytes  = 0;
+            int    host_layers = 0;
+            bool   pinned      = false;
+
+            LLAMA_LOG_INFO("%s: MoE expert layout, %d experts per layer\n", __func__, (int) n_expert);
+
+            for (const auto & [name, g] : groups) {
+                LLAMA_LOG_INFO("%s: %12s : %3d layers (%2d..%-2d) = %9.2f MiB, %.2f per layer, largest tensor %.2f\n",
+                        __func__, name.c_str(), g.n_layers, g.first, g.last,
+                        g.bytes / mib, g.bytes / mib / g.n_layers, g.max_tensor / mib);
+
+                if (g.is_host) {
+                    host_bytes  += g.bytes;
+                    host_layers += g.n_layers;
+                    // whether the host side is page-locked decides the transfer rate: falling back
+                    // to pageable adds a driver staging copy and roughly halves it. A buffer name
+                    // ending in _Host is pinned, a plain CPU name is not.
+                    pinned = pinned || name.find("_Host") != std::string::npos;
+                }
+            }
+
+            // with nothing host-resident there is no transfer to describe and no slot cache to size
+            if (host_layers > 0) {
+                LLAMA_LOG_INFO("%s:   host-side experts: %9.2f MiB over %d layers, %s\n",
+                        __func__, host_bytes / mib, host_layers,
+                        pinned ? "page-locked (full DMA rate)"
+                               : "pageable (driver staging copy, roughly half rate)");
+
+                // projection only - the slot cache itself does not exist yet, this just states what
+                // the requested size would cost so the budget can be checked before a run
+                if (params.n_cache_slots > 0 && n_expert > 0) {
+                    const double per_expert = (double) host_bytes / host_layers / (double) n_expert;
+                    const double slot_bytes = per_expert * params.n_cache_slots * host_layers;
+
+                    LLAMA_LOG_INFO("%s:   slot cache (projected): %d layers x %d slots x %.3f MiB = %9.2f MiB\n",
+                            __func__, host_layers, params.n_cache_slots, per_expert / mib, slot_bytes / mib);
+
+                    if (params.n_cache_slots >= n_expert) {
+                        LLAMA_LOG_WARN("%s:   %d slots covers all %d experts, these layers may as well be resident\n",
+                                __func__, params.n_cache_slots, (int) n_expert);
+                    }
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -1709,6 +1817,10 @@ const float * llama_model::tensor_split() const {
 uint32_t llama_model::n_gpu_layers() const {
     // note: plus 1 for the "output" layer
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
+}
+
+int32_t llama_model::n_cache_layers() const {
+    return params.n_cache_layers;
 }
 
 llama_split_mode llama_model::split_mode() const {
@@ -2448,6 +2560,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.n_cache_layers              =*/ -1,
+        /*.n_cache_slots               =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

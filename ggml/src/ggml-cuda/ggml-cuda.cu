@@ -2403,6 +2403,22 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
+// select an auxiliary stream for subsequent async operations. Used by the scheduler to issue
+// host->device weight copies concurrently with compute (see GGML_SCHED_PREFETCH_WEIGHTS).
+// note: this also switches the per-stream memory pool, which is harmless for plain memcpy.
+static int ggml_backend_cuda_select_stream(ggml_backend_t backend, int stream) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    if (stream < 0 || stream >= GGML_CUDA_MAX_STREAMS) {
+        return -1;
+    }
+
+    const int prev = cuda_ctx->curr_stream_no;
+    cuda_ctx->curr_stream_no = stream;
+
+    return prev;
+}
+
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -4456,6 +4472,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    /* .select_stream           = */ ggml_backend_cuda_select_stream,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

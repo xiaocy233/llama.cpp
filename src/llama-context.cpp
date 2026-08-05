@@ -79,6 +79,11 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// Ring depth for the MoE weight prefetch. 3 is the measured knee on an RTX 5060 over an 8188-token
+// prefill: 1574 t/s at depth 2, 1810 at depth 3, for 18 MiB more compute buffer. Deeper was not
+// measured, and the transfer is already almost fully hidden at 3.
+static constexpr int LLAMA_MOE_PREFETCH_RING_DEPTH = 3;
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -598,6 +603,13 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    // --n-cache-layers pins the leading layers' experts in VRAM and streams the rest, so those
+    // streamed copies are worth overlapping with the compute. Has to happen before the first
+    // reserve: the prefetch ring changes the graph and therefore the compute buffer size.
+    if (model.n_cache_layers() >= 0) {
+        ggml_backend_sched_set_weight_prefetch(sched.get(), LLAMA_MOE_PREFETCH_RING_DEPTH);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
