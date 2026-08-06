@@ -774,7 +774,7 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
-// ring depth for GGML_SCHED_PREFETCH_WEIGHTS
+// ring depth for the weight prefetch (ggml_backend_sched_set_weight_prefetch)
 // note: must be outside the GGML_SCHED_MAX_COPIES guard, that one is set by CMake
 #ifndef GGML_SCHED_MAX_PREFETCH_SLOTS
 // one entry is one expert matrix, so a layer's worth of gate/up/down is three entries. 12 leaves
@@ -793,6 +793,10 @@ static_assert(GGML_SCHED_MIN_PREFETCH_SLOTS >= 2,
 static_assert(GGML_SCHED_MIN_PREFETCH_SLOTS <= GGML_SCHED_MAX_PREFETCH_SLOTS,
         "the prefetch ring minimum cannot exceed the maximum");
 
+// auxiliary stream the prefetch copies are issued on. stream 0 is the compute stream, so anything
+// else gives concurrency; backends without an auxiliary stream ignore this and stay serialized.
+#define GGML_SCHED_PREFETCH_STREAM_INDEX 1
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -802,6 +806,34 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
+};
+
+#ifndef GGML_SCHED_MAX_MOE_CACHES
+#define GGML_SCHED_MAX_MOE_CACHES 128
+#endif
+
+// Per-layer state for one MoE slot cache. The device side is the caller's `slots` tensors; this is
+// the host-side bookkeeping that decides what goes where.
+struct ggml_moe_slot_state {
+    struct ggml_moe_slot_cache cache;
+
+    int n_expert;
+    int n_slots;
+    int n_expert_used;
+    size_t expert_nb[3];        // bytes of one expert in each matrix
+
+    int32_t  * slot_of_expert;  // [n_expert]  -1 = not resident. mirrors slot_map
+    int32_t  * expert_of_slot;  // [n_slots]   -1 = empty
+    uint32_t * freq;            // [n_expert]  LFU counter
+    uint32_t * pinned;          // [n_slots]   epoch of the last hit; a slot pinned this token is
+                                //             being read by the GPU and must not be overwritten
+    int      n_filled;
+    uint32_t epoch;             // bumped once per fill, i.e. once per token for this layer
+
+    uint64_t n_hit;
+    uint64_t n_miss;
+    uint64_t n_fill_bytes;
+    uint64_t n_tokens;
 };
 
 struct ggml_backend_sched {
@@ -867,7 +899,15 @@ struct ggml_backend_sched {
     // abort at the offending split instead of subtly wrong output.
     bool prefetch_verify;
 
-    // env: GGML_SCHED_PREFETCH_WEIGHTS
+    // MoE expert slot caches, registered by the caller before the first reserve.
+    // Fixed array rather than a vector: the sched is calloc'd, so no member may need construction.
+    struct ggml_moe_slot_state * moe_caches[GGML_SCHED_MAX_MOE_CACHES];
+    int  n_moe_caches;
+    bool moe_debug;   // env: GGML_SCHED_MOE_SLOT_DEBUG
+    bool moe_stats;   // env: GGML_SCHED_MOE_SLOT_STATS
+    bool moe_verify;  // env: GGML_SCHED_MOE_SLOT_VERIFY
+
+    // set through ggml_backend_sched_set_weight_prefetch
     // Overlap host->device MoE expert weight copies with compute: the copy for the next qualifying
     // split is issued on an auxiliary stream while the current split computes, and the consuming
     // split waits on a per-slot event instead of a full device synchronize.
@@ -879,7 +919,6 @@ struct ggml_backend_sched {
     //    cannot be issued ahead of the previous split's compute
     // 0 disables the feature (default)
     int prefetch_slots;   // ring depth, 0 = disabled
-    int prefetch_stream;  // auxiliary stream index used for the copies
     bool prefetch_reported;
 
     // ev_copy[i] signals "entry i mod slots has landed"
@@ -1758,6 +1797,174 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Fill the experts this token needs into their slots, then publish the table.
+//
+// Called for a split about to run on the CPU backend that contains the remap GET_ROWS. At that point
+// the scheduler has already copied ids to the host (see the input loop: for a CPU split the copy is
+// synchronous), and the remap has not read the table yet - so this is the one place where the host
+// knows which experts are needed and can still change where they live.
+static void ggml_backend_sched_moe_fill(
+        ggml_backend_sched_t sched, struct ggml_moe_slot_state * st,
+        const int32_t * ids, int n_ids, ggml_backend_t dev_backend) {
+    st->n_tokens++;
+
+    int n_hit = 0;
+    int n_miss = 0;
+
+    for (int i = 0; i < n_ids; i++) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= st->n_expert) {
+            continue;   // padding or a malformed id: the consumer would fault on it anyway
+        }
+
+        int32_t v = st->slot_of_expert[e];
+        if (v >= 0) {
+            st->freq[e]++;
+            st->pinned[v] = st->epoch;   // in use this token, do not evict below
+            n_hit++;
+            continue;
+        }
+
+        // miss: take a free slot if there is one, else evict the least frequently used slot that is
+        // not already serving this token
+        if (st->n_filled < st->n_slots) {
+            v = st->n_filled++;
+        } else {
+            uint32_t best = UINT32_MAX;
+            v = -1;
+            for (int c = 0; c < st->n_slots; c++) {
+                if (st->pinned[c] == st->epoch) {
+                    continue;
+                }
+                const int32_t occupant = st->expert_of_slot[c];
+                const uint32_t f = occupant >= 0 ? st->freq[occupant] : 0;
+                if (f < best) {
+                    best = f;
+                    v    = c;
+                }
+            }
+            // n_slots >= n_expert_used is checked at registration, so at most n_expert_used - 1 slots
+            // can be pinned when we get here and a victim always exists
+            GGML_ASSERT(v >= 0);
+            if (st->expert_of_slot[v] >= 0) {
+                st->slot_of_expert[st->expert_of_slot[v]] = -1;
+            }
+        }
+
+        for (int m = 0; m < 3; m++) {
+            if (st->cache.src[m] == NULL) {
+                continue;
+            }
+            const size_t nb = st->expert_nb[m];
+            ggml_backend_tensor_set(st->cache.slots[m],
+                    (const char *) st->cache.src[m]->data + (size_t) e * nb,
+                    (size_t) v * nb, nb);
+            st->n_fill_bytes += nb;
+        }
+
+        st->slot_of_expert[e] = v;
+        st->expert_of_slot[v] = e;
+        st->freq[e]++;
+        st->pinned[v] = st->epoch;
+        n_miss++;
+    }
+
+    // publish: the remap reads this during the CPU split's compute, right after we return
+    int32_t * map = (int32_t *) st->cache.slot_map->data;
+    for (int e = 0; e < st->n_expert; e++) {
+        map[e] = st->slot_of_expert[e];
+    }
+
+    st->n_hit  += n_hit;
+    st->n_miss += n_miss;
+    st->epoch++;
+
+    if (sched->moe_debug) {
+        char buf[512];
+        int  off = snprintf(buf, sizeof(buf), "MOE L%-2d hit=%d miss=%d ids=", st->cache.layer, n_hit, n_miss);
+        for (int i = 0; i < n_ids && off < (int) sizeof(buf) - 24; i++) {
+            off += snprintf(buf + off, sizeof(buf) - off, "%d%s", ids[i], i + 1 < n_ids ? "," : "");
+        }
+        off += snprintf(buf + off, sizeof(buf) - off, " slot=");
+        for (int i = 0; i < n_ids && off < (int) sizeof(buf) - 12; i++) {
+            const int32_t e = ids[i];
+            off += snprintf(buf + off, sizeof(buf) - off, "%d%s",
+                    (e >= 0 && e < st->n_expert) ? st->slot_of_expert[e] : -1, i + 1 < n_ids ? "," : "");
+        }
+        GGML_LOG_INFO("%s\n", buf);
+    }
+
+    if (sched->moe_verify) {
+        // read every expert this token needs back from its slot and compare against the host source.
+        // a mismatch means the table and the slot contents disagree.
+        std::vector<uint8_t> tmp;
+        for (int i = 0; i < n_ids; i++) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= st->n_expert) {
+                continue;
+            }
+            const int32_t v = st->slot_of_expert[e];
+            GGML_ASSERT(v >= 0 && v < st->n_slots);
+            for (int m = 0; m < 3; m++) {
+                if (st->cache.src[m] == NULL) {
+                    continue;
+                }
+                const size_t nb = st->expert_nb[m];
+                tmp.resize(nb);
+                ggml_backend_tensor_get(st->cache.slots[m], tmp.data(), (size_t) v * nb, nb);
+                const char * ref = (const char *) st->cache.src[m]->data + (size_t) e * nb;
+                if (memcmp(tmp.data(), ref, nb) != 0) {
+                    size_t bad = 0;
+                    while (bad < nb && tmp[bad] == (uint8_t) ref[bad]) {
+                        bad++;
+                    }
+                    GGML_LOG_ERROR("%s: MOE SLOT VERIFY FAILED\n", __func__);
+                    GGML_LOG_ERROR("  layer=%d expert=%d slot=%d matrix=%d nbytes=%zu first mismatch at %zu\n",
+                            st->cache.layer, e, v, m, nb, bad);
+                    GGML_ABORT("moe slot cache served the wrong expert");
+                }
+            }
+        }
+    }
+
+    GGML_UNUSED(dev_backend);
+}
+
+// Look for the remap in this split and fill through it. Returns the number of caches serviced.
+static int ggml_backend_sched_moe_fill_split(
+        ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, ggml_backend_t backend) {
+    int n = 0;
+
+    for (int i = 0; i < split->graph.n_nodes; i++) {
+        struct ggml_tensor * node = split->graph.nodes[i];
+        if (node->op != GGML_OP_GET_ROWS || node->src[0] == NULL || node->src[1] == NULL) {
+            continue;
+        }
+
+        struct ggml_moe_slot_state * st = NULL;
+        for (int c = 0; c < sched->n_moe_caches; c++) {
+            if (sched->moe_caches[c]->cache.slot_map == node->src[0]) {
+                st = sched->moe_caches[c];
+                break;
+            }
+        }
+        if (st == NULL) {
+            continue;
+        }
+
+        // src[1] is the scheduler's host-side copy of ids for this split, already populated
+        struct ggml_tensor * ids_t = node->src[1];
+        GGML_ASSERT(ids_t->type == GGML_TYPE_I32);
+        GGML_ASSERT(ids_t->buffer != NULL && ggml_backend_buffer_is_host(ids_t->buffer));
+
+        ggml_backend_sched_moe_fill(sched, st, (const int32_t *) ids_t->data,
+                (int) ggml_nelements(ids_t), backend);
+        n++;
+    }
+
+    return n;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1767,7 +1974,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<ggml_bitset_t> used_ids;
     std::vector<uint8_t> verify_buf;   // GGML_SCHED_PREFETCH_VERIFY only
 
-    // ---- weight prefetch (env: GGML_SCHED_PREFETCH_WEIGHTS) ----
+    // ---- weight prefetch (ggml_backend_sched_set_weight_prefetch) ----
     // The entry list must match the one ggml_backend_sched_split_graph built, because that is where
     // the copy nodes were hoisted to. Both are derived from the same predicate over the same splits,
     // so they agree by construction.
@@ -1841,7 +2048,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     k, e.split, slot, in->name, (void *) in_cpy->data, ggml_nbytes(in));
         }
 
-        const int prev_stream = ggml_backend_select_stream(bk, sched->prefetch_stream);
+        const int prev_stream = ggml_backend_select_stream(bk, GGML_SCHED_PREFETCH_STREAM_INDEX);
 
         // report once whether the copies actually landed on a separate stream. without it the
         // prefetch is correct but serialized, i.e. no speedup is possible.
@@ -1852,7 +2059,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                               "stream: correct but NOT concurrent (no speedup expected)\n", __func__);
             } else {
                 GGML_LOG_WARN("%s: weight copies issued on stream %d, compute on stream %d\n",
-                        __func__, sched->prefetch_stream, prev_stream);
+                        __func__, GGML_SCHED_PREFETCH_STREAM_INDEX, prev_stream);
             }
         }
 
@@ -1950,7 +2157,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
-                    // env: GGML_SCHED_FULL_WEIGHT_COPY
+                    // full_weight_copy, set together with the prefetch ring
                     //
                     // Determining which experts are used requires reading the ids tensor back to the host,
                     // which serializes on the router of this very layer. That data dependency makes it
@@ -1960,8 +2167,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // selected, the used-experts scan copies the whole tensor anyway, so skipping it costs
                     // no extra bytes and removes the dependency.
                     //
-                    // This probe measures the cost of that dependency (ids D2H + 2 synchronizes + the
-                    // host-side bitset loop). It is a measurement instrument, not the overlap itself.
+                    // The n_assign >= n_expert gate is what keeps decode on the used-experts path: with
+                    // one token there are only n_expert_used assignments, so copying whole tensors
+                    // would move far more bytes than needed.
                     if (sched->full_weight_copy && node->op == GGML_OP_MUL_MAT_ID) {
                         ggml_tensor * ids = node->src[2];
 
@@ -2087,6 +2295,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             n_issued++;
         }
 
+        // MoE slot cache: if this split holds the remap, ids has just been copied in and the table
+        // has not been read yet - fill the missing experts and publish the mapping now.
+        if (sched->n_moe_caches > 0) {
+            ggml_backend_sched_moe_fill_split(sched, split, split_backend);
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2169,8 +2383,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * GGML_SCHED_PREFETCH_VERIFY = getenv("GGML_SCHED_PREFETCH_VERIFY");
     sched->prefetch_verify = GGML_SCHED_PREFETCH_VERIFY ? (atoi(GGML_SCHED_PREFETCH_VERIFY) != 0) : false;
 
-    const char * GGML_SCHED_PREFETCH_STREAM = getenv("GGML_SCHED_PREFETCH_STREAM");
-    sched->prefetch_stream = GGML_SCHED_PREFETCH_STREAM ? atoi(GGML_SCHED_PREFETCH_STREAM) : 1;
+    const char * GGML_SCHED_MOE_SLOT_DEBUG  = getenv("GGML_SCHED_MOE_SLOT_DEBUG");
+    const char * GGML_SCHED_MOE_SLOT_STATS  = getenv("GGML_SCHED_MOE_SLOT_STATS");
+    const char * GGML_SCHED_MOE_SLOT_VERIFY = getenv("GGML_SCHED_MOE_SLOT_VERIFY");
+
+    sched->moe_debug  = GGML_SCHED_MOE_SLOT_DEBUG  ? (atoi(GGML_SCHED_MOE_SLOT_DEBUG)  != 0) : false;
+    sched->moe_stats  = GGML_SCHED_MOE_SLOT_STATS  ? (atoi(GGML_SCHED_MOE_SLOT_STATS)  != 0) : false;
+    sched->moe_verify = GGML_SCHED_MOE_SLOT_VERIFY ? (atoi(GGML_SCHED_MOE_SLOT_VERIFY) != 0) : false;
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
@@ -2227,6 +2446,132 @@ ggml_backend_sched_t ggml_backend_sched_new(
     ggml_backend_sched_reset(sched);
 
     return sched;
+}
+
+bool ggml_backend_sched_add_moe_slot_cache(
+        ggml_backend_sched_t sched, const struct ggml_moe_slot_cache * cache, int n_expert_used) {
+    GGML_ASSERT(sched != NULL);
+    GGML_ASSERT(cache != NULL);
+
+    if (sched->n_moe_caches >= GGML_SCHED_MAX_MOE_CACHES) {
+        GGML_LOG_WARN("%s: registry full (%d), layer %d not cached\n",
+                __func__, GGML_SCHED_MAX_MOE_CACHES, cache->layer);
+        return false;
+    }
+
+    if (cache->slot_map == NULL || cache->slot_map->type != GGML_TYPE_I32) {
+        GGML_LOG_WARN("%s: layer %d slot_map must be a non-null I32 tensor\n", __func__, cache->layer);
+        return false;
+    }
+    // the remap has to land on the CPU backend for ids to be brought to the host, and that only
+    // happens if the table it reads is host-resident
+    if (cache->slot_map->buffer == NULL || !ggml_backend_buffer_is_host(cache->slot_map->buffer)) {
+        GGML_LOG_WARN("%s: layer %d slot_map must live in host memory\n", __func__, cache->layer);
+        return false;
+    }
+
+    int    n_expert = -1;
+    int    n_slots  = -1;
+    size_t nb[3]    = { 0, 0, 0 };
+
+    for (int m = 0; m < 3; m++) {
+        if (cache->src[m] == NULL) {
+            if (cache->slots[m] != NULL) {
+                GGML_LOG_WARN("%s: layer %d matrix %d has slots but no src\n", __func__, cache->layer, m);
+                return false;
+            }
+            continue;
+        }
+        if (cache->slots[m] == NULL) {
+            GGML_LOG_WARN("%s: layer %d matrix %d has src but no slots\n", __func__, cache->layer, m);
+            return false;
+        }
+        // one expert is one ne[2] slice, so the first two dimensions and the type must agree
+        if (cache->src[m]->ne[0] != cache->slots[m]->ne[0] ||
+            cache->src[m]->ne[1] != cache->slots[m]->ne[1] ||
+            cache->src[m]->type  != cache->slots[m]->type) {
+            GGML_LOG_WARN("%s: layer %d matrix %d shape/type mismatch between src and slots\n",
+                    __func__, cache->layer, m);
+            return false;
+        }
+        if (cache->src[m]->buffer == NULL || !ggml_backend_buffer_is_host(cache->src[m]->buffer)) {
+            GGML_LOG_WARN("%s: layer %d matrix %d src must live in host memory\n", __func__, cache->layer, m);
+            return false;
+        }
+        const int e = (int) cache->src[m]->ne[2];
+        const int v = (int) cache->slots[m]->ne[2];
+        if (n_expert < 0) { n_expert = e; n_slots = v; }
+        if (e != n_expert || v != n_slots) {
+            GGML_LOG_WARN("%s: layer %d matrix %d expert/slot count differs from the others\n",
+                    __func__, cache->layer, m);
+            return false;
+        }
+        nb[m] = cache->src[m]->nb[2];
+    }
+
+    if (n_expert < 0) {
+        GGML_LOG_WARN("%s: layer %d has no matrices\n", __func__, cache->layer);
+        return false;
+    }
+    if ((int) ggml_nelements(cache->slot_map) != n_expert) {
+        GGML_LOG_WARN("%s: layer %d slot_map has %d entries, expected %d\n",
+                __func__, cache->layer, (int) ggml_nelements(cache->slot_map), n_expert);
+        return false;
+    }
+    // a slot hit this token is being read by the consumer and cannot be evicted, so there must be at
+    // least as many slots as a token can use, otherwise a miss could find no victim
+    if (n_slots < n_expert_used) {
+        GGML_LOG_WARN("%s: layer %d has %d slots but a token uses %d experts\n",
+                __func__, cache->layer, n_slots, n_expert_used);
+        return false;
+    }
+
+    struct ggml_moe_slot_state * st =
+        (struct ggml_moe_slot_state *) calloc(1, sizeof(struct ggml_moe_slot_state));
+    st->cache         = *cache;
+    st->n_expert      = n_expert;
+    st->n_slots       = n_slots;
+    st->n_expert_used = n_expert_used;
+    for (int m = 0; m < 3; m++) {
+        st->expert_nb[m] = nb[m];
+    }
+    st->slot_of_expert = (int32_t  *) malloc(sizeof(int32_t)  * n_expert);
+    st->expert_of_slot = (int32_t  *) malloc(sizeof(int32_t)  * n_slots);
+    st->freq           = (uint32_t *) calloc(n_expert, sizeof(uint32_t));
+    st->pinned         = (uint32_t *) calloc(n_slots,  sizeof(uint32_t));
+    for (int e = 0; e < n_expert; e++) { st->slot_of_expert[e] = -1; }
+    for (int v = 0; v < n_slots;  v++) { st->expert_of_slot[v] = -1; }
+    st->n_filled = 0;
+    st->epoch    = 1;   // 0 means "never pinned", so start above it
+
+    // the table starts empty; the first token of every layer is all misses
+    int32_t * map = (int32_t *) cache->slot_map->data;
+    for (int e = 0; e < n_expert; e++) { map[e] = -1; }
+
+    sched->moe_caches[sched->n_moe_caches++] = st;
+
+    if (sched->moe_debug || sched->n_moe_caches == 1) {
+        GGML_LOG_INFO("%s: layer %2d registered, %d experts -> %d slots, %.2f MiB per matrix slice\n",
+                __func__, cache->layer, n_expert, n_slots,
+                (double) nb[0] / 1024.0 / 1024.0);
+    }
+    return true;
+}
+
+const struct ggml_moe_slot_cache * ggml_backend_sched_find_moe_slot_cache(
+        ggml_backend_sched_t sched, const struct ggml_tensor * src) {
+    if (sched == NULL || src == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < sched->n_moe_caches; i++) {
+        const struct ggml_moe_slot_cache * c = &sched->moe_caches[i]->cache;
+        for (int m = 0; m < 3; m++) {
+            if (c->src[m] == src) {
+                return c;
+            }
+        }
+    }
+    return NULL;
 }
 
 void ggml_backend_sched_set_weight_prefetch(ggml_backend_sched_t sched, int ring_depth) {
@@ -2290,7 +2635,7 @@ void ggml_backend_sched_set_weight_prefetch(ggml_backend_sched_t sched, int ring
     }
 
     GGML_LOG_INFO("%s: weight prefetch enabled, ring depth = %d, aux stream = %d\n",
-            __func__, sched->prefetch_slots, sched->prefetch_stream);
+            __func__, sched->prefetch_slots, GGML_SCHED_PREFETCH_STREAM_INDEX);
     GGML_LOG_INFO("%s: the used-experts scan is skipped, whole expert tensors are copied\n", __func__);
     GGML_LOG_INFO("%s: this grows the compute buffer by (ring depth - 1) x the largest host-resident "
                   "expert tensor; an out-of-memory here means the ring is too deep\n", __func__);
@@ -2305,6 +2650,23 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    for (int i = 0; i < sched->n_moe_caches; i++) {
+        struct ggml_moe_slot_state * st = sched->moe_caches[i];
+        if (sched->moe_stats && st->n_tokens > 0) {
+            const uint64_t n_use = st->n_hit + st->n_miss;
+            GGML_LOG_INFO("moe slot cache: L%-2d slots=%-4d tokens=%-6llu hit=%.4f miss/token=%.3f fill=%.1f MiB\n",
+                    st->cache.layer, st->n_slots, (unsigned long long) st->n_tokens,
+                    n_use ? (double) st->n_hit / (double) n_use : 0.0,
+                    (double) st->n_miss / (double) st->n_tokens,
+                    (double) st->n_fill_bytes / 1024.0 / 1024.0);
+        }
+        free(st->slot_of_expert);
+        free(st->expert_of_slot);
+        free(st->freq);
+        free(st->pinned);
+        free(st);
+    }
+    sched->n_moe_caches = 0;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);

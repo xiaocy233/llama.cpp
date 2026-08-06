@@ -317,6 +317,38 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // MoE expert slot cache.
+    //
+    // At decode a token touches only n_expert_used of the n_expert experts in a layer, so keeping a
+    // small per-layer cache of experts in device memory turns the per-token host read into a copy of
+    // just the ones that are missing. The three matrices of one expert (gate, up, down) share a slot
+    // index, so one table and one remap node cover the whole layer.
+    //
+    // The caller allocates everything and builds the graph as
+    //     MUL_MAT_ID(slots[m], b, get_rows(slot_map, ids))
+    // and this scheduler fills the missing experts and updates slot_map before the remap runs.
+    //
+    // slot_map must live in HOST memory with WEIGHTS usage. That is what puts the remap on the CPU
+    // backend (GET_ROWS reports batch size 0 and is never offloaded), which in turn makes ids a
+    // split input that the scheduler copies to the host - giving a point where ids is known and the
+    // table has not been read yet. With slot_map device-resident there is no such point.
+    struct ggml_moe_slot_cache {
+        struct ggml_tensor * src[3];     // host experts   [n_embd, n_ff, n_expert], NULL = skip
+        struct ggml_tensor * slots[3];   // device cache   [n_embd, n_ff, n_slots], same order
+        struct ggml_tensor * slot_map;   // HOST table     [1, n_expert] I32, -1 = not resident
+        int layer;                       // for logging only
+    };
+
+    // Register before the first reserve. Returns false if the registry is full or the cache is
+    // malformed (shape mismatch, slot_map not host-resident, n_slots < n_expert_used).
+    GGML_API bool ggml_backend_sched_add_moe_slot_cache(
+            ggml_backend_sched_t sched, const struct ggml_moe_slot_cache * cache, int n_expert_used);
+
+    // Look up the cache registered for a host expert tensor, NULL if there is none. Used by the
+    // graph builder to decide whether to emit the remap and substitute the slot tensor.
+    GGML_API const struct ggml_moe_slot_cache * ggml_backend_sched_find_moe_slot_cache(
+            ggml_backend_sched_t sched, const struct ggml_tensor * src);
+
     // Enable prefetching of host-resident MoE expert weights onto an auxiliary stream, so the copies
     // overlap the compute instead of being serialized before it. ring_depth is the number of expert
     // tensors kept in flight; 0 disables it. Values below the internal minimum are raised.

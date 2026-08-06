@@ -611,6 +611,24 @@ void llama_context::sched_reserve() {
         ggml_backend_sched_set_weight_prefetch(sched.get(), LLAMA_MOE_PREFETCH_RING_DEPTH);
     }
 
+    // Register the MoE expert slot caches. Has to happen before the first reserve: the remap node is
+    // only emitted for tensors that have a registered cache, so the graph shape depends on this.
+    if (!model.moe_slot_layers.empty()) {
+        int n_ok = 0;
+        for (const auto & L : model.moe_slot_layers) {
+            ggml_moe_slot_cache c = {};
+            for (int m = 0; m < 3; m++) {
+                c.src[m]   = L.src[m];
+                c.slots[m] = L.slots[m];
+            }
+            c.slot_map = L.slot_map;
+            c.layer    = L.layer;
+            n_ok += ggml_backend_sched_add_moe_slot_cache(sched.get(), &c, (int) model.hparams.n_expert_used) ? 1 : 0;
+        }
+        LLAMA_LOG_INFO("%s: MoE slot cache registered for %d/%d layers\n",
+                __func__, n_ok, (int) model.moe_slot_layers.size());
+    }
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);

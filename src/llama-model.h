@@ -660,6 +660,20 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
 
+    // MoE expert slot caches, one per streaming layer. Built after the weights are loaded and
+    // registered with the scheduler at context creation; empty when the feature is off.
+    // Kept on the model because the tensors must outlive every graph.
+    struct moe_slot_layer {
+        struct ggml_tensor * src[3]   = { nullptr, nullptr, nullptr };
+        struct ggml_tensor * slots[3] = { nullptr, nullptr, nullptr };
+        struct ggml_tensor * slot_map = nullptr;
+        int layer = -1;
+    };
+    std::vector<moe_slot_layer> moe_slot_layers;
+
+    // allocate the slot tensors for every host-resident MoE layer. n_slots <= 0 disables it.
+    void build_moe_slot_caches(int n_slots);
+
     // number of leading layers whose MoE experts stay in VRAM; -1 when unset
     int32_t n_cache_layers() const;
     llama_split_mode split_mode() const;

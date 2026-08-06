@@ -1001,6 +1001,16 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // MoE slot cache: the remap depends only on (slot_map, ids), and a layer's gate/up/down share
+    // both. Emitting it once per layer rather than once per matrix keeps the CPU-side remap - and
+    // the two split boundaries it creates - to one per layer. Fresh per graph, so no invalidation.
+    struct moe_slot_remap {
+        const ggml_tensor * slot_map;
+        const ggml_tensor * ids;
+        ggml_tensor       * ids_slot;
+    };
+    mutable std::vector<moe_slot_remap> moe_slot_remaps;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
