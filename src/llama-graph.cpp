@@ -1982,6 +1982,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * logits = nullptr;
 
+    // Expert prediction for the next cached layer, decode only.
+    //
+    // cur is the router's input: past the attention residual and this layer's ffn norm. Feeding it
+    // to the *next* layer's router is the cheapest possible guess at what that layer will select -
+    // the residual stream moves slowly, and the router is a plain matrix, so no extra weights and no
+    // training are involved. It is deliberately the simplest form; the input position, the weight
+    // and how far ahead to look are all things to vary later.
+    //
+    // Runs on the device next to the real router. The scheduler picks the result up at this layer's
+    // fill and prefetches. Nothing downstream reads it, so a bad guess cannot change the output.
+    if (n_tokens == 1) {
+        const ggml_moe_slot_cache * sc = ggml_backend_sched_find_moe_slot_cache(sched, up_exps);
+        if (sc == nullptr) {
+            sc = ggml_backend_sched_find_moe_slot_cache(sched, gate_exps);
+        }
+        if (sc && sc->pred_w && sc->pred_ids) {
+            ggml_tensor * pl = ggml_mul_mat(ctx0, sc->pred_w, cur);                  // [n_expert, 1]
+            ggml_tensor * pi = ggml_top_k(ctx0, pl, (int) sc->pred_ids->ne[0]);      // [n_pred, 1] I32
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, pi, sc->pred_ids));
+            cb(pl, "ffn_moe_pred_logits", il);
+        }
+    }
+
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {

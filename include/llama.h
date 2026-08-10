@@ -341,6 +341,12 @@ extern "C" {
         // 0 disables the slot cache, so every expert a token uses is copied for that token.
         int32_t n_cache_slots;
 
+        // number of experts to predict one layer ahead and prefetch into the slot cache. The guess
+        // comes from applying the next cached layer's router to this layer's hidden state. 0 = off,
+        // in which case every miss is fetched synchronously by the layer that needs it. Only has an
+        // effect together with n_cache_slots. A wrong guess costs bandwidth, never correctness.
+        int32_t n_cache_predict;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data

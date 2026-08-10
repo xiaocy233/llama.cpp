@@ -623,6 +623,9 @@ void llama_context::sched_reserve() {
             }
             c.slot_map = L.slot_map;
             c.layer    = L.layer;
+            c.pred_w      = L.pred_w;
+            c.pred_ids    = L.pred_ids;
+            c.pred_target = L.pred_target;
             n_ok += ggml_backend_sched_add_moe_slot_cache(sched.get(), &c, (int) model.hparams.n_expert_used) ? 1 : 0;
         }
         LLAMA_LOG_INFO("%s: MoE slot cache registered for %d/%d layers\n",

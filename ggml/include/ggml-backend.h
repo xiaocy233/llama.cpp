@@ -337,6 +337,24 @@ extern "C" {
         struct ggml_tensor * slots[3];   // device cache   [n_embd, n_ff, n_slots], same order
         struct ggml_tensor * slot_map;   // HOST table     [1, n_expert] I32, -1 = not resident
         int layer;                       // for logging only
+
+        // ---- expert prediction, optional ----
+        //
+        // Which experts a layer will route to is only known once its own router has run, by which
+        // point there is no time left to fetch anything. But the routers are plain matrices, so the
+        // target layer's router can be applied to this layer's hidden state instead: the residual
+        // stream moves slowly between layers, so the result is a usable guess one layer ahead.
+        //
+        // The caller multiplies pred_w with its hidden state, takes the top k, and copies that into
+        // pred_ids. This scheduler reads pred_ids back at this layer's fill - a point where the
+        // device is already synchronized, so it costs no extra stall - and prefetches those experts
+        // into layer pred_target's slots on an auxiliary stream.
+        //
+        // A wrong guess only wastes bandwidth: the target layer still fills whatever is missing
+        // synchronously, so the output does not depend on the prediction being right.
+        struct ggml_tensor * pred_w;      // router of layer pred_target, NULL = prediction off
+        struct ggml_tensor * pred_ids;    // DEVICE I32 [n_pred], written by the graph each token
+        int                  pred_target; // layer the prediction is for
     };
 
     // Register before the first reserve. Returns false if the registry is full or the cache is

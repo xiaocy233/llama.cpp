@@ -668,11 +668,18 @@ struct llama_model {
         struct ggml_tensor * slots[3] = { nullptr, nullptr, nullptr };
         struct ggml_tensor * slot_map = nullptr;
         int layer = -1;
+
+        // prediction for the next cached layer: its router, and where this layer's graph leaves the
+        // predicted expert numbers. Both null when prediction is off.
+        struct ggml_tensor * pred_w      = nullptr;
+        struct ggml_tensor * pred_ids    = nullptr;
+        int                  pred_target = -1;
     };
     std::vector<moe_slot_layer> moe_slot_layers;
 
     // allocate the slot tensors for every host-resident MoE layer. n_slots <= 0 disables it.
-    void build_moe_slot_caches(int n_slots);
+    // n_pred > 0 additionally wires the one-layer-ahead expert prediction.
+    void build_moe_slot_caches(int n_slots, int n_pred);
 
     // number of leading layers whose MoE experts stay in VRAM; -1 when unset
     int32_t n_cache_layers() const;

@@ -1667,7 +1667,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // the slot cache needs the weights placed, so this has to come after load_all_data
     if (params.n_cache_slots > 0) {
-        build_moe_slot_caches(params.n_cache_slots);
+        build_moe_slot_caches(params.n_cache_slots, params.n_cache_predict);
     }
 
     // Report where the MoE expert weights ended up, grouped by the buffer holding them, so the
@@ -1828,7 +1828,7 @@ const float * llama_model::tensor_split() const {
 //                the fill a point where ids is known and the table has not been read yet.
 //
 // The three matrices of an expert share a slot index, so one table per layer covers all of them.
-void llama_model::build_moe_slot_caches(int n_slots) {
+void llama_model::build_moe_slot_caches(int n_slots, int n_pred) {
     moe_slot_layers.clear();
 
     if (n_slots <= 0) {
@@ -1924,7 +1924,38 @@ void llama_model::build_moe_slot_caches(int n_slots) {
         // get_rows requires a->ne[2] == b->ne[1], which holds at decode where n_tokens is 1
         L.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, n_expert);
         ggml_format_name(L.slot_map, "blk.%d.moe_slot_map", c.il);
+        if (n_pred > 0) {
+            // where the graph leaves this layer's guess. Device-resident and persistent: the graph
+            // writes it with a cpy, and the scheduler reads it back at the fill.
+            L.pred_ids = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, n_pred, 1);
+            ggml_format_name(L.pred_ids, "blk.%d.moe_pred_ids", c.il);
+        }
         built.push_back(L);
+    }
+
+    // chain each layer to the next cached one: layer i predicts for layer i+1 of this list, using
+    // that layer's own router. The last one has nothing ahead of it and keeps prediction off.
+    if (n_pred > 0) {
+        int n_chained = 0;
+        for (size_t i = 0; i + 1 < built.size(); i++) {
+            const int il_next = built[i + 1].layer;
+            ggml_tensor * w = layers[il_next].ffn_gate_inp;
+            if (w == nullptr) {
+                continue;
+            }
+            // the prediction runs on the device, so its router must not have been pushed to the host
+            if (w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer)) {
+                continue;
+            }
+            built[i].pred_w      = w;
+            built[i].pred_target = il_next;
+            n_chained++;
+        }
+        LLAMA_LOG_INFO("%s: expert prediction on, top-%d one layer ahead, %d of %d layers chained\n",
+                __func__, n_pred, n_chained, (int) built.size());
+        if (n_chained == 0) {
+            LLAMA_LOG_WARN("%s: no layer could be chained, prediction is inert\n", __func__);
+        }
     }
 
     ggml_backend_buffer_ptr buf_dev { ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(),  buft_dev)  };
@@ -2706,6 +2737,7 @@ llama_model_params llama_model_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.n_cache_layers              =*/ -1,
         /*.n_cache_slots               =*/ 0,
+        /*.n_cache_predict             =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
