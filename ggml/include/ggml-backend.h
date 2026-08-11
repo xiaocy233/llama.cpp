@@ -333,9 +333,17 @@ extern "C" {
     // split input that the scheduler copies to the host - giving a point where ids is known and the
     // table has not been read yet. With slot_map device-resident there is no such point.
     struct ggml_moe_slot_cache {
-        struct ggml_tensor * src[3];     // host experts   [n_embd, n_ff, n_expert], NULL = skip
-        struct ggml_tensor * slots[3];   // device cache   [n_embd, n_ff, n_slots], same order
-        struct ggml_tensor * slot_map;   // HOST table     [1, n_expert] I32, -1 = not resident
+        // Exclusive store: host keeps only experts not resident on GPU (packed).
+        // src[m] is compact [n_embd, n_ff, n_compact] with n_compact = n_expert - n_slots.
+        // slots[m] is [n_embd, n_ff, n_slots+1]; the last index is staging for H2D-then-D2H swaps.
+        struct ggml_tensor * src[3];     // host compact, NULL = skip
+        struct ggml_tensor * slots[3];   // device cache + 1 staging slot
+        struct ggml_tensor * slot_map;   // HOST table [1, n_expert] I32, -1 = not resident
+        // Prefill dual-base: loc_map[e] = slot index, or (n_slots+1)+compact_index if on host.
+        // DEVICE I32 [n_expert]. NULL when Prefill dual path is unused.
+        struct ggml_tensor * loc_map;
+        int n_expert;                    // logical expert count (not src->ne[2])
+        int n_slots;                     // cache capacity (CLI); physical slots = n_slots+1
         int layer;                       // for logging only
 
         // ---- expert prediction, optional ----

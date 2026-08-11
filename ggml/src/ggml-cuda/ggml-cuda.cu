@@ -1869,6 +1869,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+    const ggml_tensor * ring = dst->src[3];
+    const ggml_tensor * loc_map = dst->src[4];
+    const bool dual = (ring != nullptr && loc_map != nullptr);
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -1877,8 +1880,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
-    // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    // classic single-base fast paths
+    if (!dual && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
@@ -1906,8 +1909,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
     }
 
-    // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
-    // TODO: add asserts to verify this. should work with CUDA, HIP, etc.
+    // dual Prefill: MMQ with loc_map dual-base resolve (slots|ring), no densify gather
+    if (dual && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        const int64_t n_expert_logical = ggml_nelements(loc_map);
+        GGML_ASSERT(ring->type == src0->type);
+        GGML_ASSERT(ring->nb[2] == src0->nb[2]);
+
+        if (ggml_is_quantized(src0->type) &&
+            ggml_cuda_should_use_mmq(src0->type, cc, ne12, n_expert_logical)) {
+            ggml_cuda_mul_mat_q_dual(ctx, src0, ring, loc_map, src1, ids, dst);
+            return;
+        }
+    }
+
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(nb12 % nb11 == 0);
@@ -1922,26 +1936,38 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
 
+    const int64_t n_expert_logical = dual ? ggml_nelements(loc_map) : ne02;
+    const int64_t n_phys = dual ? src0->ne[2] : ne02;
+    GGML_ASSERT(!dual || ring->type == src0->type);
+    GGML_ASSERT(!dual || ring->nb[2] == (size_t) nb02);
+
     std::vector<int32_t> ids_to_sorted_host;
     ids_to_sorted_host.reserve(2*ne_get_rows);
     std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
 
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
 
-    std::vector<int32_t> tokens_per_expert(ne02);
+    std::vector<int32_t> tokens_per_expert(n_expert_logical);
 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
     std::vector<char> ids_host(ggml_nbytes(ids));
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+
+    std::vector<int32_t> loc_host;
+    if (dual) {
+        loc_host.resize((size_t) n_expert_logical);
+        CUDA_CHECK(cudaMemcpyAsync(loc_host.data(), loc_map->data,
+                (size_t) n_expert_logical * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
-        for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+    for (int64_t i02 = 0; i02 < n_expert_logical; ++i02) {
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+                assert(expert_to_use >= 0 && expert_to_use < n_expert_logical);
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
@@ -1969,17 +1995,31 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
-    for (int64_t i02 = 0; i02 < ne02; ++i02) {
+    for (int64_t i02 = 0; i02 < n_expert_logical; ++i02) {
         if (tokens_per_expert[i02] == 0) {
             continue;
+        }
+
+        char * expert_data = nullptr;
+        if (dual) {
+            const int32_t loc = loc_host[i02];
+            if (loc >= 0 && loc < (int32_t) n_phys) {
+                expert_data = (char *) src0->data + (size_t) loc * nb02;
+            } else {
+                const int32_t cidx = loc - (int32_t) n_phys;
+                GGML_ASSERT(cidx >= 0 && cidx < ring->ne[2]);
+                expert_data = (char *) ring->data + (size_t) cidx * ring->nb[2];
+            }
+        } else {
+            expert_data = (char *) src0->data + i02*nb02;
         }
 
         ggml_tensor src0_slice = *src0;
         src0_slice.ne[2]    = 1;
         src0_slice.nb[3]    = src0_slice.nb[2];
         src0_slice.op       = GGML_OP_VIEW;
-        src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        src0_slice.data     = (char *) src0->data + i02*nb02;
+        src0_slice.view_src = dst->src[0];
+        src0_slice.data     = expert_data;
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));

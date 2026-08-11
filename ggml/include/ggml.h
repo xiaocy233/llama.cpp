@@ -1448,6 +1448,17 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // Prefill dual-base MUL_MAT_ID: experts live in slots (device) and/or ring (compact host copy).
+    // loc_map[e] < n_slots_phys -> slots[loc]; else ring[loc - n_slots_phys].
+    // src[0]=slots, src[1]=b, src[2]=ids, src[3]=ring, src[4]=loc_map (I32 [n_expert]).
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_dual(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * slots,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * ring,
+            struct ggml_tensor  * loc_map);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

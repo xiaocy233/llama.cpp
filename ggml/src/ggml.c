@@ -3352,6 +3352,43 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+struct ggml_tensor * ggml_mul_mat_id_dual(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * slots,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * ring,
+        struct ggml_tensor  * loc_map) {
+    GGML_ASSERT(!ggml_is_transposed(slots));
+    GGML_ASSERT(!ggml_is_transposed(ring));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(loc_map->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(slots->ne[3] == 1);
+    GGML_ASSERT(ring->ne[3] == 1);
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->ne[1] == b->ne[2]);
+    GGML_ASSERT(slots->ne[0] == b->ne[0]);
+    GGML_ASSERT(ring->ne[0] == b->ne[0]);
+    GGML_ASSERT(slots->ne[1] == ring->ne[1]);
+    GGML_ASSERT(slots->type  == ring->type);
+    GGML_ASSERT(ids->ne[0] % b->ne[1] == 0);
+    GGML_ASSERT(ggml_nelements(loc_map) > 0);
+
+    const int64_t ne[4] = { slots->ne[1], ids->ne[0], b->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ID;
+    result->src[0] = slots;
+    result->src[1] = b;
+    result->src[2] = ids;
+    result->src[3] = ring;
+    result->src[4] = loc_map;
+
+    return result;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

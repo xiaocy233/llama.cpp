@@ -92,6 +92,23 @@ struct llama_model_loader {
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
+    // Exclusive MoE load: host bank is compact (experts [n_slots, n_expert)); GPU seeds [0, n_slots).
+    // File still holds the full bank at weight->offs; live host tensor is reshaped before alloc.
+    struct moe_excl_info {
+        int    n_slots   = 0;
+        int    n_expert  = 0;
+        size_t expert_nb = 0; // bytes per expert (= nb[2])
+    };
+    std::unordered_map<std::string, moe_excl_info> moe_excl;
+
+    size_t moe_excl_data_offs(const char * name, size_t weight_offs) const {
+        const auto it = moe_excl.find(name);
+        if (it == moe_excl.end()) {
+            return weight_offs;
+        }
+        return weight_offs + (size_t) it->second.n_slots * it->second.expert_nb;
+    }
+
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;

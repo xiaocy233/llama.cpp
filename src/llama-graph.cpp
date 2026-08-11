@@ -1519,47 +1519,44 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    // MoE expert slot cache: when `w` has one, the experts this token needs are (or are about to be)
-    // in a small device-resident cache instead of host memory, so index that cache rather than the
-    // full tensor. The remap turns expert numbers into slot numbers; it reads a host-resident table,
-    // which is what gives the scheduler a point to fill the misses before this runs.
-    //
-    // Only at n_tokens == 1: get_rows requires slot_map->ne[2] == ids->ne[1], and the table is
-    // shaped [1, n_expert]. Prefill keeps the upstream path, where it would need most of the experts
-    // anyway and the cache could not hold them.
-    ggml_tensor * w_use   = w;
-    ggml_tensor * ids_use = ids;
+    // MoE expert slot cache:
+    //   Decode (n_tokens==1): MUL_MAT_ID(slots, b, get_rows(slot_map, ids))
+    //   Prefill: dual-base MUL_MAT_ID(slots, b, ids, compact_ring, loc_map) — no D2H of slots
+    ggml_tensor * res = nullptr;
 
-    if (ids->ne[1] == 1) {
-        const ggml_moe_slot_cache * sc = ggml_backend_sched_find_moe_slot_cache(sched, w);
-        if (sc) {
-            for (int m = 0; m < 3; m++) {
-                if (sc->src[m] == w) {
-                    w_use = sc->slots[m];
-                    break;
-                }
+    const ggml_moe_slot_cache * sc = ggml_backend_sched_find_moe_slot_cache(sched, w);
+    if (sc != nullptr) {
+        ggml_tensor * slots = nullptr;
+        for (int m = 0; m < 3; m++) {
+            if (sc->src[m] == w) {
+                slots = sc->slots[m];
+                break;
             }
+        }
 
-            // gate/up/down of one layer share the table and the ids, so they share the remap too:
-            // reuse the node if this layer already emitted one
-            ids_use = nullptr;
+        if (slots != nullptr && ids->ne[1] == 1) {
+            ggml_tensor * ids_use = nullptr;
             for (const auto & r : moe_slot_remaps) {
                 if (r.slot_map == sc->slot_map && r.ids == ids) {
                     ids_use = r.ids_slot;
                     break;
                 }
             }
-
             if (ids_use == nullptr) {
-                // [1, n_used, 1, 1] I32 -> [n_used, 1]; get_rows keeps I32 when its source is I32
                 ids_use = ggml_get_rows(ctx0, sc->slot_map, ids);
                 ids_use = ggml_reshape_2d(ctx0, ids_use, ids->ne[0], ids->ne[1]);
                 moe_slot_remaps.push_back({ sc->slot_map, ids, ids_use });
             }
+            res = ggml_mul_mat_id(ctx0, slots, cur, ids_use);
+        } else if (slots != nullptr && sc->loc_map != nullptr) {
+            // Prefill: logical ids + map across slots and compact (ring-copied) host experts
+            res = ggml_mul_mat_id_dual(ctx0, slots, cur, ids, w, sc->loc_map);
         }
     }
 
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w_use, cur, ids_use);
+    if (res == nullptr) {
+        res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];

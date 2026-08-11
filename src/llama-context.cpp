@@ -621,8 +621,11 @@ void llama_context::sched_reserve() {
                 c.src[m]   = L.src[m];
                 c.slots[m] = L.slots[m];
             }
-            c.slot_map = L.slot_map;
-            c.layer    = L.layer;
+            c.slot_map    = L.slot_map;
+            c.loc_map     = L.loc_map;
+            c.n_expert    = L.n_expert;
+            c.n_slots     = L.n_slots;
+            c.layer       = L.layer;
             c.pred_w      = L.pred_w;
             c.pred_ids    = L.pred_ids;
             c.pred_target = L.pred_target;
