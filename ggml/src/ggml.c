@@ -1098,9 +1098,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_GATE",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1215,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_gate(loc_map, ids)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3385,6 +3389,46 @@ struct ggml_tensor * ggml_mul_mat_id_dual(
     result->src[2] = ids;
     result->src[3] = ring;
     result->src[4] = loc_map;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * loc_map,
+        struct ggml_tensor  * ids_in,
+        struct ggml_tensor  * seq,
+        int                   layer,
+        int                   n_ids,
+        int                   n_slots) {
+    GGML_ASSERT(loc_map->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids_in->type  == GGML_TYPE_I32);
+    GGML_ASSERT(seq->type     == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(seq) == 1);
+    GGML_ASSERT(ggml_is_contiguous(ids_in));
+    GGML_ASSERT(layer >= 0);
+    GGML_ASSERT(n_slots > 0);
+    GGML_ASSERT(n_ids >= 0 && n_ids <= ggml_nelements(ids_in));
+
+    // n_ids == 0 is the publish-only form: no residency check and no park, the ids pass through
+    // unchanged. Prefill uses it to tell the host what it routed to, so the cache is not cold when
+    // decode starts.
+    struct ggml_tensor * result = n_ids > 0
+        ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_ids)
+        : ggml_new_tensor(ctx, GGML_TYPE_I32, GGML_MAX_DIMS, ids_in->ne);
+
+    int64_t n_pred = ggml_nelements(ids_in) - n_ids;
+    if (n_ids + n_pred > GGML_MOE_GATE_MAX_IDS) {
+        n_pred = GGML_MOE_GATE_MAX_IDS - n_ids;   // publish-only takes the newest ids, see the kernel
+    }
+
+    const int32_t params[] = { layer, n_ids, (int32_t) n_pred, n_slots };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_GATE;
+    result->src[0] = loc_map;
+    result->src[1] = ids_in;
+    result->src[2] = seq;
 
     return result;
 }

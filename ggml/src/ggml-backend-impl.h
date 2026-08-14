@@ -145,6 +145,18 @@ extern "C" {
         // used by the scheduler to overlap host->device weight copies with compute
         // note: must be added at the end of this struct, the backend ifaces are positionally initialized
         int                       (*select_stream)     (ggml_backend_t backend, int stream);
+
+        // (optional) stateless variants of the above, for a thread that must not touch the
+        // context-wide current stream. The MoE gate worker runs concurrently with the main thread.
+        void (*set_tensor_async_stream)(ggml_backend_t backend, int stream, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+        void (*synchronize_stream)     (ggml_backend_t backend, int stream);
+
+        // (optional) mailbox for GGML_OP_MOE_GATE, allocated on first call
+        bool (*moe_gate_channel)(ggml_backend_t backend, struct ggml_moe_gate_channel * out);
+
+        // (optional) enqueue the release of a parked gate on [stream], after everything already on it.
+        // Lets the worker hand the release to the device instead of waiting for the stream itself.
+        void (*moe_gate_release_stream)(ggml_backend_t backend, int stream, int layer, uint32_t seq);
     };
 
     struct ggml_backend {

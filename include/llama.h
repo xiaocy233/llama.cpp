@@ -347,6 +347,12 @@ extern "C" {
         // effect together with n_cache_slots. A wrong guess costs bandwidth, never correctness.
         int32_t n_cache_predict;
 
+        // MiB of host weights to page-lock. Page-locked memory reaches the full H2D rate, pageable
+        // memory goes through a driver staging copy at roughly half of it. But page-locked pages
+        // cannot be paged out, so too much of it makes a later device allocation fail.
+        // -1 = auto (half of the free memory), 0 = none. Needs n_cache_slots or n_cache_layers.
+        int32_t n_cache_pin;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data

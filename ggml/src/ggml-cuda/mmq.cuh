@@ -944,25 +944,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
 
-static __device__ __forceinline__ void mmq_resolve_x_channel(
-        const char * x, const char * x_ring, const int32_t * loc_map, int n_phys,
-        int channel,
-        const char * & x_base, int & channel_phys) {
-    if (loc_map == nullptr) {
-        x_base = x;
-        channel_phys = channel;
-        return;
-    }
-    const int loc = loc_map[channel];
-    if (loc < n_phys) {
-        x_base = x;
-        channel_phys = loc;
-    } else {
-        x_base = x_ring;
-        channel_phys = loc - n_phys;
-    }
-}
-
 template <ggml_type type, int J, bool fallback>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
 static __global__ void mul_mat_q(
@@ -1067,7 +1048,7 @@ static __global__ void mul_mat_q(
         const int channel_log = fastdiv(zt, channel_ratio);
         const char * x_base;
         int channel_phys;
-        mmq_resolve_x_channel(x, x_ring, loc_map, n_phys, channel_log, x_base, channel_phys);
+        moe_resolve_x_channel(x, x_ring, loc_map, n_phys, channel_log, x_base, channel_phys);
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + channel_phys*stride_channel_x + it*I*stride_row_x;
 
         constexpr bool fixup = false;
@@ -1165,7 +1146,7 @@ static __global__ void mul_mat_q(
         const int channel_log = fastdiv(zt, channel_ratio);
         const char * x_base;
         int channel_phys;
-        mmq_resolve_x_channel(x, x_ring, loc_map, n_phys, channel_log, x_base, channel_phys);
+        moe_resolve_x_channel(x, x_ring, loc_map, n_phys, channel_log, x_base, channel_phys);
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + channel_phys*stride_channel_x + it*I*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
@@ -1253,7 +1234,7 @@ static __global__ void mul_mat_q(
     const int channel_log = fastdiv(zt, channel_ratio);
     const char * x_base;
     int channel_phys;
-    mmq_resolve_x_channel(x, x_ring, loc_map, n_phys, channel_log, x_base, channel_phys);
+    moe_resolve_x_channel(x, x_ring, loc_map, n_phys, channel_log, x_base, channel_phys);
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + channel_phys*stride_channel_x + it*I*stride_row_x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.

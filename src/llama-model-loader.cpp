@@ -1211,6 +1211,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
 
+        // spend the page-locked budget on the tensors created first, which are the lowest layers
+        if (buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+            const size_t nbytes = ggml_nbytes(t_meta);
+            if (host_pinned_used + nbytes > host_pinned_budget) {
+                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (!cpu_dev) {
+                    throw std::runtime_error("no CPU backend found");
+                }
+                buft = ggml_backend_dev_buffer_type(cpu_dev);
+            } else {
+                host_pinned_used += nbytes;
+            }
+        }
+
         if (buft != buft_list->front().second) {
             if (n_tensors_moved == 0) {
                 first_tensor_moved_name = t_meta->name;
@@ -1352,13 +1366,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
-        size_t nbytes = ggml_nbytes(it.second.tensor);
-        const auto eit = moe_excl.find(it.first);
-        if (eit != moe_excl.end()) {
-            const auto & e = eit->second;
-            nbytes = (size_t) (e.n_expert - e.n_slots) * e.expert_nb;
-        }
-        size_data += nbytes;
+        size_data += ggml_nbytes(it.second.tensor);
     }
 }
 
@@ -1374,28 +1382,26 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
         if (!weight || weight->idx != idx) {
             continue;
         }
-        const size_t offs = moe_excl_data_offs(ggml_get_name(tensor), weight->offs);
-        *first = std::min(*first, offs);
-        *last  = std::max(*last,  offs + ggml_nbytes(tensor));
+        *first = std::min(*first, weight->offs);
+        *last  = std::max(*last,  weight->offs + ggml_nbytes(tensor));
     }
 }
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
-    const size_t offs = moe_excl_data_offs(ggml_get_name(cur), w.offs);
 
     if (use_mmap) {
         const auto & mapping = mappings.at(w.idx);
         if (cur->data == nullptr) {
-            cur->data = (uint8_t *)mapping->addr() + offs;
+            cur->data = (uint8_t *)mapping->addr() + w.offs;
         } else {
-            memcpy(cur->data, (uint8_t *)mapping->addr() + offs, ggml_nbytes(cur));
+            memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, ggml_nbytes(cur));
         }
     } else {
         GGML_ASSERT(cur->data != nullptr);
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
-        file->seek(offs, SEEK_SET);
+        file->seek(w.offs, SEEK_SET);
         file->read_raw(cur->data, ggml_nbytes(cur));
     }
 
@@ -1533,7 +1539,6 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
-        const size_t data_offs = moe_excl_data_offs(ggml_get_name(cur), weight->offs);
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1541,7 +1546,7 @@ bool llama_model_loader::load_all_data(
             if (bufs.count(weight->idx)) {
                 buf_mmap = bufs.at(weight->idx);
             }
-            uint8_t * data = (uint8_t *) mapping->addr() + data_offs;
+            uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
@@ -1554,12 +1559,12 @@ bool llama_model_loader::load_all_data(
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
                 if (lmlocks) {
                     const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(data_offs + n_size);
+                    lmlock->grow_to(weight->offs + n_size);
                 }
 
                 auto & mmap_used = mmaps_used[weight->idx];
-                mmap_used.first  = std::min(mmap_used.first,  data_offs);
-                mmap_used.second = std::max(mmap_used.second, data_offs + n_size);
+                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
@@ -1567,7 +1572,7 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(data_offs, SEEK_SET);
+                file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
@@ -1577,7 +1582,7 @@ bool llama_model_loader::load_all_data(
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                 if (upload_backend) {
-                    size_t offset = data_offs;
+                    size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
                     size_t offset_from_alignment = offset - aligned_offset;
@@ -1630,7 +1635,7 @@ bool llama_model_loader::load_all_data(
                     }
                 } else {
                     read_buf.resize(n_size);
-                    file->seek(data_offs, SEEK_SET);
+                    file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {

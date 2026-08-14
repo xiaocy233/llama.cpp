@@ -2722,6 +2722,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_cache_predict = value;
         }
     ).set_env("LLAMA_ARG_N_CACHE_PREDICT"));
+    add_opt(common_arg(
+        {"-ncpin", "--n-cache-pin"}, "N",
+        string_format("page-lock at most N MiB of the host expert weights, the rest stays pageable\n"
+                      "(page-locked reaches the full H2D rate and overlaps compute, pageable goes\n"
+                      "through a driver staging copy at about half the rate and overlaps nothing)\n"
+                      "-1 = auto (free memory less a 3 GiB reserve), 0 = none (default: %d)",
+                      params.n_cache_pin),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_cache_pin = value;
+        }
+    ).set_env("LLAMA_ARG_N_CACHE_PIN"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

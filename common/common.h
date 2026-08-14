@@ -521,6 +521,7 @@ struct common_params {
     int32_t n_cache_layers = -1;   // shallow layers kept fully in VRAM, -1 = unset
     int32_t n_cache_slots  = 0;    // expert slots per streaming layer, 0 = no slot cache
     int32_t n_cache_predict = 0;   // experts predicted one layer ahead and prefetched, 0 = off
+    int32_t n_cache_pin    = -1;   // MiB of host weights to page-lock, -1 = auto, 0 = none
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale

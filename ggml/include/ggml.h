@@ -590,6 +590,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_GATE,
+
         GGML_OP_COUNT,
     };
 
@@ -1458,6 +1460,22 @@ extern "C" {
             struct ggml_tensor  * ids,
             struct ggml_tensor  * ring,
             struct ggml_tensor  * loc_map);
+
+    // Decode MoE slot cache: turn logical expert ids into physical slot ids, and let the device ask
+    // the host for the ones that are not resident. Runs on the device, so no host round trip cuts
+    // the layer in two. See probe/GATE-PLAN.md.
+    //
+    // Publishes ids, the prediction tail and a miss mask to a mailbox the CUDA backend owns, then
+    // returns at once if every expert is resident, or parks until the host fills the misses and
+    // releases it. n_ids of ids_in are the ids of this layer, the rest is the prediction.
+    GGML_API struct ggml_tensor * ggml_moe_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * loc_map,   // I32 [n_expert], slot of each expert
+            struct ggml_tensor  * ids_in,    // I32, this layer's ids then the prediction
+            struct ggml_tensor  * seq,       // I32 [1], token counter, device
+            int                   layer,     // index into the mailbox, not the model layer
+            int                   n_ids,
+            int                   n_slots);  // loc_map[e] >= n_slots means not resident
 
     // A: m columns, n rows,
     // B: p columns, n rows,

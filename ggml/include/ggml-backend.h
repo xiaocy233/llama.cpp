@@ -317,34 +317,67 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // MoE gate mailbox.
+    //
+    // Decode puts a GGML_OP_MOE_GATE in front of every streamed layer. The gate resolves ids to slot
+    // indices on the device, publishes what it saw here, and parks if an expert is missing. A host
+    // worker polls this and fills. No part of the layer waits for the host unless something is
+    // missing, so the layer is not cut into splits. See probe/GATE-PLAN.md.
+    //
+    // The backend owns this memory. It has to: it is mapped page-locked memory, and a CUDA host
+    // buffer is not a supported buffer type on a discrete GPU, so it cannot be a plain tensor src
+    // without the scheduler making a device copy of it.
+    #define GGML_MOE_GATE_MAX_IDS    32   // n_expert_used + n_pred; miss_mask still caps n_ids at 32
+    #define GGML_MOE_GATE_MAX_LAYERS 256
+
+    // One entry per gate, rewritten every token. The worker has a whole token to read an entry
+    // before the device comes back to it, and seq lets it tell a stale entry from a fresh one.
+    struct ggml_moe_gate_entry {
+        uint32_t seq;         // written last, after a system fence: this is the handshake
+        uint32_t layer;
+        uint32_t miss_mask;   // bit i = ids[i] is not resident, the gate is parked
+        uint32_t n_ids;
+        uint32_t n_pred;
+        uint32_t pad[3];
+        int32_t  ids[GGML_MOE_GATE_MAX_IDS];   // n_ids of this layer, then n_pred predicted
+    };
+
+    struct ggml_moe_gate_channel {
+        struct ggml_moe_gate_entry * ring;     // [GGML_MOE_GATE_MAX_LAYERS]
+        volatile uint32_t          * release;  // [GGML_MOE_GATE_MAX_LAYERS], host stores seq to resume
+        volatile int32_t           * timeout;  // [GGML_MOE_GATE_MAX_LAYERS] park timeouts, must stay 0
+    };
+
+    // Ask a backend for its gate mailbox, allocating it on first call. False if the backend has none.
+    GGML_API bool ggml_backend_moe_gate_channel(ggml_backend_t backend, struct ggml_moe_gate_channel * out);
+
     // MoE expert slot cache.
     //
     // At decode a token touches only n_expert_used of the n_expert experts in a layer, so keeping a
     // small per-layer cache of experts in device memory turns the per-token host read into a copy of
     // just the ones that are missing. The three matrices of one expert (gate, up, down) share a slot
-    // index, so one table and one remap node cover the whole layer.
+    // index, so one table and one gate node cover the whole layer.
     //
     // The caller allocates everything and builds the graph as
-    //     MUL_MAT_ID(slots[m], b, get_rows(slot_map, ids))
-    // and this scheduler fills the missing experts and updates slot_map before the remap runs.
-    //
-    // slot_map must live in HOST memory with WEIGHTS usage. That is what puts the remap on the CPU
-    // backend (GET_ROWS reports batch size 0 and is never offloaded), which in turn makes ids a
-    // split input that the scheduler copies to the host - giving a point where ids is known and the
-    // table has not been read yet. With slot_map device-resident there is no such point.
+    //     MUL_MAT_ID(slots[m], b, moe_gate(loc_map, ids, seq))
+    // With prediction on, the ids the gate reads carry n_pred extra entries (see below).
     struct ggml_moe_slot_cache {
-        // Exclusive store: host keeps only experts not resident on GPU (packed).
-        // src[m] is compact [n_embd, n_ff, n_compact] with n_compact = n_expert - n_slots.
-        // slots[m] is [n_embd, n_ff, n_slots+1]; the last index is staging for H2D-then-D2H swaps.
-        struct ggml_tensor * src[3];     // host compact, NULL = skip
-        struct ggml_tensor * slots[3];   // device cache + 1 staging slot
-        struct ggml_tensor * slot_map;   // HOST table [1, n_expert] I32, -1 = not resident
-        // Prefill dual-base: loc_map[e] = slot index, or (n_slots+1)+compact_index if on host.
-        // DEVICE I32 [n_expert]. NULL when Prefill dual path is unused.
+        // The host keeps every expert, so a slot is a copy and never the only one: an eviction just
+        // drops it, and every transfer is H2D.
+        struct ggml_tensor * src[3];     // host bank [n_embd, n_ff, n_expert], NULL = skip
+        struct ggml_tensor * slots[3];   // device cache [n_embd, n_ff, n_slots]
+        // loc_map[e] = slot index, or n_slots + e to read the host bank. Decode reads the second
+        // form as "missing"; Prefill dual-base reads it as a ring offset. DEVICE I32 [n_expert].
         struct ggml_tensor * loc_map;
-        int n_expert;                    // logical expert count (not src->ne[2])
-        int n_slots;                     // cache capacity (CLI); physical slots = n_slots+1
+        struct ggml_tensor * gate_seq;   // device I32 [1], the token counter, shared by every cache
+        int n_expert;                    // expert count
+        int n_slots;                     // cache capacity (CLI)
         int layer;                       // for logging only
+        int gate_slot;                   // mailbox index, filled in by the scheduler
+        // Set when src[] is page-locked. A pageable source makes the driver stage the copy itself,
+        // and that staging can wait on the device - which deadlocks against a parked gate. The
+        // scheduler stages those through its own buffer instead.
+        bool pinned;
 
         // ---- expert prediction, optional ----
         //
@@ -353,22 +386,27 @@ extern "C" {
         // target layer's router can be applied to this layer's hidden state instead: the residual
         // stream moves slowly between layers, so the result is a usable guess one layer ahead.
         //
-        // The caller multiplies pred_w with its hidden state, takes the top k, and copies that into
-        // pred_ids. This scheduler reads pred_ids back at this layer's fill - a point where the
-        // device is already synchronized, so it costs no extra stall - and prefetches those experts
-        // into layer pred_target's slots on an auxiliary stream.
+        // The caller multiplies pred_w with its hidden state, takes the top n_pred, and appends the
+        // result to the ids the gate reads. The gate publishes the guess with the rest of the entry,
+        // and the worker prefetches those experts into layer pred_target's slots.
         //
+        // pred_target has NOT run its gate yet, so a prefetch there can race a reader. The worker
+        // only ever writes slots in that layer's free pool - see probe/GATE-PLAN.md section 4.2.
         // A wrong guess only wastes bandwidth: the target layer still fills whatever is missing
         // synchronously, so the output does not depend on the prediction being right.
         struct ggml_tensor * pred_w;      // router of layer pred_target, NULL = prediction off
-        struct ggml_tensor * pred_ids;    // DEVICE I32 [n_pred], written by the graph each token
+        int                  n_pred;      // experts guessed per token, 0 = prediction off
         int                  pred_target; // layer the prediction is for
     };
 
     // Register before the first reserve. Returns false if the registry is full or the cache is
-    // malformed (shape mismatch, slot_map not host-resident, n_slots < n_expert_used).
+    // malformed (shape mismatch, n_slots < n_expert_used).
     GGML_API bool ggml_backend_sched_add_moe_slot_cache(
             ggml_backend_sched_t sched, const struct ggml_moe_slot_cache * cache, int n_expert_used);
+
+    // The I32[1] device tensor every gate reads its token counter from. The scheduler writes it
+    // once per decode step, so it must live outside the compute buffer.
+    GGML_API void ggml_backend_sched_set_moe_gate_seq(ggml_backend_sched_t sched, struct ggml_tensor * seq);
 
     // Look up the cache registered for a host expert tensor, NULL if there is none. Used by the
     // graph builder to decide whether to emit the remap and substitute the slot tensor.

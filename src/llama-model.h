@@ -666,26 +666,24 @@ struct llama_model {
     struct moe_slot_layer {
         struct ggml_tensor * src[3]   = { nullptr, nullptr, nullptr };
         struct ggml_tensor * slots[3] = { nullptr, nullptr, nullptr };
-        struct ggml_tensor * slot_map = nullptr;
-        struct ggml_tensor * loc_map  = nullptr; // device I32 [n_expert] for Prefill dual-base
+        struct ggml_tensor * loc_map  = nullptr; // device I32 [n_expert], slot of each expert
+        struct ggml_tensor * gate_seq = nullptr; // device I32 [1], shared by every layer
         int n_expert = 0;
         int n_slots  = 0;
         int layer = -1;
+        bool pinned = false;   // whole host bank is page-locked, so a copy needs no staging
 
-        // prediction for the next cached layer: its router, and where this layer's graph leaves the
-        // predicted expert numbers. Both null when prediction is off.
+        // prediction for the next cached layer: its router, and how many experts to guess. Off when
+        // pred_w is null.
         struct ggml_tensor * pred_w      = nullptr;
-        struct ggml_tensor * pred_ids    = nullptr;
+        int                  n_pred      = 0;
         int                  pred_target = -1;
     };
     std::vector<moe_slot_layer> moe_slot_layers;
 
-    // reshape host MoE banks to compact before buffer alloc / GGUF load
-    void prepare_moe_exclusive_load(llama_model_loader & ml, int n_slots);
-
-    // allocate GPU slots (+ maps); host compact is already the reshaped layer tensor
+    // allocate the device slots and the maps; the host bank is the layer tensor itself
     // n_slots <= 0 disables it. n_pred > 0 wires one-layer-ahead expert prediction.
-    void build_moe_slot_caches(int n_slots, int n_pred, llama_model_loader & ml);
+    void build_moe_slot_caches(int n_slots, int n_pred);
 
     // number of leading layers whose MoE experts stay in VRAM; -1 when unset
     int32_t n_cache_layers() const;

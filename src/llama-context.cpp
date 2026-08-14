@@ -621,16 +621,18 @@ void llama_context::sched_reserve() {
                 c.src[m]   = L.src[m];
                 c.slots[m] = L.slots[m];
             }
-            c.slot_map    = L.slot_map;
             c.loc_map     = L.loc_map;
+            c.gate_seq    = L.gate_seq;
             c.n_expert    = L.n_expert;
             c.n_slots     = L.n_slots;
             c.layer       = L.layer;
+            c.pinned      = L.pinned;
             c.pred_w      = L.pred_w;
-            c.pred_ids    = L.pred_ids;
+            c.n_pred      = L.n_pred;
             c.pred_target = L.pred_target;
             n_ok += ggml_backend_sched_add_moe_slot_cache(sched.get(), &c, (int) model.hparams.n_expert_used) ? 1 : 0;
         }
+        ggml_backend_sched_set_moe_gate_seq(sched.get(), model.moe_slot_layers.front().gate_seq);
         LLAMA_LOG_INFO("%s: MoE slot cache registered for %d/%d layers\n",
                 __func__, n_ok, (int) model.moe_slot_layers.size());
     }

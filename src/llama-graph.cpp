@@ -1520,8 +1520,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
     // MoE expert slot cache:
-    //   Decode (n_tokens==1): MUL_MAT_ID(slots, b, get_rows(slot_map, ids))
-    //   Prefill: dual-base MUL_MAT_ID(slots, b, ids, compact_ring, loc_map) — no D2H of slots
+    //   Decode (n_tokens==1): MUL_MAT_ID(slots, b, moe_gate(loc_map, ids, seq))
+    //   Prefill: dual-base MUL_MAT_ID(slots, b, ids, host_bank, loc_map)
     ggml_tensor * res = nullptr;
 
     const ggml_moe_slot_cache * sc = ggml_backend_sched_find_moe_slot_cache(sched, w);
@@ -1534,23 +1534,51 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             }
         }
 
-        if (slots != nullptr && ids->ne[1] == 1) {
+        if (slots != nullptr && ids->ne[1] == 1 && sc->gate_seq != nullptr) {
             ggml_tensor * ids_use = nullptr;
             for (const auto & r : moe_slot_remaps) {
-                if (r.slot_map == sc->slot_map && r.ids == ids) {
+                if (r.loc_map == sc->loc_map && r.ids == ids) {
                     ids_use = r.ids_slot;
                     break;
                 }
             }
             if (ids_use == nullptr) {
-                ids_use = ggml_get_rows(ctx0, sc->slot_map, ids);
+                // the guess for the next layer travels with the ids, so the gate publishes both in
+                // one mailbox entry. The gate resolves the head only; the tail is for the worker.
+                ggml_tensor * ids_in = ids;
+                for (const auto & p : moe_slot_preds) {
+                    if (p.loc_map == sc->loc_map) {
+                        ids_in = ggml_concat(ctx0, ids, p.ids, 0);
+                        break;
+                    }
+                }
+
+                ids_use = ggml_moe_gate(ctx0, sc->loc_map, ids_in, sc->gate_seq,
+                        sc->gate_slot, (int) ids->ne[0], sc->n_slots);
                 ids_use = ggml_reshape_2d(ctx0, ids_use, ids->ne[0], ids->ne[1]);
-                moe_slot_remaps.push_back({ sc->slot_map, ids, ids_use });
+                moe_slot_remaps.push_back({ sc->loc_map, ids, ids_use });
             }
             res = ggml_mul_mat_id(ctx0, slots, cur, ids_use);
         } else if (slots != nullptr && sc->loc_map != nullptr) {
-            // Prefill: logical ids + map across slots and compact (ring-copied) host experts
-            res = ggml_mul_mat_id_dual(ctx0, slots, cur, ids, w, sc->loc_map);
+            ggml_tensor * ids_use = ids;
+
+            // Report what prefill routed to. Decode then starts on a warm cache instead of missing
+            // on every layer of the first token. The gate cannot park here - it only publishes.
+            if (sc->gate_seq != nullptr && ggml_is_contiguous(ids)) {
+                for (const auto & r : moe_slot_remaps) {
+                    if (r.loc_map == sc->loc_map && r.ids == ids) {
+                        ids_use = r.ids_slot;
+                        break;
+                    }
+                }
+                if (ids_use == ids) {
+                    ids_use = ggml_moe_gate(ctx0, sc->loc_map, ids, sc->gate_seq, sc->gate_slot, 0, sc->n_slots);
+                    moe_slot_remaps.push_back({ sc->loc_map, ids, ids_use });
+                }
+            }
+
+            // logical ids, and loc_map says whether the expert comes from a slot or the bank
+            res = ggml_mul_mat_id_dual(ctx0, slots, cur, ids_use, w, sc->loc_map);
         }
     }
 
@@ -1979,29 +2007,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * logits = nullptr;
 
-    // Expert prediction for the next cached layer, decode only.
-    //
-    // cur is the router's input: past the attention residual and this layer's ffn norm. Feeding it
-    // to the *next* layer's router is the cheapest possible guess at what that layer will select -
-    // the residual stream moves slowly, and the router is a plain matrix, so no extra weights and no
-    // training are involved. It is deliberately the simplest form; the input position, the weight
-    // and how far ahead to look are all things to vary later.
-    //
-    // Runs on the device next to the real router. The scheduler picks the result up at this layer's
-    // fill and prefetches. Nothing downstream reads it, so a bad guess cannot change the output.
-    if (n_tokens == 1) {
-        const ggml_moe_slot_cache * sc = ggml_backend_sched_find_moe_slot_cache(sched, up_exps);
-        if (sc == nullptr) {
-            sc = ggml_backend_sched_find_moe_slot_cache(sched, gate_exps);
-        }
-        if (sc && sc->pred_w && sc->pred_ids) {
-            ggml_tensor * pl = ggml_mul_mat(ctx0, sc->pred_w, cur);                  // [n_expert, 1]
-            ggml_tensor * pi = ggml_top_k(ctx0, pl, (int) sc->pred_ids->ne[0]);      // [n_pred, 1] I32
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, pi, sc->pred_ids));
-            cb(pl, "ffn_moe_pred_logits", il);
-        }
-    }
-
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
@@ -2099,6 +2104,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
     } else {
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    }
+
+    // Expert prediction for the next cached layer, decode only.
+    //
+    // cur is the router's input: past the attention residual and this layer's ffn norm. Feeding it
+    // to the *next* layer's router is the cheapest possible guess at what that layer will select -
+    // the residual stream moves slowly, and the router is a plain matrix, so no extra weights and no
+    // training are involved. It is deliberately the simplest form; the input position, the weight
+    // and how far ahead to look are all things to vary later.
+    //
+    // Runs on the device next to the real router. build_lora_mm_id appends it to the ids the gate
+    // reads, so it reaches the host inside the entry the gate publishes anyway. Nothing downstream
+    // reads it, so a bad guess cannot change the output.
+    if (n_tokens == 1) {
+        const ggml_moe_slot_cache * sc = ggml_backend_sched_find_moe_slot_cache(sched, up_exps);
+        if (sc == nullptr) {
+            sc = ggml_backend_sched_find_moe_slot_cache(sched, gate_exps);
+        }
+        if (sc && sc->pred_w && sc->n_pred > 0) {
+            ggml_tensor * pl = ggml_mul_mat(ctx0, sc->pred_w, cur);      // [n_expert, 1]
+            ggml_tensor * pi = ggml_top_k(ctx0, pl, sc->n_pred);         // [n_pred, 1] I32
+            cb(pl, "ffn_moe_pred_logits", il);
+            moe_slot_preds.push_back({ sc->loc_map, pi });
+        }
     }
 
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]

@@ -10,6 +10,7 @@
 #include "ggml-cpp.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -92,22 +93,14 @@ struct llama_model_loader {
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
-    // Exclusive MoE load: host bank is compact (experts [n_slots, n_expert)); GPU seeds [0, n_slots).
-    // File still holds the full bank at weight->offs; live host tensor is reshaped before alloc.
-    struct moe_excl_info {
-        int    n_slots   = 0;
-        int    n_expert  = 0;
-        size_t expert_nb = 0; // bytes per expert (= nb[2])
-    };
-    std::unordered_map<std::string, moe_excl_info> moe_excl;
-
-    size_t moe_excl_data_offs(const char * name, size_t weight_offs) const {
-        const auto it = moe_excl.find(name);
-        if (it == moe_excl.end()) {
-            return weight_offs;
-        }
-        return weight_offs + (size_t) it->second.n_slots * it->second.expert_nb;
-    }
+    // Cap on page-locked host weights. Page-locked memory cannot be paged out, so a large one leaves
+    // the driver nothing to work with and the next device allocation fails. Tensors over the cap get
+    // the plain CPU buffer type: slower H2D, but the pages can be evicted.
+    // The cap must be set before the tensors are placed. Page-locking them afterwards does not work:
+    // a copy may not cross two registered ranges, and the tensors are packed too tight to leave a
+    // page boundary to split a range on. SIZE_MAX = no cap. create_tensor keeps the running total.
+    size_t host_pinned_budget = SIZE_MAX;
+    size_t host_pinned_used   = 0;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set

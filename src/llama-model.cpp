@@ -1343,6 +1343,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    // Cap the page-locked host weights when MoE experts stream from host memory.
+    //
+    // Streaming wants every host expert page-locked. A pageable H2D is not asynchronous: the driver
+    // drains the device and stages the bytes, so it runs at about half the rate and overlaps nothing.
+    //
+    // Page-locked pages cannot be evicted though, so locking all of a bank the machine cannot spare
+    // makes the next device allocation fail - reported as a CUDA OOM far from the cause. Keep a
+    // reserve for the driver, the KV cache and everything allocated after this point.
+    //
+    // Whatever does not fit is pageable. The layers are created in order, so the cap decides how many
+    // of the lowest streaming layers are page-locked - the lowest ones carry the most expert churn.
+    if (params.n_cache_slots > 0 || params.n_cache_layers > 0) {
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(cpu_dev, &free_mem, &total_mem);
+
+        const size_t reserve = 3ull * 1024 * 1024 * 1024;
+
+        size_t budget = 0;
+        if (params.n_cache_pin >= 0) {
+            budget = (size_t) params.n_cache_pin * 1024 * 1024;
+        } else {
+            budget = free_mem > reserve ? free_mem - reserve : 0;
+        }
+
+        ml.host_pinned_budget = budget;
+
+        const double mib = 1024.0 * 1024.0;
+        LLAMA_LOG_INFO("%s: page-locked host weights capped at %.2f MiB (%s, %.2f MiB free of %.2f MiB)\n",
+                __func__, budget / mib, params.n_cache_pin >= 0 ? "--n-cache-pin" : "auto",
+                free_mem / mib, total_mem / mib);
+
+        if (free_mem < budget + reserve) {
+            LLAMA_LOG_WARN("%s: this leaves under %.2f MiB unlocked, the load may fail\n",
+                    __func__, reserve / mib);
+        }
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights
@@ -1530,14 +1567,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // Before alloc/load: reshape host MoE banks to compact 192 and register GGUF offsets.
-    // Without this, load brings full 256 then exclusive packs another compact -> double RAM.
-    if (params.n_cache_slots > 0) {
-        prepare_moe_exclusive_load(ml, params.n_cache_slots);
-    }
-
-    // Exclusive: do not PrefetchVirtualMemory the whole GGUF (would fault in discarded slot experts).
-    ml.init_mappings(ml.moe_excl.empty(), use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1573,20 +1603,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
-        // Exclusive compact banks must be real host allocs (not mmap views): load only reads
-        // experts [n_slots, n_expert), and GPU slots are seeded from the file separately.
-        bool ctx_has_excl = false;
-        if (!ml.moe_excl.empty()) {
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
-                if (ml.moe_excl.find(ggml_get_name(t)) != ml.moe_excl.end()) {
-                    ctx_has_excl = true;
-                    break;
-                }
-            }
-        }
-
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !ctx_has_excl) {
+        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1686,7 +1704,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // the slot cache needs the weights placed, so this has to come after load_all_data
     if (params.n_cache_slots > 0) {
-        build_moe_slot_caches(params.n_cache_slots, params.n_cache_predict, ml);
+        build_moe_slot_caches(params.n_cache_slots, params.n_cache_predict);
     }
 
     // Report where the MoE expert weights ended up, grouped by the buffer holding them, so the
@@ -1750,9 +1768,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!groups.empty()) {
             const double mib = 1024.0 * 1024.0;
 
-            size_t host_bytes  = 0;
-            int    host_layers = 0;
-            bool   pinned      = false;
+            size_t host_bytes   = 0;
+            int    host_layers  = 0;
+            size_t pinned_bytes = 0;
 
             LLAMA_LOG_INFO("%s: MoE expert layout, %d experts per layer\n", __func__, (int) n_expert);
 
@@ -1767,16 +1785,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     // whether the host side is page-locked decides the transfer rate: falling back
                     // to pageable adds a driver staging copy and roughly halves it. A buffer name
                     // ending in _Host is pinned, a plain CPU name is not.
-                    pinned = pinned || name.find("_Host") != std::string::npos;
+                    if (name.find("_Host") != std::string::npos) {
+                        pinned_bytes += g.bytes;
+                    }
                 }
             }
 
             // with nothing host-resident there is no transfer to describe and no slot cache to size
             if (host_layers > 0) {
-                LLAMA_LOG_INFO("%s:   host-side experts: %9.2f MiB over %d layers, %s\n",
+                LLAMA_LOG_INFO("%s:   host-side experts: %9.2f MiB over %d layers, %.2f MiB page-locked (full DMA rate), %.2f MiB pageable (driver staging copy, roughly half rate)\n",
                         __func__, host_bytes / mib, host_layers,
-                        pinned ? "page-locked (full DMA rate)"
-                               : "pageable (driver staging copy, roughly half rate)");
+                        pinned_bytes / mib, (host_bytes - pinned_bytes) / mib);
 
                 // projection only - the slot cache itself does not exist yet, this just states what
                 // the requested size would cost so the budget can be checked before a run
@@ -1840,96 +1859,19 @@ const float * llama_model::tensor_split() const {
 
 // Allocate the per-layer expert slot cache for every layer whose experts live in host memory.
 //
-// Two buffers with different homes, and the split matters:
-//   · slots    - device memory, WEIGHTS usage, so MUL_MAT_ID is assigned to the device
-//   · slot_map - host memory, WEIGHTS usage, so the remap GET_ROWS is assigned to the CPU backend.
-//                That is what turns ids into a split input the scheduler copies to the host, giving
-//                the fill a point where ids is known and the table has not been read yet.
+// Everything is device-resident with WEIGHTS usage, so a decode layer is one CUDA split: slots and
+// loc_map for the experts, plus one shared gate_seq the scheduler stamps each token with.
 //
 // The three matrices of an expert share a slot index, so one table per layer covers all of them.
-void llama_model::prepare_moe_exclusive_load(llama_model_loader & ml, int n_slots) {
-    if (n_slots <= 0) {
-        return;
-    }
-
-    auto tensor_is_host = [&](ggml_tensor * ten) -> bool {
-        if (ten == nullptr) {
-            return false;
-        }
-        for (auto & [buft, ctx_ptr] : ml.ctx_map) {
-            for (ggml_tensor * cur = ggml_get_first_tensor(ctx_ptr.get()); cur; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
-                if (cur == ten) {
-                    return ggml_backend_buft_is_host(buft);
-                }
-            }
-        }
-        return false;
-    };
-
-    int n_prep = 0;
-    for (int il = 0; il < (int) layers.size(); il++) {
-        if (layers[il].ffn_gate_up_exps || layers[il].ffn_gate_chexps) {
-            continue;
-        }
-        ggml_tensor * t[3] = {
-            layers[il].ffn_gate_exps, layers[il].ffn_up_exps, layers[il].ffn_down_exps,
-        };
-        bool any = false;
-        bool all_host = true;
-        for (int m = 0; m < 3; m++) {
-            if (t[m] == nullptr) {
-                all_host = false;
-                break;
-            }
-            any = true;
-            if (!tensor_is_host(t[m])) {
-                all_host = false;
-                break;
-            }
-        }
-        if (!any || !all_host) {
-            continue;
-        }
-
-        const int64_t n_expert = t[0]->ne[2];
-        if (n_slots >= n_expert) {
-            LLAMA_LOG_WARN("%s: layer %d: %d slots leaves no host compact (n_expert=%d), skip\n",
-                    __func__, il, n_slots, (int) n_expert);
-            continue;
-        }
-        const int64_t n_compact = n_expert - n_slots;
-
-        for (int m = 0; m < 3; m++) {
-            GGML_ASSERT(t[m]->ne[2] == n_expert);
-            const char * name = ggml_get_name(t[m]);
-            if (ml.get_weight(name) == nullptr) {
-                LLAMA_LOG_ERROR("%s: missing GGUF weight for '%s'\n", __func__, name);
-                ml.moe_excl.clear();
-                return;
-            }
-            const size_t expert_nb = t[m]->nb[2];
-            ml.moe_excl[name] = { n_slots, (int) n_expert, expert_nb };
-            t[m]->ne[2] = n_compact;
-            t[m]->nb[3] = t[m]->nb[2] * (size_t) n_compact;
-            n_prep++;
-        }
-    }
-
-    if (n_prep > 0) {
-        LLAMA_LOG_INFO("%s: exclusive load prepared: %d host MoE banks -> compact %d (GPU seeds %d)\n",
-                __func__, n_prep, (int) (hparams.n_expert - n_slots), n_slots);
-    }
-}
-
-void llama_model::build_moe_slot_caches(int n_slots, int n_pred, llama_model_loader & ml) {
+void llama_model::build_moe_slot_caches(int n_slots, int n_pred) {
     moe_slot_layers.clear();
 
     if (n_slots <= 0) {
         return;
     }
 
-    // collect the layers that stream: expert tensors present and host-resident (already compact)
-    struct cand { int il; ggml_tensor * src[3]; int n_expert; size_t expert_nb[3]; };
+    // collect the layers that stream: expert tensors present and host-resident
+    struct cand { int il; ggml_tensor * src[3]; };
     std::vector<cand> cands;
 
     for (int il = 0; il < (int) layers.size(); il++) {
@@ -1953,21 +1895,7 @@ void llama_model::build_moe_slot_caches(int n_slots, int n_pred, llama_model_loa
             continue;
         }
 
-        cand c;
-        c.il = il;
-        c.src[0] = t[0];
-        c.src[1] = t[1];
-        c.src[2] = t[2];
-
-        // prefer loader metadata (full n_expert); fall back to n_slots + compact ne[2]
-        // gate/up/down can have different nb[2] (down is often transposed) - look up each name
-        const auto eit = ml.moe_excl.find(ggml_get_name(t[0]));
-        c.n_expert = eit != ml.moe_excl.end() ? eit->second.n_expert : n_slots + (int) t[0]->ne[2];
-        for (int m = 0; m < 3; m++) {
-            const auto mit = ml.moe_excl.find(ggml_get_name(t[m]));
-            c.expert_nb[m] = mit != ml.moe_excl.end() ? mit->second.expert_nb : t[m]->nb[2];
-        }
-        cands.push_back(c);
+        cands.push_back({ il, { t[0], t[1], t[2] } });
     }
 
     if (cands.empty()) {
@@ -1975,19 +1903,15 @@ void llama_model::build_moe_slot_caches(int n_slots, int n_pred, llama_model_loa
         return;
     }
 
-    const int n_expert = cands[0].n_expert;
+    const int n_expert = (int) cands[0].src[0]->ne[2];
     if (n_slots >= n_expert) {
-        LLAMA_LOG_WARN("%s: %d slots leaves no host compact (n_expert=%d), slot cache not built\n",
+        LLAMA_LOG_WARN("%s: %d slots covers all %d experts, slot cache not built\n",
                 __func__, n_slots, n_expert);
         return;
     }
 
-    const int n_compact = n_expert - n_slots;
-    const int n_phys    = n_slots + 1; // +1 staging for H2D-then-D2H swaps
-
-    GGML_ASSERT((int) cands[0].src[0]->ne[2] == n_compact);
-
     ggml_backend_buffer_type_t buft_dev = nullptr;
+    ggml_backend_buffer_type_t buft_pinned = nullptr;
     for (const auto & d : devices) {
         if (d.is_meta || d.dev == nullptr) {
             continue;
@@ -1995,6 +1919,7 @@ void llama_model::build_moe_slot_caches(int n_slots, int n_pred, llama_model_loa
         ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(d.dev);
         if (buft && !ggml_backend_buft_is_host(buft)) {
             buft_dev = buft;
+            buft_pinned = ggml_backend_dev_host_buffer_type(d.dev);
             break;
         }
     }
@@ -2002,10 +1927,8 @@ void llama_model::build_moe_slot_caches(int n_slots, int n_pred, llama_model_loa
         LLAMA_LOG_WARN("%s: could not find a device buffer type, slot cache not built\n", __func__);
         return;
     }
-    ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
-
-    // per layer: 3 slots + loc_map + pred_ids + slot_map (compact already loaded)
-    const size_t n_meta = cands.size() * 6 + 8;
+    // per layer: 3 slots + loc_map, plus the shared gate_seq
+    const size_t n_meta = cands.size() * 5 + 8;
 
     ggml_init_params ip = {
         /* .mem_size   = */ ggml_tensor_overhead() * n_meta,
@@ -2013,11 +1936,12 @@ void llama_model::build_moe_slot_caches(int n_slots, int n_pred, llama_model_loa
         /* .no_alloc   = */ true,
     };
     ggml_context_ptr ctx_dev { ggml_init(ip) };
-    ggml_context_ptr ctx_host{ ggml_init(ip) };
-    if (!ctx_dev || !ctx_host) {
-        LLAMA_LOG_ERROR("%s: failed to create metadata contexts\n", __func__);
+    if (!ctx_dev) {
+        LLAMA_LOG_ERROR("%s: failed to create the metadata context\n", __func__);
         return;
     }
+
+    int n_pinned = 0;   // layers whose whole bank is page-locked, i.e. copied at full DMA rate
 
     std::vector<moe_slot_layer> built;
     for (const auto & c : cands) {
@@ -2025,22 +1949,24 @@ void llama_model::build_moe_slot_caches(int n_slots, int n_pred, llama_model_loa
         L.layer    = c.il;
         L.n_expert = n_expert;
         L.n_slots  = n_slots;
+        bool pinned = buft_pinned != nullptr;
         for (int m = 0; m < 3; m++) {
-            L.src[m] = c.src[m]; // already compact host bank from exclusive load
+            L.src[m] = c.src[m];
             L.slots[m] = ggml_new_tensor_3d(ctx_dev.get(), c.src[m]->type,
-                    c.src[m]->ne[0], c.src[m]->ne[1], n_phys);
+                    c.src[m]->ne[0], c.src[m]->ne[1], n_slots);
             ggml_format_name(L.slots[m], "blk.%d.moe_slots.%d", c.il, m);
+            pinned = pinned && c.src[m]->buffer != nullptr &&
+                    ggml_backend_buffer_get_type(c.src[m]->buffer) == buft_pinned;
         }
-        L.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, n_expert);
-        ggml_format_name(L.slot_map, "blk.%d.moe_slot_map", c.il);
+        n_pinned += pinned ? 1 : 0;
+        L.pinned  = pinned;
         L.loc_map = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_I32, n_expert);
         ggml_format_name(L.loc_map, "blk.%d.moe_loc_map", c.il);
-        if (n_pred > 0) {
-            L.pred_ids = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, n_pred, 1);
-            ggml_format_name(L.pred_ids, "blk.%d.moe_pred_ids", c.il);
-        }
         built.push_back(L);
     }
+
+    ggml_tensor * gate_seq = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_I32, 1);
+    ggml_set_name(gate_seq, "moe_gate_seq");
 
     if (n_pred > 0) {
         int n_chained = 0;
@@ -2054,6 +1980,7 @@ void llama_model::build_moe_slot_caches(int n_slots, int n_pred, llama_model_loa
                 continue;
             }
             built[i].pred_w      = w;
+            built[i].n_pred      = n_pred;
             built[i].pred_target = il_next;
             n_chained++;
         }
@@ -2064,68 +1991,52 @@ void llama_model::build_moe_slot_caches(int n_slots, int n_pred, llama_model_loa
         }
     }
 
-    ggml_backend_buffer_ptr buf_dev { ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(),  buft_dev)  };
-    ggml_backend_buffer_ptr buf_host{ ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), buft_host) };
-    if (!buf_dev || !buf_host) {
-        LLAMA_LOG_ERROR("%s: failed to allocate exclusive MoE buffers (%d layers x %d+%d)\n",
-                __func__, (int) cands.size(), n_slots, n_compact);
+    ggml_backend_buffer_ptr buf_dev { ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), buft_dev) };
+    if (!buf_dev) {
+        LLAMA_LOG_ERROR("%s: failed to allocate MoE slot buffers (%d layers x %d slots)\n",
+                __func__, (int) cands.size(), n_slots);
         return;
     }
-    ggml_backend_buffer_set_usage(buf_dev.get(),  GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_set_usage(buf_dev.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // Seed GPU slots [0, n_slots) from GGUF (file read, not host compact). Staging stays empty.
-    std::vector<uint8_t> tmp;
-    for (size_t li = 0; li < built.size(); li++) {
-        moe_slot_layer & L = built[li];
-        const cand & c = cands[li];
-
-        int32_t * smap = (int32_t *) L.slot_map->data;
-        for (int e = 0; e < n_expert; e++) {
-            smap[e] = (e < n_slots) ? e : -1;
-        }
+    // Start every slot empty. loc_map[e] = n_slots + e sends the gate to the host bank, i.e. "not
+    // resident", and the cache warms up through the miss path over the first few tokens.
+    std::vector<int32_t> loc_init((size_t) n_expert);
+    for (int e = 0; e < n_expert; e++) {
+        loc_init[e] = n_slots + e;
+    }
+    for (moe_slot_layer & L : built) {
+        ggml_backend_tensor_set(L.loc_map, loc_init.data(), 0, (size_t) n_expert * sizeof(int32_t));
 
         for (int m = 0; m < 3; m++) {
-            // live compact stride is authoritative; gate/up/down differ (down often transposed)
+            // gate/up/down strides differ (down is often transposed), so take each one as it is
             const size_t nb = L.src[m]->nb[2];
-            GGML_ASSERT(c.expert_nb[m] == nb);
             GGML_ASSERT(L.slots[m]->nb[2] == nb);
-            GGML_ASSERT((int) L.src[m]->ne[2] == n_compact);
-
-            const char * name = ggml_get_name(c.src[m]);
-            const auto * w = ml.get_weight(name);
-            if (w == nullptr) {
-                LLAMA_LOG_ERROR("%s: missing GGUF weight for '%s' while seeding slots\n", __func__, name);
-                return;
-            }
-
-            tmp.resize(nb);
-            for (int s = 0; s < n_slots; s++) {
-                // Always file-read: avoids faulting mmap pages for experts that stay only on GPU.
-                ml.files.at(w->idx)->seek(w->offs + (size_t) s * nb, SEEK_SET);
-                ml.files.at(w->idx)->read_raw(tmp.data(), nb);
-                ggml_backend_tensor_set(L.slots[m], tmp.data(), (size_t) s * nb, nb);
-            }
+            // the scheduler addresses an expert as src->data + e*nb, here and on every fill
+            GGML_ASSERT(ggml_is_contiguous(L.src[m]));
         }
+        L.gate_seq = gate_seq;
     }
 
+    const int32_t seq0 = 0;
+    ggml_backend_tensor_set(gate_seq, &seq0, 0, sizeof(seq0));
+
     const double mib = 1024.0 * 1024.0;
-    LLAMA_LOG_INFO("%s: exclusive store %d layers: %d GPU slots (+1 stage) + %d host compact, %d experts\n",
-            __func__, (int) built.size(), n_slots, n_compact, n_expert);
-    LLAMA_LOG_INFO("%s: %s %.2f MiB (slots+loc) + %s %.2f MiB (maps; compact already in model buffers)\n",
+    LLAMA_LOG_INFO("%s: %d layers, %d experts -> %d device slots, host keeps the full bank\n",
+            __func__, (int) built.size(), n_expert, n_slots);
+    LLAMA_LOG_INFO("%s: %s %.2f MiB (slots+loc)\n",
             __func__,
-            ggml_backend_buffer_name(buf_dev.get()),  ggml_backend_buffer_get_size(buf_dev.get())  / mib,
-            ggml_backend_buffer_name(buf_host.get()), ggml_backend_buffer_get_size(buf_host.get()) / mib);
+            ggml_backend_buffer_name(buf_dev.get()), ggml_backend_buffer_get_size(buf_dev.get()) / mib);
     LLAMA_LOG_INFO("%s: layers %d..%d\n",
             __func__, built.front().layer, built.back().layer);
+
+    LLAMA_LOG_INFO("%s: %d/%d layers have their whole bank page-locked, a miss on the rest pays a "
+            "driver staging copy - raise --n-cache-pin for more\n",
+            __func__, n_pinned, (int) built.size());
 
     std::vector<ggml_backend_buffer_ptr> bufs;
     bufs.emplace_back(std::move(buf_dev));
     pimpl->ctxs_bufs.emplace_back(std::move(ctx_dev), std::move(bufs));
-
-    std::vector<ggml_backend_buffer_ptr> bufs2;
-    bufs2.emplace_back(std::move(buf_host));
-    pimpl->ctxs_bufs.emplace_back(std::move(ctx_host), std::move(bufs2));
 
     moe_slot_layers = std::move(built);
 }
@@ -2879,6 +2790,7 @@ llama_model_params llama_model_default_params() {
         /*.n_cache_layers              =*/ -1,
         /*.n_cache_slots               =*/ 0,
         /*.n_cache_predict             =*/ 0,
+        /*.n_cache_pin                 =*/ -1,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
