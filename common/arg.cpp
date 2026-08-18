@@ -2727,7 +2727,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("page-lock at most N MiB of the host expert weights, the rest stays pageable\n"
                       "(page-locked reaches the full H2D rate and overlaps compute, pageable goes\n"
                       "through a driver staging copy at about half the rate and overlaps nothing)\n"
-                      "-1 = auto (free memory less a 3 GiB reserve), 0 = none (default: %d)",
+                      "-1 = auto (min(host-offload, cudaMallocHost max) - 200 MiB),\n"
+                      "0 = none (default: %d)",
                       params.n_cache_pin),
         [](common_params & params, int value) {
             if (value < -1) {

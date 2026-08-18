@@ -1316,6 +1316,44 @@ static void * ggml_cuda_host_malloc(size_t size) {
     return ptr;
 }
 
+// silent try: a failed probe must not warn, the caller walks down from `want`
+static bool ggml_cuda_host_malloc_fits(size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return false;
+    }
+
+    void * ptr = nullptr;
+    cudaError_t err = cudaMallocHost((void **) &ptr, size);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    CUDA_CHECK(cudaFreeHost(ptr));
+    return true;
+}
+
+// largest cudaMallocHost that succeeds, capped at `want`. failed tries are cheap;
+// the first success is the one that actually locks pages, so walk down from want
+// instead of binary-searching through several multi-GiB successes.
+static size_t ggml_backend_cuda_host_pin_max(size_t want) {
+    if (want == 0 || getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return 0;
+    }
+    if (ggml_cuda_host_malloc_fits(want)) {
+        return want;
+    }
+
+    const size_t step = 64ull * 1024 * 1024;
+    size_t s = (want / step) * step;
+    while (s > 0 && !ggml_cuda_host_malloc_fits(s)) {
+        s -= step;
+    }
+    return s;
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * ptr = ggml_cuda_host_malloc(size);
 
@@ -5513,6 +5551,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_host_pin_max") == 0) {
+        return (void *)ggml_backend_cuda_host_pin_max;
     }
     return nullptr;
 }

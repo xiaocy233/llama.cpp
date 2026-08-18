@@ -1348,36 +1348,92 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // Streaming wants every host expert page-locked. A pageable H2D is not asynchronous: the driver
     // drains the device and stages the bytes, so it runs at about half the rate and overlaps nothing.
     //
-    // Page-locked pages cannot be evicted though, so locking all of a bank the machine cannot spare
-    // makes the next device allocation fail - reported as a CUDA OOM far from the cause. Keep a
-    // reserve for the driver, the KV cache and everything allocated after this point.
-    //
-    // Whatever does not fit is pageable. The layers are created in order, so the cap decides how many
-    // of the lowest streaming layers are page-locked - the lowest ones carry the most expert churn.
+    // cudaMallocHost has a tighter cap than AvailPhys. Asking for the whole host bank in one shot
+    // can fail and dump every expert to pageable. Auto probes the largest lock that succeeds, then
+    // leaves 200 MiB so the real CUDA_Host buffer still fits. Layers are created in order, so the
+    // cap page-locks the lowest streaming layers first.
     if (params.n_cache_slots > 0 || params.n_cache_layers > 0) {
         size_t free_mem = 0, total_mem = 0;
         ggml_backend_dev_memory(cpu_dev, &free_mem, &total_mem);
 
-        const size_t reserve = 3ull * 1024 * 1024 * 1024;
+        const size_t leave = 200ull * 1024 * 1024;
 
+        // expert matrices that will live on the host (same name filter as the layout report)
+        size_t host_w = 0;
+        {
+            std::vector<std::regex> cpu_ov;
+            if (params.tensor_buft_overrides) {
+                for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                    if (o->buft == ggml_backend_cpu_buffer_type()) {
+                        cpu_ov.emplace_back(o->pattern);
+                    }
+                }
+            }
+
+            for (const auto & kv : ml.weights_map) {
+                const std::string & name = kv.first;
+                int il = -1;
+                if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < 0) {
+                    continue;
+                }
+                if (name.find("ffn_") == std::string::npos || name.find("_exps") == std::string::npos) {
+                    continue;
+                }
+                if (name.find("_exps_b") != std::string::npos || name.find("_exps_s") != std::string::npos) {
+                    continue;
+                }
+
+                bool on_host = false;
+                if (il < (int) pimpl->dev_layer.size() && pimpl->dev_layer[il].dev == cpu_dev) {
+                    on_host = true;
+                }
+                if (params.n_cache_layers >= 0 && il >= params.n_cache_layers) {
+                    on_host = true;
+                }
+                if (!on_host) {
+                    for (const auto & re : cpu_ov) {
+                        if (std::regex_search(name, re)) {
+                            on_host = true;
+                            break;
+                        }
+                    }
+                }
+                if (on_host && kv.second.tensor) {
+                    host_w += ggml_nbytes(kv.second.tensor);
+                }
+            }
+        }
+
+        size_t pin_max = 0;
         size_t budget = 0;
         if (params.n_cache_pin >= 0) {
             budget = (size_t) params.n_cache_pin * 1024 * 1024;
         } else {
-            budget = free_mem > reserve ? free_mem - reserve : 0;
+            using host_pin_max_fn = size_t (*)(size_t);
+            for (const auto & d : devices) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev);
+                if (!reg) {
+                    continue;
+                }
+                auto * fn = (host_pin_max_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_pin_max");
+                if (!fn) {
+                    continue;
+                }
+                pin_max = fn(host_w);
+                break;
+            }
+            const size_t cap = pin_max < host_w ? pin_max : host_w;
+            budget = cap > leave ? cap - leave : 0;
         }
 
         ml.host_pinned_budget = budget;
 
         const double mib = 1024.0 * 1024.0;
-        LLAMA_LOG_INFO("%s: page-locked host weights capped at %.2f MiB (%s, %.2f MiB free of %.2f MiB)\n",
-                __func__, budget / mib, params.n_cache_pin >= 0 ? "--n-cache-pin" : "auto",
-                free_mem / mib, total_mem / mib);
-
-        if (free_mem < budget + reserve) {
-            LLAMA_LOG_WARN("%s: this leaves under %.2f MiB unlocked, the load may fail\n",
-                    __func__, reserve / mib);
-        }
+        const char * mode = params.n_cache_pin >= 0 ? "--n-cache-pin" : "auto";
+        LLAMA_LOG_INFO("%s: page-locked host weights capped at %.2f MiB (%s)\n",
+                __func__, budget / mib, mode);
+        LLAMA_LOG_DEBUG("%s: pin debug: free_mib=%.2f host_offload_mib=%.2f pin_mib=%.2f pin_max_mib=%.2f mode=%s\n",
+                __func__, free_mem / mib, host_w / mib, budget / mib, pin_max / mib, mode);
     }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;

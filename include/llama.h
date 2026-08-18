@@ -350,7 +350,8 @@ extern "C" {
         // MiB of host weights to page-lock. Page-locked memory reaches the full H2D rate, pageable
         // memory goes through a driver staging copy at roughly half of it. But page-locked pages
         // cannot be paged out, so too much of it makes a later device allocation fail.
-        // -1 = auto (half of the free memory), 0 = none. Needs n_cache_slots or n_cache_layers.
+        // -1 = auto: min(host-offload, largest cudaMallocHost) minus 200 MiB. 0 = none.
+        // Needs n_cache_slots or n_cache_layers.
         int32_t n_cache_pin;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
