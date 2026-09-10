@@ -590,6 +590,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_GATE,
+
         GGML_OP_COUNT,
     };
 
@@ -1447,6 +1449,49 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // Prefill dual-base MUL_MAT_ID: experts live in slots (device) and/or ring (compact host copy).
+    // loc_map[e] < n_slots_phys -> slots[loc]; else ring[loc - n_slots_phys].
+    // src[0]=slots, src[1]=b, src[2]=ids, src[3]=ring, src[4]=loc_map (I32 [n_expert]).
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_dual(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * slots,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * ring,
+            struct ggml_tensor  * loc_map);
+
+    // Decode MoE slot cache: turn logical expert ids into physical slot ids, and let the device ask
+    // the host for the ones that are not resident. Runs on the device, so no host round trip cuts
+    // the layer in two. See probe/GATE-PLAN.md.
+    //
+    // Metal decode gate. I32 [n_ids, 2]: resolved slots and selected logical expert IDs.
+    GGML_API struct ggml_tensor * ggml_moe_gate_substitute(
+            struct ggml_context * ctx,
+            struct ggml_tensor * loc_map,
+            struct ggml_tensor * ids_in,
+            struct ggml_tensor * seq,
+            struct ggml_tensor * probs,
+            int layer, int n_ids, int n_slots, float threshold);
+
+    // Publishes IDs, predictions and a miss mask, then waits for the worker before resolving slots.
+    // The first n_ids of ids_in belong to this layer; the remaining IDs are predictions.
+    GGML_API struct ggml_tensor * ggml_moe_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * loc_map,   // I32 [n_expert], slot of each expert
+            struct ggml_tensor  * ids_in,    // I32, this layer's ids then the prediction
+            struct ggml_tensor  * seq,       // I32 [1], token counter, device
+            int                   layer,     // index into the mailbox, not the model layer
+            int                   n_ids,
+            int                   n_slots);  // loc_map[e] >= n_slots means not resident
+
+    // Join a resident layer's real and predicted router ids. Publishes pred_ids and returns ids.
+    GGML_API struct ggml_tensor * ggml_moe_head(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * pred_ids,
+            struct ggml_tensor  * seq,
+            int                   layer);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

@@ -317,6 +317,141 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // MoE gate mailbox.
+    //
+    // Decode gates publish expert IDs, then wait for the worker before resolving slot indices.
+    // The release must cover all earlier weight copies and location updates, including prefetches.
+    //
+    // The backend owns this memory. It has to: it is mapped page-locked memory, and a CUDA host
+    // buffer is not a supported buffer type on a discrete GPU, so it cannot be a plain tensor src
+    // without the scheduler making a device copy of it.
+    #define GGML_MOE_GATE_MAX_IDS    32   // n_expert_used + n_pred; miss_mask still caps n_ids at 32
+    #define GGML_MOE_GATE_MAX_EXPERTS 256
+    #define GGML_MOE_GATE_MAX_LAYERS 256
+    #define GGML_MOE_GATE_MODE_NORMAL 0
+    #define GGML_MOE_GATE_MODE_HEAD   1
+    #define GGML_MOE_GATE_MODE_SUBSTITUTE 2
+
+    // One entry per gate, rewritten every token. The worker has a whole token to read an entry
+    // before the device comes back to it, and seq lets it tell a stale entry from a fresh one.
+    struct ggml_moe_gate_entry {
+        uint32_t seq;         // written last, after a system fence: this is the handshake
+        uint32_t layer;
+        uint32_t miss_mask;   // bit i = ids[i] was not resident when the gate published
+        uint32_t n_ids;
+        uint32_t n_pred;
+        uint32_t payload_hash; // substitute mode: FNV-1a over IDs and router probabilities
+        uint32_t mode;
+        float substitute_threshold;
+        int32_t  ids[GGML_MOE_GATE_MAX_IDS];   // n_ids of this layer, then n_pred predicted
+        float router_probs[GGML_MOE_GATE_MAX_EXPERTS];
+        uint8_t response_align[96]; // CPU response starts on a separate 256-byte block
+        int32_t selected_ids[GGML_MOE_GATE_MAX_IDS]; // CPU-owned response, separate from GPU publication
+        uint8_t response_tail[128];
+    };
+
+    struct ggml_moe_gate_channel {
+        struct ggml_moe_gate_entry * ring;     // [GGML_MOE_GATE_MAX_LAYERS]
+        volatile uint32_t          * release;  // [GGML_MOE_GATE_MAX_LAYERS], host stores seq to resume
+        volatile int32_t           * timeout;  // [GGML_MOE_GATE_MAX_LAYERS] park timeouts, must stay 0
+        // Optional asynchronous release. The callback must signal only after all earlier fills
+        // and location updates complete. Without it, the worker drains its stream and stores release.
+        void                     ** gate_events;    // [GGML_MOE_GATE_MAX_LAYERS], may be NULL
+        void                      (* gate_signal)(void * gate_ctx, int slot, uint32_t seq);
+        void                      * gate_ctx;       // may be NULL
+    };
+
+    // Ask a backend for its gate mailbox, allocating it on first call. False if the backend has none.
+    GGML_API bool ggml_backend_moe_gate_channel(ggml_backend_t backend, struct ggml_moe_gate_channel * out);
+
+    // MoE expert slot cache.
+    //
+    // At decode a token touches only n_expert_used of the n_expert experts in a layer, so keeping a
+    // small per-layer cache of experts in device memory turns the per-token host read into a copy of
+    // just the ones that are missing. The three matrices of one expert (gate, up, down) share a slot
+    // index, so one table and one gate node cover the whole layer.
+    //
+    // The caller allocates everything and builds the graph as
+    //     MUL_MAT_ID(slots[m], b, moe_gate(loc_map, ids, seq))
+    // With prediction on, the ids the gate reads carry n_pred extra entries (see below).
+    struct ggml_moe_slot_cache {
+        // The host keeps every expert, so a slot is a copy and never the only one: an eviction just
+        // drops it, and every transfer is H2D.
+        struct ggml_tensor * src[3];     // host bank [n_embd, n_ff, n_expert], NULL = skip
+        struct ggml_tensor * slots[3];   // device cache [n_embd, n_ff, n_slots]
+        // loc_map[e] = slot index, or n_slots + e to read the host bank. Decode reads the second
+        // form as "missing"; Prefill dual-base reads it as a ring offset. DEVICE I32 [n_expert].
+        struct ggml_tensor * loc_map;
+        struct ggml_tensor * gate_seq;   // device I32 [1], the token counter, shared by every cache
+        int n_expert;                    // expert count
+        int n_slots;                     // cache capacity (CLI)
+        int layer;                       // for logging only
+        int gate_slot;                   // mailbox index, filled in by the scheduler
+        // Set when src[] is page-locked. A pageable source makes the driver stage the copy itself,
+        // and that staging can wait on the device - which deadlocks against a parked gate. The
+        // scheduler stages those through its own buffer instead.
+        bool pinned;
+
+        // Disk-resident bank: src_fd >= 0 means the bank is not in host memory at all
+        // (src[m]->data is a marker pointer); expert e of matrix m is pread() from file offset
+        // src_off[m] + e*nb[2] by the backend's set_tensor_async_file hook.
+        // src_fd < 0 = ordinary host-memory bank.
+        int      src_fd;
+        uint64_t src_off[3];
+
+        // ---- expert prediction, optional ----
+        //
+        // Which experts a layer will route to is only known once its own router has run, by which
+        // point there is no time left to fetch anything. But the routers are plain matrices, so the
+        // target layer's router can be applied to this layer's hidden state instead: the residual
+        // stream moves slowly between layers, so the result is a usable guess one layer ahead.
+        //
+        // The caller multiplies pred_w with its hidden state, takes the top n_pred, and appends the
+        // result to the ids the gate reads. The gate publishes the guess with the rest of the entry,
+        // and the worker prefetches those experts into layer pred_target's slots.
+        //
+        // Prefetch may evict from the target cache before its gate is released. Every target gate
+        // waits for the worker, including all-hit gates, so wrong guesses only waste bandwidth.
+        struct ggml_tensor * pred_w;      // router of layer pred_target, NULL = prediction off
+        int                  n_pred;      // experts guessed per token, 0 = prediction off
+        int                  pred_target; // layer the prediction is for
+
+        // The resident layer immediately before the first cached layer has no cache gate to carry
+        // its prediction. It publishes through head_gate_slot instead.
+        struct ggml_tensor * head_pred_w;
+        int                  head_n_pred;
+        int                  head_pred_source;
+        int                  head_gate_slot; // mailbox index, assigned by the scheduler
+    };
+
+    // Register before the first reserve. Returns false if the registry is full or the cache is
+    // malformed (shape mismatch, n_slots < n_expert_used).
+    GGML_API bool ggml_backend_sched_add_moe_slot_cache(
+            ggml_backend_sched_t sched, const struct ggml_moe_slot_cache * cache, int n_expert_used);
+
+    // The I32[1] device tensor every gate reads its token counter from. The scheduler writes it
+    // once per decode step, so it must live outside the compute buffer.
+    GGML_API void ggml_backend_sched_set_moe_gate_seq(ggml_backend_sched_t sched, struct ggml_tensor * seq);
+
+    // Applies to the next graph; synchronizes pending work when the value changes.
+    GGML_API void ggml_backend_sched_set_moe_substitute_enabled(ggml_backend_sched_t sched, bool enabled);
+
+    // Look up the cache registered for a host expert tensor, NULL if there is none. Used by the
+    // graph builder to decide whether to emit the remap and substitute the slot tensor.
+    GGML_API const struct ggml_moe_slot_cache * ggml_backend_sched_find_moe_slot_cache(
+            ggml_backend_sched_t sched, const struct ggml_tensor * src);
+
+    // Find the first-cache predictor emitted while model layer source_layer is built.
+    GGML_API const struct ggml_moe_slot_cache * ggml_backend_sched_find_moe_head_predictor(
+            ggml_backend_sched_t sched, int source_layer);
+
+    // Enable prefetching of host-resident MoE expert weights onto an auxiliary stream, so the copies
+    // overlap the compute instead of being serialized before it. ring_depth is the number of expert
+    // tensors kept in flight; 0 disables it. Values below the internal minimum are raised.
+    //
+    // Must be called before the first reserve: the ring changes the graph and the compute buffer size.
+    GGML_API void                 ggml_backend_sched_set_weight_prefetch(ggml_backend_sched_t sched, int ring_depth);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
