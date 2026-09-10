@@ -81,6 +81,11 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// Ring depth for the MoE weight prefetch. 3 is the measured knee on an RTX 5060 over an 8188-token
+// prefill: 1574 t/s at depth 2, 1810 at depth 3, for 18 MiB more compute buffer. Deeper was not
+// measured, and the transfer is already almost fully hidden at 3.
+static constexpr int LLAMA_MOE_PREFETCH_RING_DEPTH = 3;
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -110,6 +115,12 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
+
+    if (!std::isfinite(params.moe_substitute_threshold) ||
+            params.moe_substitute_threshold < 0.0f || params.moe_substitute_threshold > 1.0f) {
+        throw std::invalid_argument("moe_substitute_threshold must be finite and in [0, 1]");
+    }
+    cparams.moe_substitute_threshold = params.moe_substitute_threshold;
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
@@ -625,6 +636,8 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
+    sched.reset();
+
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
@@ -641,6 +654,55 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    // --n-cache-layers pins the leading layers' experts in VRAM and streams the rest, so those
+    // streamed copies are worth overlapping with the compute. Has to happen before the first
+    // reserve: the prefetch ring changes the graph and therefore the compute buffer size.
+    // On Metal with disk-resident banks the scheduler matrix ring is not used: prefill streams
+    // whole layers through the layer-ring offloader (llama-moe-prefill.cpp) instead, and decode
+    // fills go through the host pool. Keeping the ring on would just grow the compute buffer.
+    const bool moe_disk_prefill =
+        model.n_cache_layers() >= 0 && !model.moe_slot_layers.empty() &&
+        model.moe_slot_layers.front().src_fd >= 0;
+    if (model.n_cache_layers() >= 0 && !moe_disk_prefill) {
+        ggml_backend_sched_set_weight_prefetch(sched.get(), LLAMA_MOE_PREFETCH_RING_DEPTH);
+    }
+
+    // Register the MoE expert slot caches. Has to happen before the first reserve: the remap node is
+    // only emitted for tensors that have a registered cache, so the graph shape depends on this.
+    if (!model.moe_slot_layers.empty()) {
+        init_moe_slot_caches();
+        for (const auto & c : moe_slot_caches) {
+            ggml_backend_sched_add_moe_slot_cache(sched.get(), &c, (int) model.hparams.n_expert_used);
+        }
+        ggml_backend_sched_set_moe_gate_seq(sched.get(), moe_slot_caches.front().gate_seq);
+    }
+
+    // Backend prefill layer ring: stream whole layers from disk while the GPU computes on the
+    // previous ones (--cache-disk). Registered as the backend's MoE interceptor handler; only
+    // prefill graphs bind to it, decode keeps the slot-cache path above.
+    {
+        const bool prefill_supported = !backends.empty() && llama_moe_prefill_offload::supported(backends.front().get());
+        if (model.moe_disk_fds.empty() == false && prefill_supported) {
+            const int n_ring = model.n_cache_prefill_buffers() > 0 ? model.n_cache_prefill_buffers() : 2;
+            moe_prefill = std::make_unique<llama_moe_prefill_offload>(backends.front().get(), n_ring);
+            for (const auto & L : model.moe_slot_layers) {
+                if (L.src_fd < 0) {
+                    continue;
+                }
+                for (int m = 0; m < 3; m++) {
+                    if (L.src[m] == nullptr) {
+                        continue;
+                    }
+                    // pools have to exist before the first graph build: the scheduler sizes its
+                    // compute buffers against the graph, and a buffer-less pool tensor would be
+                    // carved out of the compute buffer at full-bank size per matrix
+                    moe_prefill->add_pool(L.src[m], L.layer, L.src_fd, L.src_off[m]);
+                }
+            }
+            moe_prefill->finalize_buffers();
+        }
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1268,6 +1330,11 @@ bool llama_context::get_causal_attn() const {
     return cparams.causal_attn;
 }
 
+void llama_context::set_moe_generation_count(llama_seq_id seq_id, int32_t n_generated) {
+    GGML_ASSERT(seq_id >= 0 && n_generated >= 0);
+    moe_generation_counts[seq_id] = n_generated;
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1404,6 +1471,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // prefill layer-ring lifecycle: arm the ring ahead of a prefill graph, stand it down before a
+    // decode graph (decode owns the banks through the slot cache + host gate instead)
+    if (moe_prefill) {
+        if (ubatch.n_seq_tokens > 1) {
+            moe_prefill->prepare_prefill();
+        } else if (moe_prefill->active()) {
+            // the prefill graph's command buffers may still be in flight; drain them so the
+            // sidecar never writes a ring slot the GPU is still reading
+            ggml_backend_sched_synchronize(sched.get());
+            moe_prefill->release_prefill_buffers();
+        }
+    }
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1458,6 +1538,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    if (cparams.moe_substitute_threshold > 0.0f) {
+        constexpr int32_t protected_tokens = 5;
+        bool enabled = ubatch.n_tokens == 1;
+        for (int32_t s = 0; enabled && s < ubatch.n_seq_id[0]; ++s) {
+            const auto it = moe_generation_counts.find(ubatch.seq_id[0][s]);
+            enabled = it != moe_generation_counts.end() && it->second >= protected_tokens;
+        }
+        ggml_backend_sched_set_moe_substitute_enabled(sched.get(), enabled);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -2601,6 +2691,7 @@ llm_graph_params llama_context::graph_params(
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.moe_prefill =*/ (ubatch.n_seq_tokens > 1) ? moe_prefill.get() : nullptr,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3489,6 +3580,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     for (const auto & [buft, size] : model.memory_breakdown()) {
         ret[buft].model += size;
     }
+    if (buf_moe) {
+        ret[ggml_backend_buffer_get_type(buf_moe.get())].context += ggml_backend_buffer_get_size(buf_moe.get());
+    }
     if (memory) {
         for (const auto & [buft, size] : memory->memory_breakdown()) {
             ret[buft].context += size;
@@ -3778,6 +3872,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.moe_substitute_threshold    =*/ 0.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -3985,6 +4080,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 bool llama_get_causal_attn(const llama_context * ctx) {
     return ctx->get_causal_attn();
+}
+
+void llama_set_moe_generation_count(llama_context * ctx, llama_seq_id seq_id, int32_t n_generated) {
+    ctx->set_moe_generation_count(seq_id, n_generated);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

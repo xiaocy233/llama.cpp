@@ -36,6 +36,9 @@ set(LLAMA_CORE_SOURCES
     llama-model-loader.cpp
     llama-model-saver.cpp
     llama-model.cpp
+    llama-moe-prefill.cpp
+    llama-moe.cpp
+    llama-moe-graph.cpp
     llama-moe-source.cpp
     llama-quant.cpp
     llama-sampler.cpp
