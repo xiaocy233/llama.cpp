@@ -1412,6 +1412,20 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Mailbox for GGML_OP_MOE_GATE. Mapped page-locked memory: the gate writes it from the device and a
+// host worker polls it without either side going through the driver. It is backend-private because
+// a CUDA host buffer is not a supported buffer type on a discrete GPU (see
+// ggml_backend_cuda_device_supports_buft), so as a plain tensor src the scheduler would copy it to
+// the device and the host would poll a page nothing ever writes.
+struct ggml_cuda_moe_gate_channel {
+    ggml_moe_gate_entry * ring_host    = nullptr;
+    ggml_moe_gate_entry * ring_dev     = nullptr;
+    uint32_t            * release_host = nullptr;
+    uint32_t            * release_dev  = nullptr;
+    int32_t             * timeout_host = nullptr;
+    int32_t             * timeout_dev  = nullptr;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1523,6 +1537,11 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // MoE gate mailbox, allocated on first use and never moved, so graph capture stays valid
+    ggml_cuda_moe_gate_channel moe_gate_ch;
+
+    const ggml_cuda_moe_gate_channel & moe_gate_channel();
 };
 
 struct ggml_cuda_mm_fusion_args_host {
@@ -1541,6 +1560,34 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
 };
+
+// MoE dual base: the experts of one layer live in two places at once, a small set of device slots
+// and a second bank holding all of them. loc_map[e] picks which, and the three matrices of a layer
+// share one table. loc_map == nullptr means single base, i.e. every other caller.
+struct ggml_cuda_mm_dual_args_device {
+    const void *    x_ring  = nullptr;
+    const int32_t * loc_map = nullptr;
+    int             n_phys  = 0;         // slots in the first base; loc >= n_phys means the ring
+};
+
+static __device__ __forceinline__ void moe_resolve_x_channel(
+        const char * x, const char * x_ring, const int32_t * loc_map, int n_phys,
+        int channel,
+        const char * & x_base, int & channel_phys) {
+    if (loc_map == nullptr) {
+        x_base = x;
+        channel_phys = channel;
+        return;
+    }
+    const int loc = loc_map[channel];
+    if (loc < n_phys) {
+        x_base = x;
+        channel_phys = loc;
+    } else {
+        x_base = x_ring;
+        channel_phys = loc - n_phys;
+    }
+}
 
 struct ggml_cuda_kernel_launch_params {
     dim3 block_nums;
