@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-prefill.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -54,6 +55,7 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    void init_moe_slot_caches();
 
     void synchronize();
 
@@ -118,6 +120,7 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    void set_moe_generation_count(llama_seq_id seq_id, int32_t n_generated);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -280,6 +283,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    std::map<llama_seq_id, int32_t> moe_generation_counts;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
@@ -341,12 +345,19 @@ private:
 
     std::vector<swap_info> output_swaps;
 
-    ggml_backend_sched_ptr sched;
-
-    bool sched_need_reserve = true;
-
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    ggml_context_ptr ctx_moe;
+    ggml_backend_buffer_ptr buf_moe;
+    std::vector<ggml_moe_slot_cache> moe_slot_caches;
+
+    ggml_backend_sched_ptr sched;
+
+    // Metal prefill layer-ring offloader (active with --cache-disk + Metal + slot caches)
+    std::unique_ptr<llama_moe_prefill_offload> moe_prefill;
+
+    bool sched_need_reserve = true;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

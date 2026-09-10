@@ -3,6 +3,7 @@
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-hparams.h"
+#include "llama-moe-prefill.h"
 #include "llama-adapter.h"
 
 #include <cstdint>
@@ -18,6 +19,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_model_loader;
 
 struct llama_memory_context_i;
 
@@ -771,6 +773,10 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // the Metal prefill layer-ring offloader, active on prefill graphs when --cache-disk is on.
+    // nullptr = no binding happens and the banks take their regular path
+    llama_moe_prefill_offload * moe_prefill = nullptr;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -987,6 +993,9 @@ struct llm_graph_context {
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
+    // Metal prefill layer-ring offloader (nullptr when off); see llm_graph_params
+    llama_moe_prefill_offload * moe_prefill = nullptr;
+
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
@@ -1000,6 +1009,24 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // MoE slot cache: the gate depends only on (loc_map, ids), and a layer's gate/up/down share
+    // both. Emitting it once per layer rather than once per matrix keeps it to one gate - and one
+    // park point - per layer. Fresh per graph, so no invalidation.
+    struct moe_slot_remap {
+        const ggml_tensor * loc_map;
+        const ggml_tensor * ids;
+        ggml_tensor       * ids_slot;
+    };
+    mutable std::vector<moe_slot_remap> moe_slot_remaps;
+
+    // Expert prediction waiting to be appended to a gate. build_moe_ffn computes it where the
+    // router input is still at hand; the gate that carries it is built later, per weight matrix.
+    struct moe_slot_pred {
+        const ggml_tensor * loc_map;
+        ggml_tensor       * ids;
+    };
+    mutable std::vector<moe_slot_pred> moe_slot_preds;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

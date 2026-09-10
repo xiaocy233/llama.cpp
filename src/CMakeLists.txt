@@ -34,8 +34,11 @@ add_library(llama
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
-            llama-model.cpp
+            llama-moe-prefill.cpp
+            llama-moe.cpp
+            llama-moe-graph.cpp
             llama-moe-source.cpp
+            llama-model.cpp
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp
