@@ -1,3 +1,4 @@
+#include "../ggml-moe-backend.h"
 #include "ggml-metal.h"
 
 #include "ggml-impl.h"
@@ -6,6 +7,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
+#include "ggml-metal-moe.h"
 
 #include <mutex>
 #include <string>
@@ -565,6 +567,55 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     ggml_metal_set_n_cb(ctx, n_cb);
 }
 
+static int ggml_backend_metal_select_stream(ggml_backend_t backend, int stream) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    return ggml_metal_select_stream(ctx, stream);
+}
+
+static void ggml_backend_metal_set_tensor_async_stream(ggml_backend_t backend, int stream, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_set_tensor_async_stream(ctx, stream, tensor, data, offset, size);
+}
+
+static void ggml_backend_metal_synchronize_stream(ggml_backend_t backend, int stream) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_synchronize_stream(ctx, stream);
+}
+
+static bool ggml_backend_metal_moe_gate_channel(ggml_backend_t backend, struct ggml_moe_gate_channel * out) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_moe_t moe = ggml_metal_moe_get(ctx);
+    const bool ok = ggml_metal_moe_gate_channel(moe, out);
+    if (ok) {
+        // the event form: expose the per-slot events and the signal entry so the shared worker
+        // can release the queue-side waits once the fills it issued have landed
+        out->gate_events = ggml_metal_moe_gate_events(moe);
+        out->gate_signal = ggml_metal_moe_gate_signal_drained;
+        out->gate_ctx    = moe;
+    }
+    return ok;
+}
+
+static bool ggml_backend_metal_set_tensor_async_file(ggml_backend_t backend, int stream, ggml_tensor * tensor, int fd, uint64_t file_off, size_t offset, size_t size) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    return ggml_metal_set_tensor_async_file(ctx, stream, tensor, fd, file_off, offset, size);
+}
+
 static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -582,6 +633,14 @@ static ggml_backend_i ggml_backend_metal_i = {
     /* .event_record            = */ ggml_backend_metal_event_record,
     /* .event_wait              = */ ggml_backend_metal_event_wait,
     /* .graph_optimize          = */ ggml_backend_metal_graph_optimize,
+    /* .select_stream           = */ ggml_backend_metal_select_stream,
+    /* .set_tensor_async_stream = */ ggml_backend_metal_set_tensor_async_stream,
+    /* .synchronize_stream      = */ ggml_backend_metal_synchronize_stream,
+    /* .moe_gate_channel        = */ ggml_backend_metal_moe_gate_channel,
+    // NULL on purpose: the host gate never parks a kernel, so there is nothing for the
+    // device to release. this also marks the backend as host-gated for the scheduler.
+    /* .moe_gate_release_stream = */ NULL,
+    /* .set_tensor_async_file   = */ ggml_backend_metal_set_tensor_async_file,
 };
 
 static ggml_guid_t ggml_backend_metal_guid(void) {
@@ -639,6 +698,44 @@ void ggml_backend_metal_capture_next_compute(ggml_backend_t backend) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
     ggml_metal_capture_next_compute(ctx);
+}
+
+// ---- MoE expert streaming API ----
+
+ggml_backend_buffer_type_t ggml_backend_metal_get_shared_buffer_type(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+    GGML_UNUSED(backend);
+
+    // single-device backend: the shared (unified-memory) buffer type of device 0
+    return ggml_backend_metal_buffer_type_shared(0);
+}
+
+void * ggml_backend_metal_event_new(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    return ggml_metal_device_event_init(ggml_metal_get_dev(ctx));
+}
+
+void ggml_backend_metal_event_free(void * event) {
+    ggml_metal_device_event_free(NULL, (ggml_metal_event_t) event);
+}
+
+void ggml_backend_metal_event_signal(void * event, uint64_t value) {
+    ggml_metal_event_host_signal((ggml_metal_event_t) event, value);
+}
+
+void * ggml_backend_metal_event_raw(void * event) {
+    return ggml_metal_event_obj((ggml_metal_event_t) event);
+}
+
+void ggml_backend_metal_set_moe_handler(ggml_backend_t backend, struct ggml_metal_moe_handler handler) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_device_set_moe_handler(ggml_metal_get_dev(ctx), handler);
 }
 
 // backend device
@@ -868,7 +965,15 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
     GGML_UNUSED(reg);
 }
 
+static ggml_moe_backend_caps ggml_backend_metal_moe_get_caps(ggml_backend_dev_t) {
+    return { 3, true, getenv("GGML_METAL_MOE_HOST_GATE") == nullptr };
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_moe_get_caps") == 0) {
+        return (void *) ggml_backend_metal_moe_get_caps;
+    }
+
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
     }

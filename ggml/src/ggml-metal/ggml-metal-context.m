@@ -6,10 +6,14 @@
 #import "ggml-metal-impl.h"
 #import "ggml-metal-common.h"
 #import "ggml-metal-ops.h"
+#import "ggml-metal-moe.h"
 
 #import <Foundation/Foundation.h>
 
 #import <Metal/Metal.h>
+
+#include <errno.h>
+#include <unistd.h>
 
 #undef MIN
 #undef MAX
@@ -79,6 +83,13 @@ struct ggml_metal {
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
+
+    // MoE host-offload state (ggml-metal-moe.m): created on first use, freed with the context
+    void * moe;
+
+    // currently selected "stream" (see ggml-backend-impl.h): on Metal, 0 is the GPU path and
+    // anything else is served by the host fill pool
+    int cur_stream;
 };
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
@@ -229,6 +240,11 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
     ggml_metal_device_event_free(ctx->dev, ctx->ev_cpy);
 
+    if (ctx->moe) {
+        ggml_metal_moe_free((ggml_metal_moe_t) ctx->moe);
+        ctx->moe = nil;
+    }
+
     free(ctx);
 }
 
@@ -305,6 +321,20 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
 }
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (ctx->cur_stream != 0) {
+        // prefetch-ring weight copy: with a unified memory the copy is a plain memcpy into the
+        // shared destination buffer, executed by the host fill pool so it overlaps GPU compute.
+        // ordering against the ring buffer's previous reader is handled by the pool's
+        // ring_begin/ring_end event plumbing (ggml-metal-moe.m).
+        GGML_ASSERT(tensor->data != NULL);
+        ggml_metal_moe_fill_mem(ggml_metal_moe_get(ctx), (char *) tensor->data + offset, data, size);
+        return;
+    }
+
+    if (size == 0) {
+        return;   // a zero-sized copy is a no-op (the scheduler can emit these for empty views)
+    }
+
     @autoreleasepool {
         // wrap the source data into a Metal buffer
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
@@ -349,6 +379,10 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 }
 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (size == 0) {
+        return;   // a zero-sized copy is a no-op (the scheduler can emit these for empty views)
+    }
+
     @autoreleasepool {
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
         id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
@@ -435,10 +469,90 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+// MoE gate graphs need the serial path: every resolving gate (n_ids > 0) is a host barrier that
+// publishes the mailbox entry, lets the worker fill the missing experts, and resolves the ids in
+// place. The barrier needs the router output, so the command buffer is committed and drained at
+// each gate - that boundary is also exactly what makes the worker's host-side fills visible to
+// the next segment. Head prediction uses a device kernel.
+static enum ggml_status ggml_metal_graph_compute_gated(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+
+        id<MTLCommandBuffer> cmd_buf = nil;
+
+        int seg_start = 0;
+        for (int i = 0; i <= gf->n_nodes; i++) {
+            const bool at_gate = i < gf->n_nodes &&
+                    gf->nodes[i]->op == GGML_OP_MOE_GATE &&
+                    ggml_get_op_params_i32(gf->nodes[i], 4) == GGML_MOE_GATE_MODE_NORMAL;
+
+            if (at_gate || i == gf->n_nodes) {
+                if (i > seg_start) {
+                    cmd_buf = [queue commandBufferWithUnretainedReferences];
+                    [cmd_buf retain];
+                    [ctx->cmd_bufs_ext addObject:cmd_buf];
+                    ctx->cmd_buf_last = cmd_buf;
+
+                    ggml_metal_op_t ctx_op = ggml_metal_op_init(
+                        ctx->dev, cmd_buf, gf, seg_start, i,
+                        ctx->use_fusion, ctx->use_concurrency,
+                        /* use_capture = */ false, ctx->debug_graph, ctx->debug_fusion);
+
+                    for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                        const int res = ggml_metal_op_encode(ctx_op, idx);
+                        if (res == 0) {
+                            break;
+                        }
+                        idx += res - 1;
+                    }
+
+                    ggml_metal_op_free(ctx_op);
+
+                    [cmd_buf commit];
+                }
+
+                if (at_gate) {
+                    // the ids the gate reads are produced by the segment that just committed
+                    if (cmd_buf != nil) {
+                        [cmd_buf waitUntilCompleted];
+                    }
+
+                    if (!ggml_metal_moe_host_gate(ggml_metal_moe_get(ctx), gf->nodes[i])) {
+                        return GGML_STATUS_FAILED;
+                    }
+                }
+
+                seg_start = i + 1;
+            }
+        }
+
+        return GGML_STATUS_SUCCESS;
+    }
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
+    }
+
+    // Resolving gates (n_ids > 0) now encode as a kernel + a queue-side event wait
+    // (ggml_metal_op_moe_gate): the whole decode graph runs on the normal progressive-submission
+    // path and the shared worker signals the gate events after its fills land. The old
+    // commit-and-drain host barrier survives only behind this env switch as a fallback.
+    static BOOL host_gate_env = NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        host_gate_env = getenv("GGML_METAL_MOE_HOST_GATE") != NULL;
+    });
+    if (host_gate_env) {
+        for (int i = 0; i < gf->n_nodes; i++) {
+            if (gf->nodes[i]->op == GGML_OP_MOE_GATE &&
+                    ggml_get_op_params_i32(gf->nodes[i], 4) == GGML_MOE_GATE_MODE_NORMAL &&
+                    ggml_get_op_params_i32(gf->nodes[i], 1) > 0) {
+                return ggml_metal_graph_compute_gated(ctx, gf);
+            }
+        }
     }
 
     // number of nodes encoded by the main thread (empirically determined)
@@ -625,6 +739,13 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
 }
 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
+    if (ctx->cur_stream != 0) {
+        // prefetch ring: the copies are host-side pool tasks, so the event is armed to be
+        // signaled from the CPU once the pool passes the current point
+        ggml_metal_moe_ring_end(ggml_metal_moe_get(ctx), ev);
+        return;
+    }
+
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
@@ -641,6 +762,13 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
 }
 
 void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+    if (ctx->cur_stream != 0) {
+        // prefetch ring: the fills must not start until the GPU is done reading the previous
+        // contents of the ring buffer - the pool tasks wait on the event host-side
+        ggml_metal_moe_ring_begin(ggml_metal_moe_get(ctx), ev);
+        return;
+    }
+
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
@@ -658,6 +786,81 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
 
 ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
     return ctx->ev_cpy;
+}
+
+// ---- MoE host-offload wiring ----
+
+ggml_metal_device_t ggml_metal_get_dev(ggml_metal_t ctx) {
+    return ctx->dev;
+}
+
+void * ggml_metal_moe_get_raw(ggml_metal_t ctx) {
+    return ctx->moe;
+}
+
+void ggml_metal_set_moe(ggml_metal_t ctx, void * moe) {
+    ctx->moe = moe;
+}
+
+int ggml_metal_select_stream(ggml_metal_t ctx, int stream) {
+    const int prev = ctx->cur_stream;
+    ctx->cur_stream = stream;
+    return prev;
+}
+
+void ggml_metal_set_tensor_async_stream(ggml_metal_t ctx, int stream, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    // the stateless worker-stream variant: runs on the scheduler's MoE worker thread,
+    // concurrently with the main thread. all of it is host-side copies through the pool.
+    GGML_ASSERT(stream != 0);
+    GGML_ASSERT(tensor->data != NULL);
+
+    char * dst = (char *) tensor->data + offset;
+
+    // loc_map row publishes are the only small writes on this path; they must be ordered
+    // after the payload fills issued before them (a row points a reader at the data)
+    if (size <= 256) {
+        ggml_metal_moe_row_mem(ggml_metal_moe_get(ctx), dst, data, size);
+    } else {
+        ggml_metal_moe_fill_mem(ggml_metal_moe_get(ctx), dst, data, size);
+    }
+}
+
+void ggml_metal_synchronize_stream(ggml_metal_t ctx, int stream) {
+    GGML_ASSERT(stream != 0);
+    ggml_metal_moe_wait(ggml_metal_moe_get(ctx));
+}
+
+bool ggml_metal_set_tensor_async_file(ggml_metal_t ctx, int stream, struct ggml_tensor * tensor, int fd, uint64_t file_off, size_t offset, size_t size) {
+    if (size == 0) {
+        return true;   // a zero-sized copy is a no-op (the scheduler can emit these for empty views)
+    }
+
+    GGML_ASSERT(tensor->data != NULL);
+    char * dst = (char *) tensor->data + offset;
+
+    if (stream != 0) {
+        // worker/prefetch stream: the pool pread()s it, inheriting the pending ring-reuse wait
+        ggml_metal_moe_fill_file(ggml_metal_moe_get(ctx), dst, fd, file_off, size);
+        return true;
+    }
+
+    // stream 0 is the plain compute-stream copy path: the caller expects the bytes to be in
+    // place before the next command buffer is committed (the CB boundary is the coherence
+    // point), so read them synchronously here
+    size_t done = 0;
+    while (done < size) {
+        const ssize_t n = pread(fd, dst + done, size - done, (off_t) (file_off + done));
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            GGML_LOG_ERROR("%s: pread failed (fd=%d off=%llu size=%zu): n=%zd errno=%d\n",
+                    __func__, fd, (unsigned long long) file_off, size, n, errno);
+            return false;
+        }
+        done += (size_t) n;
+    }
+    return true;
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {

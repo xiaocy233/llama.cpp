@@ -7,6 +7,7 @@
 #include "ggml-metal-impl.h"
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
+#include "ggml-metal-moe.h"
 
 #include <cassert>
 #include <algorithm>
@@ -362,6 +363,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_MUL_MAT_ID:
             {
                 n_fuse = ggml_metal_op_mul_mat_id(ctx, idx);
+            } break;
+        case GGML_OP_MOE_GATE:
+            {
+                n_fuse = ggml_metal_op_moe_gate(ctx, idx);
             } break;
         case GGML_OP_GET_ROWS:
             {
@@ -2552,6 +2557,142 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*ne02*ne21;
 }
 
+static int ggml_metal_op_moe_head_publish(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    int32_t layer  = ggml_get_op_params_i32(op, 0);
+    int32_t n_ids  = ggml_get_op_params_i32(op, 1);
+    int32_t n_pred = ggml_get_op_params_i32(op, 2);
+
+    void * mailbox = ggml_metal_device_get_moe_mailbox(ctx->dev);
+    GGML_ASSERT(mailbox != nullptr);
+
+    auto pipeline = ggml_metal_library_get_pipeline(lib, "kernel_moe_head_publish");
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(lib,
+                "kernel_moe_head_publish", "kernel_moe_head_publish", nullptr);
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op->src[0]),          0);  // ids
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op->src[1]),          1);  // pred_ids
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op),                  2);  // out
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op->src[2]),          3);  // seq
+    ggml_metal_encoder_set_buffer (enc, (struct ggml_metal_buffer_id) { mailbox, 0 },  4);  // mailbox ring
+    ggml_metal_encoder_set_bytes  (enc, &layer,  sizeof(layer),  5);
+    ggml_metal_encoder_set_bytes  (enc, &n_ids,  sizeof(n_ids),  6);
+    ggml_metal_encoder_set_bytes  (enc, &n_pred, sizeof(n_pred), 7);
+    ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 32, 1, 1);
+
+    return 1;
+}
+
+// resolving form (decode): one kernel publishes the mailbox entry and resolves what it can, then
+// a queue-side event wait blocks the mul_mat_id behind it until the worker has filled the misses
+// and signaled this gate slot's event. The wait value is the token's gate seq, which the host
+// wrote into the seq tensor before the graph started, so it is known exactly at encode time.
+static_assert(sizeof(ggml_moe_gate_entry) == 1536);
+static_assert(offsetof(ggml_moe_gate_entry, router_probs) == 160);
+static_assert(offsetof(ggml_moe_gate_entry, selected_ids) == 1280);
+
+int ggml_metal_op_moe_gate(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    if (ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_HEAD) {
+        return ggml_metal_op_moe_head_publish(ctx, idx);
+    }
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    int32_t layer   = ggml_get_op_params_i32(op, 0);
+    int32_t n_ids   = ggml_get_op_params_i32(op, 1);
+    int32_t n_pred  = ggml_get_op_params_i32(op, 2);
+    int32_t n_slots = ggml_get_op_params_i32(op, 3);
+
+    GGML_ASSERT(n_ids > 0);
+
+    void * mailbox = ggml_metal_device_get_moe_mailbox(ctx->dev);
+    GGML_ASSERT(mailbox != nullptr);
+
+    auto pipeline = ggml_metal_library_get_pipeline(lib, "kernel_moe_gate");
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(lib, "kernel_moe_gate", "kernel_moe_gate", nullptr);
+    }
+
+    // the seq value of THIS token: the scheduler wrote it into the seq tensor before the graph
+    // started (ggml_backend_sched_graph_compute bumps moe_seq then tensor_sets it), so encode
+    // time reads the exact value the kernel will publish
+    const uint32_t seq = (uint32_t) *(const int32_t *) op->src[2]->data;
+
+    ggml_metal_moe_t moe = (ggml_metal_moe_t) ggml_metal_device_get_moe_state(ctx->dev);
+    GGML_ASSERT(moe != NULL);
+    ggml_metal_event_t ev = ggml_metal_moe_gate_event(moe, (int) layer);
+    GGML_ASSERT(ev != NULL);
+
+    // order point: a concurrent compute encoder runs its dispatches unordered, so the publish
+    // kernel could read ids_in before the router's dispatch has written them. A cmd-buffer-level
+    // wait on an always-satisfied value (0) still forces every earlier dispatch to complete
+    // before anything after it starts, which is exactly the ordering the ids copy needs.
+    // A serial encoder already runs its dispatches in order, so skip the boundary there.
+    if (ctx->use_concurrency) {
+        ggml_metal_encoder_wait_for_event(enc, ggml_metal_event_obj(ev), 0);
+    }
+
+    // part 1: publish the mailbox entry (miss mask over the current loc_map)
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op->src[1]),          0);  // ids_in
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op->src[0]),          1);  // loc_map
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op->src[2]),          2);  // seq
+    ggml_metal_encoder_set_buffer (enc, (struct ggml_metal_buffer_id) { mailbox, 0 },  4);  // mailbox ring
+
+    ggml_metal_encoder_set_bytes(enc, &layer,   sizeof(layer),   5);
+    ggml_metal_encoder_set_bytes(enc, &n_ids,   sizeof(n_ids),   6);
+    ggml_metal_encoder_set_bytes(enc, &n_pred,  sizeof(n_pred),  7);
+    ggml_metal_encoder_set_bytes(enc, &n_slots, sizeof(n_slots), 8);
+
+    int32_t substitute = ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_SUBSTITUTE;
+    int32_t n_expert = substitute ? (int32_t) ggml_nelements(op->src[3]) : 0;
+    float threshold = 0.0f;
+    if (substitute) memcpy(&threshold, (const char *) op->op_params + 5 * sizeof(int32_t), sizeof(threshold));
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(substitute ? op->src[3] : op->src[1]), 9);
+    ggml_metal_encoder_set_bytes(enc, &substitute, sizeof(substitute), 10);
+    ggml_metal_encoder_set_bytes(enc, &n_expert, sizeof(n_expert), 11);
+    ggml_metal_encoder_set_bytes(enc, &threshold, sizeof(threshold), 12);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 32, 1, 1);
+
+    // the queue-side wait: released when the worker has served this entry (fills + rows + fence)
+    // and host-signaled the event. With the event already at [seq] the wait passes in hardware.
+    ggml_metal_encoder_wait_for_event(enc, ggml_metal_event_obj(ev), seq);
+
+    // part 2: resolve behind the wait, when the worker's loc_map updates are visible. Same
+    // host-write-then-wait-then-read shape as the prefill layer ring (verified bit-exact).
+    auto pipeline_r = ggml_metal_library_get_pipeline(lib, "kernel_moe_gate_resolve");
+    if (!pipeline_r.pipeline) {
+        pipeline_r = ggml_metal_library_compile_pipeline(lib, "kernel_moe_gate_resolve", "kernel_moe_gate_resolve", nullptr);
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline_r);
+    ggml_metal_buffer_id resolved_ids = ggml_metal_get_buffer_id(op->src[1]);
+    if (substitute) {
+        resolved_ids = {mailbox, (size_t) layer * sizeof(ggml_moe_gate_entry) + offsetof(ggml_moe_gate_entry, selected_ids)};
+    }
+    ggml_metal_encoder_set_buffer (enc, resolved_ids,                               0);
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op->src[0]),          1);  // loc_map
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op),                  3);  // out
+    ggml_metal_encoder_set_bytes(enc, &n_ids,   sizeof(n_ids),   6);
+    int32_t return_logical = substitute;
+    ggml_metal_encoder_set_bytes(enc, &return_logical, sizeof(return_logical), 7);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 32, 1, 1);
+
+    return 1;
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2582,6 +2723,32 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
     ggml_metal_buffer_id bid_src2 = ggml_metal_get_buffer_id(op->src[2]);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+
+    // MoE interceptor: when src0 is an offloader pool tensor (e.g. a prefill layer-ring slot),
+    // the weights behind it are only guaranteed resident after the offloader signals this
+    // layer's event. Beacon + GPU-side event wait; the ids pass through untouched.
+    {
+        struct ggml_metal_moe_handler handler = ggml_metal_device_get_moe_handler(ctx->dev);
+        if (handler.fn != nullptr) {
+            struct ggml_metal_moe_intercept mi;
+            if (handler.fn(handler.user_data, op->src[0], op->src[2], &mi)) {
+                if (!mi.reuse && mi.mode == GGML_METAL_MOE_MODE_WAIT) {
+                    auto pipeline = ggml_metal_library_get_pipeline_moe_interceptor(lib);
+
+                    ggml_metal_buffer_id moe_base = ggml_metal_get_buffer_id(mi.msg_tensor);
+                    ggml_metal_buffer_id b_req  = { moe_base.metal, moe_base.offs + MOE_OFF_REQ };
+
+                    ggml_metal_encoder_set_pipeline(enc, pipeline);
+                    ggml_metal_encoder_set_buffer (enc, bid_src2, 0);
+                    ggml_metal_encoder_set_buffer (enc, b_req, 1);
+                    ggml_metal_encoder_set_bytes (enc, &mi.seq, sizeof(mi.seq), 2);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
+
+                    ggml_metal_encoder_wait_for_event(enc, ggml_backend_metal_event_raw(mi.event), mi.seq);
+                }
+            }
+        }
+    }
 
     const uint32_t r2 = 1;
     const uint32_t r3 = 1;

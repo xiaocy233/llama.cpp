@@ -135,7 +135,7 @@ static bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
             continue;
         }
 
-        if (mr.p0 < cmp.p1 && mr.p1 >= cmp.p0) {
+        if (mr.p0 < cmp.p1 && mr.p1 > cmp.p0) {
             if (mrs->debug > 2) {
                 GGML_LOG_DEBUG("%s: the %s range buf=%lld, [%lld, %lld) overlaps with a previous %s range buf=%lld, [%lld, %lld)\n",
                         __func__,

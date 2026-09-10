@@ -2,6 +2,9 @@
 
 #include "ggml-metal-device.h"
 
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -30,6 +33,20 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev);
 void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
 
 ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
+
+// MoE host-offload state accessors (ggml-metal-moe.m)
+ggml_metal_device_t ggml_metal_get_dev(ggml_metal_t ctx);
+void * ggml_metal_moe_get_raw(ggml_metal_t ctx);
+void   ggml_metal_set_moe    (ggml_metal_t ctx, void * moe);
+
+// stream routing: stream 0 is the GPU path, the rest are served by the host fill pool
+int  ggml_metal_select_stream         (ggml_metal_t ctx, int stream);
+void ggml_metal_set_tensor_async_stream(ggml_metal_t ctx, int stream, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+void ggml_metal_synchronize_stream    (ggml_metal_t ctx, int stream);
+
+// file-sourced fill for disk-resident MoE banks: pread [file_off, file_off+size) of fd into
+// tensor at offset. any stream goes to the host fill pool; stream 0 reads synchronously.
+bool ggml_metal_set_tensor_async_file(ggml_metal_t ctx, int stream, struct ggml_tensor * tensor, int fd, uint64_t file_off, size_t offset, size_t size);
 
 void ggml_metal_set_n_cb            (ggml_metal_t ctx, int n_cb);
 void ggml_metal_set_abort_callback  (ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data);

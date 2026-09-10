@@ -11601,3 +11601,158 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+// MoE interceptor: stamps the request sequence into the per-layer mailbox so the host offloader
+// can see that the GPU reached this layer (progress beacon for the ring rotation). Reading
+// selected[0] is volatile and otherwise unused: the data dependency it creates keeps the beacon
+// ordered behind the actual routing compute, so the offloader never rotates a ring slot the GPU
+// has not yet consumed.
+kernel void kernel_moe_interceptor(
+        device const int   * selected [[buffer(0)]],
+        device atomic_uint * req_seq  [[buffer(1)]],
+        constant uint      & seq      [[buffer(2)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (tid == 0) {
+        device const volatile int * sel = selected;
+        (void) sel[0];
+        atomic_store_explicit(req_seq, seq, memory_order_relaxed);
+    }
+}
+
+// mailbox entry layout, mirroring struct ggml_moe_gate_entry (ggml-backend.h):
+//   uint32 seq@0, layer@4, miss_mask@8, n_ids@12, n_pred@16, hash@20, mode@24, threshold@28, int32 ids[32]@32
+#define MOE_GATE_ENTRY_SIZE 1536
+#define MOE_GATE_PROBS_OFF  160
+#define MOE_GATE_IDS_OFF    32
+
+kernel void kernel_moe_head_publish(
+    device const int32_t * ids      [[buffer(0)]],
+    device const int32_t * pred_ids [[buffer(1)]],
+    device       int32_t * out      [[buffer(2)]],
+    device const int32_t * seq_p    [[buffer(3)]],
+    device       char    * ring     [[buffer(4)]],
+    constant     int32_t & layer    [[buffer(5)]],
+    constant     int32_t & n_ids    [[buffer(6)]],
+    constant     int32_t & n_pred   [[buffer(7)]],
+    uint tidx [[thread_index_in_threadgroup]],
+    uint nt   [[threads_per_threadgroup]])
+{
+    device char * box = ring + (uint64_t) layer * MOE_GATE_ENTRY_SIZE;
+    device volatile int32_t  * box_ids = (device volatile int32_t  *) (box + MOE_GATE_IDS_OFF);
+    device volatile uint32_t * box_hdr = (device volatile uint32_t *) box;
+
+    for (int i = (int) tidx; i < n_pred; i += (int) nt) {
+        box_ids[i] = pred_ids[i];
+    }
+    for (int i = (int) tidx; i < n_ids; i += (int) nt) {
+        out[i] = ids[i];
+    }
+    if (tidx == 0) {
+        box_hdr[1] = (uint32_t) layer;
+        box_hdr[2] = 0u;
+        box_hdr[3] = 0u;
+        box_hdr[4] = (uint32_t) n_pred;
+        box_hdr[5] = 0u;
+        box_hdr[6] = 0u;
+        box_hdr[7] = 0u;
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst);
+    if (tidx == 0) {
+        box_hdr[0] = (uint32_t) seq_p[0];
+    }
+}
+
+// Resolving form of the MoE gate (decode), part 1: publish a mailbox entry so the host worker
+// can fill what is missing. The CUDA twin is moe_gate_kernel in ggml-cuda/moe-gate.cu; the
+// in-kernel spin-wait segment is deliberately absent here - on Apple Silicon a running kernel
+// cannot observe host stores (verified by measurement), so the wait lives on the command queue
+// instead: the encoder places an event wait right after this kernel, and kernel_moe_gate_resolve
+// (the second half) runs only once the worker has filled the misses and signaled the event.
+//
+// loc_map is volatile: the worker rewrites it between tokens, and every read must go to memory.
+kernel void kernel_moe_gate(
+        device const int32_t * ids_in  [[buffer(0)]],   // [n_ids + n_pred]
+        device volatile int32_t * loc_map [[buffer(1)]], // [n_expert], slot of each expert
+        device const int32_t * seq_p   [[buffer(2)]],   // [1], shared sequence counter
+        device       char    * ring    [[buffer(4)]],   // mailbox ring (ggml_moe_gate_entry[])
+        constant     int32_t & layer   [[buffer(5)]],
+        constant     int32_t & n_ids   [[buffer(6)]],
+        constant     int32_t & n_pred  [[buffer(7)]],
+        constant     int32_t & n_slots [[buffer(8)]],
+        device const float * router_probs [[buffer(9)]],
+        constant int32_t & substitute [[buffer(10)]],
+        constant int32_t & n_expert [[buffer(11)]],
+        constant float & threshold [[buffer(12)]],
+        uint tidx [[thread_index_in_threadgroup]],
+        uint nt   [[threads_per_threadgroup]])
+{
+    constexpr int ENTRY_SIZE = MOE_GATE_ENTRY_SIZE;
+    constexpr int IDS_OFF    = 32;
+
+    // Publish the IDs, mask and sequence from one writer.
+    if (tidx != 0) {
+        return;
+    }
+
+    device char * box_c = ring + (uint64_t) layer * ENTRY_SIZE;
+    device volatile uint32_t * box_hdr = (device volatile uint32_t *) box_c;
+    device volatile int32_t  * box_ids = (device volatile int32_t  *) (box_c + IDS_OFF);
+
+    // miss mask over the routed ids: bit i = loc_map[ids[i]] says "not resident"
+    uint miss = 0;
+    for (int i = 0; i < n_ids; i++) {
+        const int32_t e = ids_in[i];
+        if (e >= 0 && loc_map[e] >= n_slots) {
+            miss |= (1u << i);
+        }
+    }
+
+    // publish: ids + prediction tail, then the header, then seq last (the worker's handshake).
+    // One thread does the header after the ids copies so the entry is never read half-written.
+    uint payload_hash = 2166136261u;
+    for (int i = 0; i < n_ids + n_pred; i++) {
+        const int32_t value = ids_in[i];
+        box_ids[i] = value;
+        if (substitute) payload_hash = (payload_hash ^ as_type<uint>(value)) * 16777619u;
+    }
+    if (substitute) {
+        device volatile float * target = (device volatile float *) (box_c + MOE_GATE_PROBS_OFF);
+        for (int i = 0; i < n_expert; i++) {
+            const float value = router_probs[i];
+            target[i] = value;
+            payload_hash = (payload_hash ^ as_type<uint>(value)) * 16777619u;
+        }
+    }
+    box_hdr[1] = (uint32_t) layer;
+    box_hdr[2] = miss;
+    box_hdr[3] = (uint32_t) n_ids;
+    box_hdr[4] = (uint32_t) n_pred;
+    box_hdr[5] = substitute ? payload_hash : 0u;
+    box_hdr[6] = substitute ? 2u : 0u;
+    box_hdr[7] = as_type<uint32_t>(threshold);
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst);
+    box_hdr[0] = (uint32_t) *seq_p;
+}
+
+// Resolving form, part 2: runs BEHIND the queue-side event wait, so the worker's loc_map updates
+// are visible and every routed id is resident. Same host-write-then-wait-then-read shape as the
+// prefill layer ring (verified bit-exact), which is the only CPU->GPU ordering Metal guarantees.
+kernel void kernel_moe_gate_resolve(
+        device const volatile int32_t * ids_in [[buffer(0)]],
+        device volatile int32_t * loc_map [[buffer(1)]], // [n_expert]
+        device       int32_t * out     [[buffer(3)]],   // [n_ids] resolved slot ids
+        constant     int32_t & n_ids   [[buffer(6)]],
+        constant     int32_t & return_logical [[buffer(7)]],
+        uint tidx [[thread_index_in_threadgroup]],
+        uint nt   [[threads_per_threadgroup]])
+{
+    for (int i = (int) tidx; i < n_ids; i += (int) nt) {
+        const int32_t e = ids_in[i];
+        out[i] = e >= 0 ? loc_map[e] : 0;   // < n_slots guaranteed: the worker filled every miss
+        if (return_logical) {
+            out[n_ids + i] = e;
+        }
+    }
+}

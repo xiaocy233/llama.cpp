@@ -459,12 +459,17 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+    id<MTLCommandBuffer> cmd_buf;   // kept for encoder_wait_for_event (encoding re-entry)
+    bool concurrent;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    res->cmd_buf = cmd_buf;
+    res->concurrent = concurrent;
 
     if (concurrent) {
         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
@@ -502,6 +507,23 @@ void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_met
     [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
 }
 
+// interleave a GPU-side event wait into the encoder: end the current compute encoding, encode the
+// wait, and reopen. Used by the MoE interceptor so the layer weights are guaranteed resident
+// before the MUL_MAT_ID kernels that read them
+void ggml_metal_encoder_wait_for_event(ggml_metal_encoder_t encoder, void * event, uint64_t value) {
+    id<MTLSharedEvent> ev = (id<MTLSharedEvent>) event;
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+    [encoder->cmd_buf encodeWaitForEvent:ev value:value];
+    if (encoder->concurrent) {
+        encoder->obj = [encoder->cmd_buf
+            computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+    } else {
+        encoder->obj = [encoder->cmd_buf computeCommandEncoder];
+    }
+    [encoder->obj retain];
+}
+
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx) {
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
 }
@@ -534,6 +556,19 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // MoE gate mailbox (shared): ring + release + timeout. Owned here so it survives the
+    // backend context (the scheduler's stats report reads it after the backend is gone)
+    id<MTLBuffer> moe_mailbox;
+
+    // MoE interceptor handler (see ggml-metal.h); hung off the device so the multi-threaded
+    // op encoders reach it without a backend pointer
+    struct ggml_metal_moe_handler moe_handler;
+
+    // the backend's MoE state (gate events for the decode gate); same lifetime as moe_mailbox.
+    // The op encoders only get the device, not the backend context, and the resolving gate
+    // needs the per-slot events to place its queue-side wait.
+    void * moe_state;
 };
 
 //
@@ -1073,6 +1108,58 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
     GGML_UNUSED(dev);
 }
 
+// ---- host-side event accessors (MoE fill pool / gate) ----
+
+uint64_t ggml_metal_event_host_await_point(ggml_metal_event_t ev) {
+    return (uint64_t) atomic_load_explicit(&ev->value, memory_order_acquire);
+}
+
+void ggml_metal_event_host_wait(ggml_metal_event_t ev, uint64_t value) {
+    id<MTLSharedEvent> event = ev->obj;
+    const bool res = [event waitUntilSignaledValue:value timeoutMS:60000];
+    if (!res) {
+        GGML_ABORT("%s: failed to wait for event\n", __func__);
+    }
+}
+
+uint64_t ggml_metal_event_host_arm(ggml_metal_event_t ev) {
+    // same value discipline as ggml_metal_event_encode_signal
+    return (uint64_t) atomic_fetch_add_explicit(&ev->value, 1, memory_order_relaxed) + 1;
+}
+
+void ggml_metal_event_host_signal(ggml_metal_event_t ev, uint64_t value) {
+    id<MTLSharedEvent> event = ev->obj;
+    event.signaledValue = value;
+}
+
+void * ggml_metal_event_obj(ggml_metal_event_t ev) {
+    return ev->obj;
+}
+
+void * ggml_metal_device_get_moe_mailbox(ggml_metal_device_t dev) {
+    return dev->moe_mailbox;
+}
+
+void ggml_metal_device_set_moe_mailbox(ggml_metal_device_t dev, void * buf) {
+    dev->moe_mailbox = (id<MTLBuffer>) buf;   // +1 from newBufferWithLength, intentionally never released
+}
+
+void * ggml_metal_device_get_moe_state(ggml_metal_device_t dev) {
+    return dev->moe_state;
+}
+
+void ggml_metal_device_set_moe_state(ggml_metal_device_t dev, void * moe) {
+    dev->moe_state = moe;
+}
+
+void ggml_metal_device_set_moe_handler(ggml_metal_device_t dev, struct ggml_metal_moe_handler handler) {
+    dev->moe_handler = handler;
+}
+
+struct ggml_metal_moe_handler ggml_metal_device_get_moe_handler(ggml_metal_device_t dev) {
+    return dev->moe_handler;
+}
+
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
     if (@available(macOS 10.12, iOS 16.0, *)) {
         *total = dev->mtl_device.recommendedMaxWorkingSetSize;
@@ -1387,6 +1474,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
+        case GGML_OP_MOE_GATE:
+            return true;
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:

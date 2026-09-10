@@ -1,6 +1,10 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-metal.h"
+
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,6 +83,9 @@ void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const cha
 void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline);
+
+// interleave a GPU-side shared-event wait into the encoder (ends and reopens the compute encoding)
+void ggml_metal_encoder_wait_for_event(ggml_metal_encoder_t encoder, void * event, uint64_t value);
 
 void ggml_metal_encoder_set_bytes (ggml_metal_encoder_t encoder, void * data, size_t size, int idx);
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx);
@@ -276,6 +283,14 @@ typedef struct ggml_metal_event * ggml_metal_event_t;
 void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf);
 void ggml_metal_event_encode_wait  (ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf);
 
+// host-side accessors for MTLSharedEvent-backed events: the MoE fill pool and gate use these to
+// wait on / signal GPU progress without a command buffer
+uint64_t ggml_metal_event_host_await_point(ggml_metal_event_t ev);          // value a wait should target
+void     ggml_metal_event_host_wait(ggml_metal_event_t ev, uint64_t value); // block until signaledValue >= value
+uint64_t ggml_metal_event_host_arm  (ggml_metal_event_t ev);                // bump and return the value to signal later
+void     ggml_metal_event_host_signal(ggml_metal_event_t ev, uint64_t value);
+void *   ggml_metal_event_obj        (ggml_metal_event_t ev);               // the raw id<MTLSharedEvent>
+
 ggml_metal_device_t ggml_metal_device_init(int device);
 void ggml_metal_device_free(ggml_metal_device_t dev);
 
@@ -283,6 +298,24 @@ ggml_metal_device_t ggml_metal_device_get(int device);
 
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
+
+// the MoE gate mailbox lives in one shared buffer owned by the device, so that both the host
+// (worker, decode gate) and the publish kernel (prefill gate) can address it
+void * ggml_metal_device_get_moe_mailbox(ggml_metal_device_t dev); // id<MTLBuffer>, nil until set
+
+// the backend's MoE state (ggml_metal_moe_t), for the op encoders to reach the gate events
+void * ggml_metal_device_get_moe_state(ggml_metal_device_t dev);
+void   ggml_metal_device_set_moe_state(ggml_metal_device_t dev, void * moe);
+void   ggml_metal_device_set_moe_mailbox(ggml_metal_device_t dev, void * buf);
+
+// the MoE interceptor handler, hung off the device so the op encoders reach it without a backend
+// pointer (the multi-threaded encoders only carry the device)
+struct ggml_metal_moe_handler;
+void ggml_metal_device_set_moe_handler(ggml_metal_device_t dev, struct ggml_metal_moe_handler handler);
+struct ggml_metal_moe_handler ggml_metal_device_get_moe_handler(ggml_metal_device_t dev);
+
+// the interceptor pipeline (kernel_moe_interceptor), compiled on first use
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_interceptor(ggml_metal_library_t lib);
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
 
