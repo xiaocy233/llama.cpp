@@ -22,6 +22,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "../ggml/src/ggml-backend-impl.h"   // ggml_backend_buffer_i / ggml_backend_buffer_type definitions
 
 #include <algorithm>
 #include <cassert>
@@ -29,14 +30,21 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <cerrno>
 #include <functional>
 #include <map>
+#include <set>
 #include <numeric>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1005,7 +1013,6 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
 
     uint64_t n_elements = 0;
 
@@ -1056,6 +1063,13 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+#if defined(__APPLE__)
+    // the dup'ed fds backing disk-resident MoE banks outlive the loader's files, so they are
+    // ours to close
+    for (int fd : moe_disk_fds) {
+        close(fd);
+    }
+#endif
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -1258,6 +1272,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
     const auto & tensor_split = params.tensor_split;
 
+#if !defined(GGML_USE_METAL)
+    if (params.cache_disk) {
+        throw std::runtime_error("cache_disk requires Metal");
+    }
+#endif
+    if (params.cache_disk && ml.use_mmap) {
+        throw std::runtime_error("cache_disk requires load_mode != mmap (the banks are pread on demand)");
+    }
+    ml.cache_disk = params.cache_disk;
+
     const int n_layer_all = hparams.n_layer_all;
     const int n_gpu_layers = this->n_gpu_layers();
 
@@ -1341,6 +1365,92 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+    // Cap the page-locked host weights when MoE experts stream from host memory.
+    //
+    // Streaming wants every host expert page-locked. A pageable H2D is not asynchronous: the driver
+    // drains the device and stages the bytes, so it runs at about half the rate and overlaps nothing.
+    //
+    // cudaMallocHost has a tighter cap than AvailPhys. Asking for the whole host bank in one shot
+    // can fail and dump every expert to pageable. Auto probes the largest lock that succeeds, then
+    // leaves 200 MiB so the real CUDA_Host buffer still fits. Layers are created in order, so the
+    // cap page-locks the lowest streaming layers first.
+    if (params.n_cache_slots > 0 || params.n_cache_layers > 0) {
+
+        const size_t leave = 200ull * 1024 * 1024;
+
+        // expert matrices that will live on the host
+        size_t host_w = 0;
+        {
+            std::vector<std::regex> cpu_ov;
+            if (params.tensor_buft_overrides) {
+                for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                    if (o->buft == ggml_backend_cpu_buffer_type()) {
+                        cpu_ov.emplace_back(o->pattern);
+                    }
+                }
+            }
+
+            for (const auto & kv : ml.weights_map) {
+                const std::string & name = kv.first;
+                int il = -1;
+                if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < 0) {
+                    continue;
+                }
+                if (name.find("ffn_") == std::string::npos || name.find("_exps") == std::string::npos) {
+                    continue;
+                }
+                if (name.find("_exps_b") != std::string::npos || name.find("_exps_s") != std::string::npos) {
+                    continue;
+                }
+
+                bool on_host = false;
+                if (il < (int) pimpl->dev_layer.size() && pimpl->dev_layer[il].dev == cpu_dev) {
+                    on_host = true;
+                }
+                if (params.n_cache_layers >= 0 && il >= params.n_cache_layers) {
+                    on_host = true;
+                }
+                if (!on_host) {
+                    for (const auto & re : cpu_ov) {
+                        if (std::regex_search(name, re)) {
+                            on_host = true;
+                            break;
+                        }
+                    }
+                }
+                if (on_host && kv.second.tensor) {
+                    host_w += ggml_nbytes(kv.second.tensor);
+                }
+            }
+        }
+
+        size_t pin_max = 0;
+        size_t budget = 0;
+        if (params.n_cache_pin >= 0) {
+            budget = (size_t) params.n_cache_pin * 1024 * 1024;
+        } else {
+            using host_pin_max_fn = size_t (*)(size_t);
+            for (const auto & d : devices) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev);
+                if (!reg) {
+                    continue;
+                }
+                auto * fn = (host_pin_max_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_pin_max");
+                if (!fn) {
+                    continue;
+                }
+                pin_max = fn(host_w);
+                break;
+            }
+            const size_t cap = pin_max < host_w ? pin_max : host_w;
+            budget = cap > leave ? cap - leave : 0;
+        }
+
+        ml.host_pinned_budget = budget;
+
+
+    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -1664,6 +1774,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // the slot cache needs the weights placed, so this has to come after load_all_data
+    if (params.n_cache_slots > 0) {
+        init_moe_slot_caches(params.n_cache_slots, params.n_cache_predict, ml);
+    }
+
     return true;
 }
 
@@ -1709,6 +1824,14 @@ const float * llama_model::tensor_split() const {
 uint32_t llama_model::n_gpu_layers() const {
     // note: plus 1 for the "output" layer
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
+}
+
+int32_t llama_model::n_cache_layers() const {
+    return params.n_cache_layers;
+}
+
+int32_t llama_model::n_cache_prefill_buffers() const {
+    return params.n_cache_prefill_buffers;
 }
 
 llama_split_mode llama_model::split_mode() const {
@@ -2448,6 +2571,12 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.n_cache_layers              =*/ -1,
+        /*.n_cache_slots               =*/ 0,
+        /*.n_cache_predict             =*/ 0,
+        /*.n_cache_pin                 =*/ -1,
+        /*.cache_disk                  =*/ false,
+        /*.n_cache_prefill_buffers     =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

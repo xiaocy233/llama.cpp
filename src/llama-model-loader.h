@@ -10,6 +10,7 @@
 #include "ggml-cpp.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -92,6 +93,19 @@ struct llama_model_loader {
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
+    // Cap on page-locked host weights. Page-locked memory cannot be paged out, so a large one leaves
+    // the driver nothing to work with and the next device allocation fails. Tensors over the cap get
+    // the plain CPU buffer type: slower H2D, but the pages can be evicted.
+    // The cap must be set before the tensors are placed. Page-locking them afterwards does not work:
+    // a copy may not cross two registered ranges, and the tensors are packed too tight to leave a
+    // page boundary to split a range on. SIZE_MAX = no cap. create_tensor keeps the running total.
+    size_t host_pinned_budget = SIZE_MAX;
+    size_t host_pinned_used   = 0;
+
+    // cache_disk: expert banks overridden to a host buffer type go to the disk marker buffer type
+    // instead - no data is read for them at load time; the offloader pread()s them on demand.
+    bool cache_disk = false;
+
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;
@@ -171,6 +185,10 @@ struct llama_model_loader {
     enum llm_arch get_arch() const;
 
     const llama_tensor_weight * get_weight(const char * name) const;
+
+    // the disk source of a bank tensor: the fd of the file holding it and its absolute offset
+    // in that file. returns false when the tensor has no file backing (metadata-only load).
+    bool get_disk_source(const char * name, int * fd, uint64_t * offs) const;
 
     const llama_tensor_weight & require_weight(const char * name) const;
 

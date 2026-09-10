@@ -841,6 +841,16 @@ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weig
     return *weight;
 }
 
+bool llama_model_loader::get_disk_source(const char * name, int * fd, uint64_t * offs) const {
+    const llama_tensor_weight * weight = get_weight(name);
+    if (!weight || weight->idx >= files.size()) {
+        return false;
+    }
+    *fd   = files.at(weight->idx)->file_id();
+    *offs = weight->offs;
+    return true;
+}
+
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
     const auto * weight = get_weight(name);
     if (!weight) {
@@ -1172,7 +1182,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
-                    if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                    if (cache_disk && ggml_backend_buft_is_host(overrides->buft)) {
+                        // a host-targeted expert override becomes disk-resident: no data is read,
+                        // the offloader pread()s the experts on demand
+                        buft = llama_moe_cache_disk_buft();
+                    } else if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
                         if (use_mmap) {
@@ -1209,6 +1223,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 throw std::runtime_error("no CPU backend found");
             }
             buft = ggml_backend_dev_buffer_type(cpu_dev);
+        }
+
+        // spend the page-locked budget on the tensors created first, which are the lowest layers
+        if (buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+            const size_t nbytes = ggml_nbytes(t_meta);
+            if (host_pinned_used + nbytes > host_pinned_budget) {
+                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (!cpu_dev) {
+                    throw std::runtime_error("no CPU backend found");
+                }
+                buft = ggml_backend_dev_buffer_type(cpu_dev);
+            } else {
+                host_pinned_used += nbytes;
+            }
         }
 
         if (buft != buft_list->front().second) {
@@ -1515,6 +1543,11 @@ bool llama_model_loader::load_all_data(
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
+            continue;
+        }
+
+        // a disk-resident bank keeps its bytes in the GGUF file: no read, no progress tick
+        if (cur->buffer != nullptr && ggml_backend_buffer_get_type(cur->buffer) == llama_moe_cache_disk_buft()) {
             continue;
         }
 

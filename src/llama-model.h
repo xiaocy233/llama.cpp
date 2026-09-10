@@ -659,6 +659,45 @@ struct llama_model {
     const float * tensor_split() const;
 
     uint32_t n_gpu_layers() const;
+
+    // Read-only sources and configuration for context-owned MoE slot caches.
+    struct moe_slot_layer {
+        struct ggml_tensor * src[3]   = { nullptr, nullptr, nullptr };
+        int n_expert = 0;
+        int n_slots  = 0;
+        int layer = -1;
+        bool pinned = false;   // whole host bank is page-locked, so a copy needs no staging
+
+        // Disk-resident bank (params.cache_disk): src_fd >= 0 and expert e of matrix m lives at
+        // file offset src_off[m] + e*nb[2]. src_fd < 0 = ordinary host-memory bank.
+        int      src_fd = -1;
+        uint64_t src_off[3] = { 0, 0, 0 };
+
+        // prediction for the next cached layer: its router, and how many experts to guess. Off when
+        // pred_w is null.
+        struct ggml_tensor * pred_w      = nullptr;
+        int                  n_pred      = 0;
+        int                  pred_target = -1;
+
+        // Only set on the first cached layer. Its resident predecessor publishes this prediction
+        // without needing a cache gate of its own.
+        struct ggml_tensor * head_pred_w      = nullptr;
+        int                  head_n_pred      = 0;
+        int                  head_pred_source = -1;
+    };
+    std::vector<moe_slot_layer> moe_slot_layers;
+    ggml_backend_buffer_type_t moe_slot_buft = nullptr;
+
+    // the dup'ed fds backing disk-resident banks, closed in ~llama_model
+    std::vector<int> moe_disk_fds;
+
+    // ml supplies the file source for disk-resident banks.
+    void init_moe_slot_caches(int n_slots, int n_pred, const struct llama_model_loader & ml);
+
+    // number of leading layers whose MoE experts stay in VRAM; -1 when unset
+    int32_t n_cache_layers() const;
+    // prefill layer-ring depth (Metal disk offload), 0 = default
+    int32_t n_cache_prefill_buffers() const;
     llama_split_mode split_mode() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
