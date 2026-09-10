@@ -4003,6 +4003,14 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        if (params_base.moe_substitute_threshold > 0.0f) {
+            for (const auto & slot : slots) {
+                const int32_t n_generated = slot.state == SLOT_STATE_GENERATING ? slot.n_decoded : 0;
+                llama_set_moe_generation_count(ctx_tgt, slot.id, n_generated);
+            }
+        }
+
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
