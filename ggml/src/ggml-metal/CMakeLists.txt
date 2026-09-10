@@ -11,6 +11,7 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-common.cpp
                          ggml-metal-context.m
                          ggml-metal-moe.m
+                         ggml-metal-prefill.cpp
                          ggml-metal-ops.cpp
                         )
 
@@ -123,3 +124,5 @@ if (NOT GGML_METAL_EMBED_LIBRARY)
             DESTINATION ${CMAKE_INSTALL_BINDIR}
         )
 endif()
+
+set_source_files_properties(ggml-metal-prefill.cpp PROPERTIES COMPILE_OPTIONS "-fblocks")

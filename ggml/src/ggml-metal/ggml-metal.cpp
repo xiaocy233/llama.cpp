@@ -1,3 +1,4 @@
+#include "ggml-metal-prefill.h"
 #include "../ggml-moe-backend.h"
 #include "ggml-metal.h"
 
@@ -972,6 +973,9 @@ static ggml_moe_backend_caps ggml_backend_metal_moe_get_caps(ggml_backend_dev_t)
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_moe_get_caps") == 0) {
         return (void *) ggml_backend_metal_moe_get_caps;
+    }
+    if (strcmp(name, "ggml_backend_moe_prefill_init") == 0) {
+        return (void *) ggml_backend_metal_moe_prefill_init;
     }
 
     if (strcmp(name, "ggml_backend_get_features") == 0) {
