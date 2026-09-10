@@ -207,6 +207,12 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .graph_optimize          = */ NULL,
+    /* .select_stream           = */ NULL,
+    /* .set_tensor_async_stream = */ NULL,
+    /* .synchronize_stream      = */ NULL,
+    /* .moe_gate_channel        = */ NULL,
+    /* .moe_gate_release_stream = */ NULL,
+    /* .set_tensor_async_file   = */ NULL,
 };
 
 static ggml_guid_t ggml_backend_cpu_guid(void) {
@@ -471,6 +477,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_MOE_GATE:
+            return false;   // needs a mailbox only the device backend owns
         default:
             return true;
     }

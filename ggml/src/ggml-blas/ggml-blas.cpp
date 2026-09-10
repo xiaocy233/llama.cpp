@@ -276,6 +276,12 @@ static struct ggml_backend_i blas_backend_i = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .graph_optimize          = */ NULL,
+    /* .select_stream           = */ NULL,
+    /* .set_tensor_async_stream = */ NULL,
+    /* .synchronize_stream      = */ NULL,
+    /* .moe_gate_channel        = */ NULL,
+    /* .moe_gate_release_stream = */ NULL,
+    /* .set_tensor_async_file   = */ NULL,
 };
 
 static ggml_guid_t ggml_backend_blas_guid(void) {
