@@ -20,6 +20,8 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    float moe_substitute_threshold;
+
     float rope_freq_base;
     float rope_freq_scale;
 

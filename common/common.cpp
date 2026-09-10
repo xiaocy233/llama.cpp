@@ -1607,6 +1607,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mode       = params.load_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
+    mparams.n_cache_layers  = params.n_cache_layers;
+    mparams.n_cache_slots   = params.n_cache_slots;
+    mparams.n_cache_predict = params.n_cache_predict;
+    mparams.n_cache_pin     = params.n_cache_pin;
+    mparams.cache_disk      = params.cache_disk;
+    mparams.n_cache_prefill_buffers = params.n_cache_prefill_buffers;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
@@ -1634,6 +1640,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
+    cparams.moe_substitute_threshold = params.moe_substitute_threshold;
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;

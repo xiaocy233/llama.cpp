@@ -303,6 +303,11 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    // A marker buffer type for disk-resident MoE expert banks (llama_model_params.cache_disk):
+    // tensors keep their metadata, get no host data allocation, and are pread() from the GGUF
+    // file on demand. Used as a tensor_buft_overrides target by the loader.
+    LLAMA_API ggml_backend_buffer_type_t llama_moe_cache_disk_buft(void);
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -330,6 +335,38 @@ extern "C" {
 
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
+
+        // MoE expert caching. n_cache_layers is the number of leading layers whose experts stay in
+        // VRAM; the rest stream from host memory, and setting it (>= 0) also turns on prefetching of
+        // those streamed weights. -1 leaves the placement to the tensor overrides and keeps the
+        // upstream behaviour of copying the weights synchronously before each use.
+        int32_t n_cache_layers;
+
+        // number of expert slots to keep in VRAM for each layer whose experts live in host memory.
+        // 0 disables the slot cache, so every expert a token uses is copied for that token.
+        int32_t n_cache_slots;
+
+        // number of experts to predict one layer ahead and prefetch into the slot cache. The guess
+        // comes from applying the next cached layer's router to this layer's hidden state. 0 = off,
+        // in which case every miss is fetched synchronously by the layer that needs it. Only has an
+        // effect together with n_cache_slots. A wrong guess costs bandwidth, never correctness.
+        int32_t n_cache_predict;
+
+        // MiB of host weights to page-lock. Page-locked memory reaches the full H2D rate, pageable
+        // memory goes through a driver staging copy at roughly half of it. But page-locked pages
+        // cannot be paged out, so too much of it makes a later device allocation fail.
+        // -1 = auto: min(host-offload, largest cudaMallocHost) minus 200 MiB. 0 = none.
+        // Needs n_cache_slots or n_cache_layers.
+        int32_t n_cache_pin;
+
+        // Metal only: the streamed layers' expert banks stay in the GGUF file instead
+        // of host memory, and are pread() on demand. Requires load_mode != mmap.
+        // Halves the RAM footprint on unified-memory machines.
+        bool cache_disk;
+
+        // Metal only, needs cache_disk: number of full-layer ring buffers the prefill
+        // stage rotates through while streaming layers from disk. 0 = 2.
+        int32_t n_cache_prefill_buffers;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -372,6 +409,8 @@ extern "C" {
         float    yarn_beta_slow;   // YaRN high correction dim
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
+
+        float moe_substitute_threshold; // [0, 1], 0 disables; Qwen3.5 MoE CUDA/Metal slot-cache decode
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
@@ -995,6 +1034,10 @@ extern "C" {
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    // Before decode, report tokens already generated in this request (0 during prompt processing).
+    // MoE substitution stays disabled until 5 tokens have been generated. Unreported sequences stay disabled.
+    LLAMA_API void llama_set_moe_generation_count(struct llama_context * ctx, llama_seq_id seq_id, int32_t n_generated);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
