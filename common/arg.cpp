@@ -2679,6 +2679,98 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"-nclayers", "--n-cache-layers"}, "N",
+        "keep the Mixture of Experts (MoE) weights of the first N layers in VRAM, and the rest in the CPU\n"
+        "(the mirror image of --n-cpu-moe, which keeps the *last* layers in VRAM)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            // the layer count is not known until the model is loaded, so match every plausible index
+            // above N. one alternation rather than one override per block: the loader rebuilds a
+            // regex per (tensor, override) pair, so the override count is what costs load time.
+            // keep strings alive and avoid leaking memory by storing them in a static vector
+            static std::list<std::string> buft_overrides;
+            buft_overrides.push_back(llm_ffn_exps_blocks_from_regex(value));
+            params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), ggml_backend_cpu_buffer_type()});
+            params.n_cache_layers = value;
+        }
+    ).set_env("LLAMA_ARG_N_CACHE_LAYERS"));
+    add_opt(common_arg(
+        {"-ncslots", "--n-cache-slots"}, "N",
+        string_format("number of expert slots to keep in VRAM for each layer that is not fully cached\n"
+                      "(0 = no slot cache, every used expert is copied per token) (default: %d)",
+                      params.n_cache_slots),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_N_CACHE_SLOTS"));
+    add_opt(common_arg(
+        {"--moe-substitute-threshold"}, "N",
+        "replace missing experts below normalized routing weight N with resident experts\n"
+        "Qwen3.5 MoE, CUDA/Metal slot-cache decode only; range [0, 1] (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            size_t end = 0;
+            const float threshold = std::stof(value, &end);
+            if (end != value.size() || !std::isfinite(threshold) || threshold < 0.0f || threshold > 1.0f) {
+                throw std::invalid_argument("moe-substitute-threshold must be finite and in [0, 1]");
+            }
+            params.moe_substitute_threshold = threshold;
+        }
+    ));
+    add_opt(common_arg(
+        {"-ncpred", "--n-cache-predict"}, "N",
+        string_format("predict N experts one layer ahead and prefetch them into the slot cache\n"
+                      "(the next cached layer's router is applied to this layer's hidden state)\n"
+                      "0 = no prediction, every miss is fetched when the layer needs it (default: %d)",
+                      params.n_cache_predict),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_cache_predict = value;
+        }
+    ).set_env("LLAMA_ARG_N_CACHE_PREDICT"));
+    add_opt(common_arg(
+        {"-ncpin", "--n-cache-pin"}, "N",
+        string_format("page-lock at most N MiB of the host expert weights, the rest stays pageable\n"
+                      "(page-locked reaches the full H2D rate and overlaps compute, pageable goes\n"
+                      "through a driver staging copy at about half the rate and overlaps nothing)\n"
+                      "-1 = auto (min(host-offload, cudaMallocHost max) - 200 MiB),\n"
+                      "0 = none (default: %d)",
+                      params.n_cache_pin),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_cache_pin = value;
+        }
+    ).set_env("LLAMA_ARG_N_CACHE_PIN"));
+    add_opt(common_arg(
+        {"--cache-disk"},
+        "streaming layers' expert banks stay in the GGUF file instead of host memory, read on\n"
+        "demand with pread. Halves the RAM footprint on unified-memory machines (Metal).\n"
+        "Only meaningful with -nclayers. Requires --load-mode none.",
+        [](common_params & params) {
+            params.cache_disk = true;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK"));
+    add_opt(common_arg(
+        {"-ncpb", "--n-cache-prefill-buffers"}, "N",
+        string_format("full-layer ring buffers the prefill stage rotates through while streaming\n"
+                      "experts from disk (Metal, needs --cache-disk; default: %d)",
+                      params.n_cache_prefill_buffers > 0 ? params.n_cache_prefill_buffers : 2),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 16) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_cache_prefill_buffers = value;
+        }
+    ).set_env("LLAMA_ARG_N_CACHE_PREFILL_BUFFERS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
