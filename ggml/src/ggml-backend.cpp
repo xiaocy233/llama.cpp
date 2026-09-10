@@ -10,16 +10,21 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-moe-runtime.h"
+#include "ggml-weight-prefetch.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
 #include <assert.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 #ifdef __APPLE__
@@ -556,6 +561,29 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
     backend->iface.event_wait(backend, event);
 }
 
+// select an auxiliary stream for subsequent async operations on this backend
+// returns the previously selected stream index, or -1 if the backend does not support it
+static int ggml_backend_select_stream(ggml_backend_t backend, int stream) {
+    GGML_ASSERT(backend);
+
+    if (backend->iface.select_stream == NULL) {
+        return -1;
+    }
+
+    return backend->iface.select_stream(backend, stream);
+}
+
+bool ggml_backend_moe_gate_channel(ggml_backend_t backend, struct ggml_moe_gate_channel * out) {
+    GGML_ASSERT(backend);
+    GGML_ASSERT(out);
+
+    if (backend->iface.moe_gate_channel == NULL) {
+        return false;
+    }
+
+    return backend->iface.moe_gate_channel(backend, out);
+}
+
 static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
     if (backend->iface.graph_optimize != NULL) {
@@ -761,6 +789,29 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+// ring depth for the weight prefetch (ggml_backend_sched_set_weight_prefetch)
+// note: must be outside the GGML_SCHED_MAX_COPIES guard, that one is set by CMake
+#ifndef GGML_SCHED_MAX_PREFETCH_SLOTS
+// one entry is one expert matrix, so a layer's worth of gate/up/down is three entries. 12 leaves
+// room to hold several layers ahead without another rebuild.
+#define GGML_SCHED_MAX_PREFETCH_SLOTS 12
+#endif
+
+// the ring is clamped up to this depth whenever prefetch is enabled at all.
+// must stay outside the guard above - that one may be predefined, which would skip this.
+#ifndef GGML_SCHED_MIN_PREFETCH_SLOTS
+#define GGML_SCHED_MIN_PREFETCH_SLOTS 3
+#endif
+
+static_assert(GGML_SCHED_MIN_PREFETCH_SLOTS >= 2,
+        "a ring depth below 2 is a data race: the copy for entry k+1 is issued before entry k's compute");
+static_assert(GGML_SCHED_MIN_PREFETCH_SLOTS <= GGML_SCHED_MAX_PREFETCH_SLOTS,
+        "the prefetch ring minimum cannot exceed the maximum");
+
+// auxiliary stream the prefetch copies are issued on. stream 0 is the compute stream, so anything
+// else gives concurrency; backends without an auxiliary stream ignore this and stay serialized.
+#define GGML_SCHED_PREFETCH_STREAM_INDEX 1
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -819,6 +870,41 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+
+    // env: GGML_SCHED_FULL_WEIGHT_COPY
+    // copy host-resident MoE expert weights in full instead of scanning the routing ids for the
+    // used experts. At batch sizes where every expert is selected this copies the same number of
+    // bytes, but it removes the host round-trip of the ids tensor from the per-layer critical path.
+    bool full_weight_copy;
+
+
+    // env: GGML_SCHED_PREFETCH_VERIFY
+    // read every prefetched weight copy back from the device right before its consumer runs and
+    // compare it against the host source. Slow, but it turns a protocol violation into an explicit
+    // abort at the offending split instead of subtly wrong output.
+    bool prefetch_verify;
+
+    ggml_moe_runtime * moe;
+    bool has_moe_gate;
+
+    // set through ggml_backend_sched_set_weight_prefetch
+    // Overlap host->device MoE expert weight copies with compute: the copy for the next qualifying
+    // split is issued on an auxiliary stream while the current split computes, and the consuming
+    // split waits on a per-slot event instead of a full device synchronize.
+    //
+    // Requires:
+    //  - n_copies == 1 (multi-GPU pipeline parallelism has its own double buffering)
+    //  - the backend implements select_stream, event_record and event_wait
+    //  - full_weight_copy, otherwise the copy depends on the routing ids of its own layer and
+    //    cannot be issued ahead of the previous split's compute
+    // 0 disables the feature (default)
+    ggml_weight_prefetch_plan * prefetch_plan;
+    int prefetch_slots;   // ring depth, 0 = disabled
+
+    // ev_copy[i] signals "entry i mod slots has landed"
+    ggml_backend_event_t prefetch_ev_copy[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_PREFETCH_SLOTS];
+    // recorded after every split's compute: "all work enqueued so far has completed"
+    ggml_backend_event_t prefetch_ev_compute_last[GGML_SCHED_MAX_BACKENDS];
 
     int debug;
 
@@ -1052,6 +1138,10 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+// true if this split input is a host-resident MoE expert weight consumed by the split's first
+// MUL_MAT_ID. Such an input is the only kind that can be copied ahead of time: its contents are
+// constant for the whole graph and it has no producer in the graph.
+// note: mirrors the condition of the used-experts copy path in ggml_backend_sched_compute_splits
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1073,6 +1163,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     graph->uid = ggml_graph_next_uid();
 
+    sched->has_moe_gate = false;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        if (graph->nodes[i]->op == GGML_OP_MOE_GATE &&
+                ggml_get_op_params_i32(graph->nodes[i], 4) != GGML_MOE_GATE_MODE_HEAD) {
+            sched->has_moe_gate = true;
+            break;
+        }
+    }
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
@@ -1461,6 +1559,57 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     struct ggml_cgraph * graph_copy = &sched->graph;
 
+    // ---- weight prefetch: hoist the weight copies earlier in the node order ----
+    //
+    // ggml-alloc gives a tensor its memory when its node position is reached, and hands that memory
+    // to other tensors before that point. Prefetching writes the copy before its node position, so
+    // the copy would land in memory that ggml-alloc has assigned to something else. Emitting the
+    // copy node D entries earlier makes its lifetime start where the prefetch is issued, which is
+    // what makes the prefetch legal at all.
+    //
+    // entry k is issued in compute_splits just before the compute of pf[k - D].split, so that is
+    // where its node has to be emitted. Entries below D are emitted at the very start of the graph.
+    const int pf_depth = sched->prefetch_slots > 0 ? sched->prefetch_slots - 1 : 0;
+
+    using pf_entry = ggml_weight_prefetch_entry;
+    auto & pf = sched->prefetch_plan->entries;
+    pf.clear();
+
+    if (pf_depth > 0) {
+        for (int i = 0; i < sched->n_splits; i++) {
+            struct ggml_backend_sched_split * sp = &sched->splits[i];
+            sp->graph = ggml_graph_view(graph, sp->i_start, sp->i_end);
+
+            for (int j = 0; j < sp->n_inputs; j++) {
+                struct ggml_tensor * in     = sp->inputs[j];
+                struct ggml_tensor * in_cpy = tensor_id_copy(hash_id(in), sp->backend_id, sched->cur_copy);
+
+                if (ggml_weight_prefetch_eligible(&sp->graph, in, in_cpy)) {
+                    pf.push_back({ i, j });
+                    break;
+                }
+            }
+        }
+    }
+
+    sched->prefetch_plan->schedule(sched->n_splits, pf_depth);
+    const auto & emit_at_split = sched->prefetch_plan->issue_at_split;
+
+    auto emit_copy_node = [&](const pf_entry & e) {
+        struct ggml_backend_sched_split * sp = &sched->splits[e.split];
+        struct ggml_tensor * in     = sp->inputs[e.input];
+        struct ggml_tensor * in_cpy = tensor_id_copy(hash_id(in), sp->backend_id, sched->cur_copy);
+
+        assert(graph_copy->size > graph_copy->n_nodes);
+        sched->node_backend_ids[graph_copy->n_nodes] = sp->backend_id;
+        graph_copy->nodes[graph_copy->n_nodes++] = in_cpy;
+    };
+
+    // the first pf_depth entries have nothing to hide behind, allocate them up front
+    for (size_t k = 0; k < pf.size() && k < (size_t) pf_depth; k++) {
+        emit_copy_node(pf[k]);
+    }
+
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
@@ -1483,9 +1632,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             sched->node_backend_ids[graph_copy->n_nodes] = sched->hv_tensor_backend_ids[input_id];
             graph_copy->nodes[graph_copy->n_nodes++] = input_dep;
 
-            // add a dependency to the input copy so that it is allocated at the start of the split
-            sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
-            graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
+            // add a dependency to the input copy so that it is allocated at the start of the split.
+            // prefetched weight copies are emitted earlier instead (see above), skip them here.
+            const bool hoisted = pf_depth > 0 &&
+                ggml_weight_prefetch_eligible(&split->graph, input, input_cpy);
+
+            if (!hoisted) {
+                sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
+                graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
+            }
+        }
+
+        // emit the copy node of the entry that will be issued during this split's compute
+        if (emit_at_split[i] >= 0) {
+            emit_copy_node(pf[emit_at_split[i]]);
         }
 
         for (int j = split->i_start; j < split->i_end; j++) {
@@ -1598,11 +1758,100 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    std::vector<uint8_t> verify_buf;   // GGML_SCHED_PREFETCH_VERIFY only
+
+    // ---- weight prefetch (ggml_backend_sched_set_weight_prefetch) ----
+    // Use the allocation plan so that each copy starts within its allocated lifetime.
+    //
+    // Schedule for entry k (D = pf_depth = prefetch_slots - 1):
+    //   issued  just before the compute of split pf[k - D].split   (entries < D are issued up front)
+    //   waited  by the compute of split pf[k].split
+    // The copy target's previous owner is some tensor whose work was enqueued before the issue
+    // point, so the copy waits on ev_compute_last, which is recorded after every split's compute.
+    const int pf_depth = sched->prefetch_slots > 0 ? sched->prefetch_slots - 1 : 0;
+
+    using pf_entry = ggml_weight_prefetch_entry;
+    auto pf = sched->prefetch_plan->entries;
+    auto pf_of_split = sched->prefetch_plan->entry_of_split;
+    auto issue_at_split = sched->prefetch_plan->issue_at_split;
+    size_t n_issued = 0;
+
+    if (pf_depth > 0) {
+        // events are only created for backends that implement event_record / event_wait
+        if (!pf.empty() && sched->prefetch_ev_copy[splits[pf[0].split].backend_id][0] == NULL) {
+            pf.clear();
+            pf_of_split.assign(sched->n_splits, -1);
+            issue_at_split.assign(sched->n_splits, -1);
+        }
+
+
+        // seed ev_compute_last so the first wait does not block on an unrecorded event
+        if (!pf.empty()) {
+            const int bid = splits[pf[0].split].backend_id;
+            ggml_backend_event_record(sched->prefetch_ev_compute_last[bid], sched->backends[bid]);
+        }
+    }
+
+    // issue the copy of entry k on the auxiliary stream
+    auto prefetch_issue = [&](size_t k) {
+        const pf_entry & e = pf[k];
+        struct ggml_backend_sched_split * sp = &splits[e.split];
+        const int slot = (int) (k % (size_t) sched->prefetch_slots);
+        const int bid  = sp->backend_id;
+
+        ggml_backend_t bk = sched->backends[bid];
+
+        struct ggml_tensor * in     = sp->inputs[e.input];
+        struct ggml_tensor * in_cpy = tensor_copy(in, bid, sched->cur_copy);
+
+
+        const int prev_stream = ggml_backend_select_stream(bk, GGML_SCHED_PREFETCH_STREAM_INDEX);
+
+        // report once whether the copies actually landed on a separate stream. without it the
+        // prefetch is correct but serialized, i.e. no speedup is possible.
+
+        // the target memory belonged to another tensor until this point in the node order; that
+        // tensor's work was enqueued before the issue point, so waiting for the last recorded
+        // compute is sufficient to know it is done reading
+        ggml_backend_event_wait(bk, sched->prefetch_ev_compute_last[bid]);
+
+        // no dependency on this layer's routing ids, so it can be issued early
+        const struct ggml_moe_slot_state * st = ggml_moe_runtime_bank_of(sched->moe, in);
+
+        int    ie  = 0;
+        size_t off = 0;
+        size_t len = 0;
+        while (ggml_moe_runtime_bank_range(st, in, &ie, &off, &len)) {
+            ggml_backend_tensor_set_async(bk, in_cpy, (const char *) in->data + off, off, len);
+        }
+
+        ggml_backend_event_record(sched->prefetch_ev_copy[bid][slot], bk);
+
+        if (prev_stream >= 0) {
+            ggml_backend_select_stream(bk, prev_stream);
+        }
+    };
+
+    // the first pf_depth entries have nothing to hide behind, issue them up front
+    for (; n_issued < pf.size() && n_issued < (size_t) pf_depth; n_issued++) {
+        prefetch_issue(n_issued);
+    }
+
+    ggml_moe_runtime_set_decode(sched->moe, sched->has_moe_gate);
+    if (ggml_moe_runtime_active(sched->moe)) {
+        if (!sched->has_moe_gate) {
+            ggml_moe_runtime_quiesce(sched->moe);
+        }
+        ggml_moe_runtime_new_token(sched->moe);
+    }
+
+    const bool drain_moe = ggml_moe_runtime_drain(sched->moe) && sched->has_moe_gate;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1619,6 +1868,53 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
+                // this weight was already copied ahead of time on the auxiliary stream: only wait for
+                // the copy to land, no device synchronize and no ids round-trip
+                if (pf_depth > 0 && pf_of_split[split_id] >= 0 &&
+                        pf[pf_of_split[split_id]].input == input_id) {
+                    const size_t k    = (size_t) pf_of_split[split_id];
+                    const int    slot = (int) (k % (size_t) sched->prefetch_slots);
+                    ggml_backend_event_wait(split_backend, sched->prefetch_ev_copy[split_backend_id][slot]);
+
+                    if (sched->prefetch_verify) {
+                        // the copy has landed by now; the device content must equal the host source.
+                        // a mismatch means the prefetch protocol let something overwrite this buffer.
+                        // only the copied ranges hold live data, the rest is left stale on purpose.
+                        const size_t nb = ggml_nbytes(input);
+
+                        const struct ggml_moe_slot_state * st =
+                            ggml_moe_runtime_bank_of(sched->moe, input);
+
+                        ggml_backend_synchronize(split_backend);
+                        verify_buf.resize(nb);
+                        ggml_backend_tensor_get(input_cpy, verify_buf.data(), 0, nb);
+
+                        int    ie  = 0;
+                        size_t off = 0;
+                        size_t len = 0;
+                        while (ggml_moe_runtime_bank_range(st, input, &ie, &off, &len)) {
+                            const uint8_t * dev = verify_buf.data() + off;
+                            const uint8_t * src = (const uint8_t *) input->data + off;
+                            if (memcmp(dev, src, len) == 0) {
+                                continue;
+                            }
+
+                            size_t i = 0;
+                            while (i < len && dev[i] == src[i]) {
+                                i++;
+                            }
+                            GGML_LOG_ERROR("%s: PREFETCH VERIFY FAILED\n", __func__);
+                            GGML_LOG_ERROR("  split=%d entry=%zu slot=%d tensor=%s\n",
+                                    split_id, k, slot, input->name);
+                            GGML_LOG_ERROR("  nbytes=%zu first mismatch at byte %zu (device=0x%02x host=0x%02x)\n",
+                                    nb, off + i, dev[i], src[i]);
+                            GGML_ABORT("weight prefetch corrupted a copy");
+                        }
+                    }
+
+                    continue;
+                }
+
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -1628,15 +1924,58 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
+                const bool moe_classic = split->graph.n_nodes > 0 &&
+                    node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy;
+                const bool moe_dual = split->graph.n_nodes > 0 &&
+                    node->op == GGML_OP_MUL_MAT_ID && node->src[3] == input_cpy && node->src[4] != NULL;
+
                 if (split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input->buffer) && (
-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
-                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
-                    )) {
+                    ggml_backend_buffer_is_host(input->buffer) && (moe_classic || moe_dual)) {
+
+                    // dual Prefill: the ids index the logical experts and loc_map - not this copy -
+                    // decides which of them are read here, so the used-experts scan does not apply
+                    if (moe_dual) {
+                        const struct ggml_moe_slot_state * st =
+                            ggml_moe_runtime_bank_of(sched->moe, input);
+
+                        int    ie  = 0;
+                        size_t off = 0;
+                        size_t len = 0;
+                        while (ggml_moe_runtime_bank_range(st, input, &ie, &off, &len)) {
+                            ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                    (const char *) input->data + off, off, len);
+                        }
+                        continue;
+                    }
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+
+                    // full_weight_copy, set together with the prefetch ring
+                    //
+                    // Determining which experts are used requires reading the ids tensor back to the host,
+                    // which serializes on the router of this very layer. That data dependency makes it
+                    // impossible to issue this copy before the previous layer's compute has finished.
+                    //
+                    // When the batch is large enough that every expert is statistically certain to be
+                    // selected, the used-experts scan copies the whole tensor anyway, so skipping it costs
+                    // no extra bytes and removes the dependency.
+                    //
+                    // The n_assign >= n_expert gate is what keeps decode on the used-experts path: with
+                    // one token there are only n_expert_used assignments, so copying whole tensors
+                    // would move far more bytes than needed.
+                    if (sched->full_weight_copy && node->op == GGML_OP_MUL_MAT_ID) {
+                        ggml_tensor * ids = node->src[2];
+
+                        // n_tokens * n_expert_used, i.e. the number of (token, expert) assignments
+                        const int64_t n_assign = ggml_nelements(ids);
+
+                        if (n_assign >= n_expert) {
+                            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                            continue;
+                        }
+                    }
 
                     ggml_backend_synchronize(input_backend);
 
@@ -1672,6 +2011,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         prev_ids_tensor = ids_tensor;
                     }
+
+                    // report how many experts the router actually selected. This decides whether a
+                    // full-tensor copy costs extra bytes over the used-experts copy, which is the
+                    // premise of removing the ids dependency. Model/prompt property, not hardware.
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -1721,10 +2064,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
+                        // Host->device: prefer the compute stream. A blocking set_tensor uses
+                        // cudaStreamPerThread and its Synchronize waits out any earlier H2D on the
+                        // copy engine (including MoE slot prefetch), which serializes MoE launch.
+                        if (ggml_backend_buffer_is_host(input->buffer) &&
+                                split_backend->iface.set_tensor_async != NULL) {
+                            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        } else {
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        }
                     }
                 }
             }
+        }
+
+
+        // issue this split's scheduled entry before its compute, so the DMA runs alongside it.
+        // exactly once per entry: the schedule is precomputed, there is no forward search.
+        if (issue_at_split.size() > (size_t) split_id && issue_at_split[split_id] >= 0) {
+            const size_t k = (size_t) issue_at_split[split_id];
+            GGML_ASSERT(k == n_issued);
+            prefetch_issue(k);
+            n_issued++;
+        }
+
+        // A Prefill dual-base node reads the location table straight from the graph, so it needs the
+        // table caught up here. Decode does not come through this: its gate publishes to the worker
+        // and the worker writes the table, both without the main thread.
+        if (ggml_moe_runtime_active(sched->moe)) {
+            ggml_moe_runtime_publish_split(sched->moe, &split->graph);
         }
 
         if (!sched->callback_eval) {
@@ -1772,6 +2140,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+
+        // publish "everything enqueued up to here has been computed", which is what the next
+        // prefetch waits on before overwriting memory that used to belong to another tensor
+        // only on backends that own prefetch events; CPU-type backends have no event interface
+        if (pf_depth > 0 && !pf.empty() && sched->prefetch_ev_compute_last[split_backend_id] != NULL) {
+            ggml_backend_event_record(sched->prefetch_ev_compute_last[split_backend_id], split_backend);
+        }
+    }
+
+    if (drain_moe) {
+        // Preserve the synchronization controlled by GGML_SCHED_MOE_SLOT_STATS.
+        for (int i = 0; i < sched->n_backends; i++) {
+            ggml_backend_synchronize(sched->backends[i]);
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1789,9 +2171,27 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
+    sched->moe = ggml_moe_runtime_new(backends, n_backends);
+    sched->prefetch_plan = new ggml_weight_prefetch_plan;
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
+
+    // Diagnostics only. The feature itself is turned on through
+    // ggml_backend_sched_set_weight_prefetch, so that it is a property of the caller's
+    // configuration rather than of the environment the process happens to run in.
+
+    const char * GGML_SCHED_PREFETCH_VERIFY = getenv("GGML_SCHED_PREFETCH_VERIFY");
+    sched->prefetch_verify = GGML_SCHED_PREFETCH_VERIFY ? (atoi(GGML_SCHED_PREFETCH_VERIFY) != 0) : false;
+
+
+
+    // For how many decode tokens the device releases its own parked gate, instead of the host doing
+    // it after waiting for the stream.
+    //
+    // Off by default. It cannot help the first decode graph: that one goes to the driver node by
+    // node, and measurement says nothing the worker gives the device runs until the graph is done -
+    // the release kernel included. It only made the deadlock start 14 layers earlier.
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
@@ -1839,6 +2239,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
         }
+
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
@@ -1849,14 +2250,90 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+
+
+
+
+
+
+
+
+
+
+void ggml_backend_sched_set_weight_prefetch(ggml_backend_sched_t sched, int ring_depth) {
+    GGML_ASSERT(sched != NULL);
+    GGML_ASSERT(sched->galloc != NULL);   // must be called before the first reserve
+
+    if (ring_depth <= 0) {
+        sched->prefetch_slots   = 0;
+        sched->full_weight_copy = false;
+        return;
+    }
+
+    if (ring_depth > GGML_SCHED_MAX_PREFETCH_SLOTS) {
+        ring_depth = GGML_SCHED_MAX_PREFETCH_SLOTS;
+    }
+    // A single slot is a data race: the copy for the next split is issued before the current split's
+    // compute is launched, so with one slot they would touch the same memory. Depth 2 is correct but
+    // leaves the copy stream only one entry ahead, so any jitter stalls the consumer - depth 3
+    // measured 1810 t/s against 1574 at depth 2 on an RTX 5060 over an 8188-token prefill, for the
+    // cost of 18 MiB. So the ring is raised to the minimum rather than left where the caller put it.
+    if (ring_depth < GGML_SCHED_MIN_PREFETCH_SLOTS) {
+        ring_depth = GGML_SCHED_MIN_PREFETCH_SLOTS;
+    }
+
+    // Pipeline parallelism already double buffers the split inputs across graph invocations, and its
+    // events use the same slots, so the two schemes cannot both own them.
+    if (sched->n_copies > 1) {
+        sched->prefetch_slots   = 0;
+        sched->full_weight_copy = false;
+        return;
+    }
+
+    sched->prefetch_slots = ring_depth;
+
+    // The prefetch copies whole expert tensors: reading the routing ids back to pick out the used
+    // experts would serialize on the router of the very layer being prefetched, which is exactly the
+    // dependency that makes prefetching impossible. So the two go together.
+    sched->full_weight_copy = true;
+
+    for (int b = 0; b < sched->n_backends; b++) {
+        // Events are mandatory - they carry the slot-filled and slot-free dependencies. select_stream
+        // is optional: without it the copies stay on the compute stream, which is still correct
+        // (stream order is stronger than event order) but yields no concurrency. That keeps the ring
+        // and the event protocol exercisable on backends that have no auxiliary stream.
+        ggml_backend_t backend = sched->backends[b];
+
+        if (backend->iface.event_record == NULL || backend->iface.event_wait == NULL) {
+            continue;
+        }
+        for (int i = 0; i < sched->prefetch_slots; i++) {
+            if (sched->prefetch_ev_copy[b][i] == NULL) {
+                sched->prefetch_ev_copy[b][i] = ggml_backend_event_new(backend->device);
+            }
+        }
+        if (sched->prefetch_ev_compute_last[b] == NULL) {
+            sched->prefetch_ev_compute_last[b] = ggml_backend_event_new(backend->device);
+        }
+    }
+
+
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    ggml_moe_runtime_free(sched->moe);
+    delete sched->prefetch_plan;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
+        for (int i = 0; i < GGML_SCHED_MAX_PREFETCH_SLOTS; i++) {
+            ggml_backend_event_free(sched->prefetch_ev_copy[b][i]);
+        }
+        ggml_backend_event_free(sched->prefetch_ev_compute_last[b]);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
@@ -2428,4 +2905,20 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+}
+
+bool ggml_backend_sched_add_moe_slot_cache(ggml_backend_sched_t sched, const ggml_moe_slot_cache * cache, int n_expert_used) {
+    return ggml_moe_runtime_add_moe_slot_cache(sched->moe, cache, n_expert_used);
+}
+void ggml_backend_sched_set_moe_gate_seq(ggml_backend_sched_t sched, ggml_tensor * seq) {
+    ggml_moe_runtime_set_moe_gate_seq(sched->moe, seq);
+}
+void ggml_backend_sched_set_moe_substitute_enabled(ggml_backend_sched_t sched, bool enabled) {
+    ggml_moe_runtime_set_moe_substitute_enabled(sched->moe, enabled);
+}
+const ggml_moe_slot_cache * ggml_backend_sched_find_moe_slot_cache(ggml_backend_sched_t sched, const ggml_tensor * src) {
+    return sched ? ggml_moe_runtime_find_moe_slot_cache(sched->moe, src) : nullptr;
+}
+const ggml_moe_slot_cache * ggml_backend_sched_find_moe_head_predictor(ggml_backend_sched_t sched, int source_layer) {
+    return sched ? ggml_moe_runtime_find_moe_head_predictor(sched->moe, source_layer) : nullptr;
 }
