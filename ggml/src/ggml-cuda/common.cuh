@@ -1424,6 +1424,9 @@ struct ggml_cuda_moe_gate_channel {
     uint32_t            * release_dev  = nullptr;
     int32_t             * timeout_host = nullptr;
     int32_t             * timeout_dev  = nullptr;
+    float * probs_host[GGML_MOE_GATE_MAX_LAYERS] = {};
+    float * probs_dev [GGML_MOE_GATE_MAX_LAYERS] = {};
+    size_t n_probs[GGML_MOE_GATE_MAX_LAYERS] = {};
 };
 
 struct ggml_backend_cuda_context {
@@ -1713,4 +1716,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

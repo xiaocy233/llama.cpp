@@ -325,7 +325,7 @@ extern "C" {
     // The backend owns this memory. It has to: it is mapped page-locked memory, and a CUDA host
     // buffer is not a supported buffer type on a discrete GPU, so it cannot be a plain tensor src
     // without the scheduler making a device copy of it.
-    #define GGML_MOE_GATE_MAX_IDS    32   // n_expert_used + n_pred; miss_mask still caps n_ids at 32
+    #define GGML_MOE_GATE_MAX_IDS    512  // actual and predicted IDs for a batch
     #define GGML_MOE_GATE_MAX_EXPERTS 256
     #define GGML_MOE_GATE_MAX_LAYERS 256
     #define GGML_MOE_GATE_MODE_NORMAL 0
@@ -337,17 +337,16 @@ extern "C" {
     struct ggml_moe_gate_entry {
         uint32_t seq;         // written last, after a system fence: this is the handshake
         uint32_t layer;
-        uint32_t miss_mask;   // bit i = ids[i] was not resident when the gate published
+        uint32_t miss_mask;   // any expert was not resident
         uint32_t n_ids;
         uint32_t n_pred;
         uint32_t payload_hash; // substitute mode: FNV-1a over IDs and router probabilities
         uint32_t mode;
         float substitute_threshold;
         int32_t  ids[GGML_MOE_GATE_MAX_IDS];   // n_ids of this layer, then n_pred predicted
-        float router_probs[GGML_MOE_GATE_MAX_EXPERTS];
-        uint8_t response_align[96]; // CPU response starts on a separate 256-byte block
+        uint8_t response_align[224]; // CPU response starts on a separate 256-byte block
         int32_t selected_ids[GGML_MOE_GATE_MAX_IDS]; // CPU-owned response, separate from GPU publication
-        uint8_t response_tail[128];
+        uint8_t response_tail[256];
     };
 
     struct ggml_moe_gate_channel {
@@ -359,6 +358,9 @@ extern "C" {
         void                     ** gate_events;    // [GGML_MOE_GATE_MAX_LAYERS], may be NULL
         void                      (* gate_signal)(void * gate_ctx, int slot, uint32_t seq);
         void                      * gate_ctx;       // may be NULL
+        // Backend-owned mapped storage for this slot's per-token router probabilities.
+        float *                   (* alloc_probs)(void * ctx, int slot, size_t n_probs);
+        void                      * probs_ctx;
     };
 
     // Ask a backend for its gate mailbox, allocating it on first call. False if the backend has none.

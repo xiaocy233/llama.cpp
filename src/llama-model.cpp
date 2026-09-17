@@ -1284,6 +1284,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int n_layer_all = hparams.n_layer_all;
     const int n_gpu_layers = this->n_gpu_layers();
+    ml.offload_mtp = ml.load_mtp && hparams.n_layer_nextn > 0 && !devices.empty();
 
     const bool use_mmap_buffer = true;
 
@@ -1344,6 +1345,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
+            if (ml.offload_mtp && il >= (int) hparams.n_layer()) {
+                auto * dev = devices.back().dev;
+                return {dev, &pimpl->gpu_buft_list.at(dev)};
+            }
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
@@ -1354,7 +1359,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
+    // keep the input on the CPU unless MTP needs the shared embedding on the GPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
 
     // assign the repeating layers to the devices according to the splits
@@ -1365,6 +1370,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+    if (ml.offload_mtp) {
+        pimpl->dev_input = pimpl->dev_output;
+        LLAMA_LOG_INFO("%s: keeping MTP layers and shared input/output weights on GPU; CPU tensor overrides do not apply to these weights\n", __func__);
+    }
 
     // Cap the page-locked host weights when MoE experts stream from host memory.
     //
@@ -1395,6 +1405,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 const std::string & name = kv.first;
                 int il = -1;
                 if (sscanf(name.c_str(), "blk.%d.", &il) != 1 || il < 0) {
+                    continue;
+                }
+                if (ml.offload_mtp && il >= (int) hparams.n_layer()) {
                     continue;
                 }
                 if (name.find("ffn_") == std::string::npos || name.find("_exps") == std::string::npos) {

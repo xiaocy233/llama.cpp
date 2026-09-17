@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-moe-runtime.h"
+#include "ggml-moe-backend.h"
 #include "ggml-weight-prefetch.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -1933,12 +1934,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (moe_classic || moe_dual)) {
 
-                    // dual Prefill: the ids index the logical experts and loc_map - not this copy -
-                    // decides which of them are read here, so the used-experts scan does not apply
-                    if (moe_dual) {
-                        const struct ggml_moe_slot_state * st =
-                            ggml_moe_runtime_bank_of(sched->moe, input);
+                    struct ggml_moe_slot_state * st = moe_dual ?
+                        ggml_moe_runtime_bank_of(sched->moe, input) : nullptr;
+                    const bool bulk_copy = ggml_moe_use_bulk_copy(node->src[2]->ne[1], node->src[2]->ne[0], input->ne[2], moe_dual ? node->src[0]->ne[2] : 0);
+                    const bool moe_dual_small = moe_dual && !bulk_copy;
 
+                    if (moe_dual && bulk_copy) {
                         int    ie  = 0;
                         size_t off = 0;
                         size_t len = 0;
@@ -1965,16 +1966,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // The n_assign >= n_expert gate is what keeps decode on the used-experts path: with
                     // one token there are only n_expert_used assignments, so copying whole tensors
                     // would move far more bytes than needed.
-                    if (sched->full_weight_copy && node->op == GGML_OP_MUL_MAT_ID) {
-                        ggml_tensor * ids = node->src[2];
-
-                        // n_tokens * n_expert_used, i.e. the number of (token, expert) assignments
-                        const int64_t n_assign = ggml_nelements(ids);
-
-                        if (n_assign >= n_expert) {
-                            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
-                            continue;
-                        }
+                    if (sched->full_weight_copy && !moe_dual && bulk_copy) {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        continue;
                     }
 
                     ggml_backend_synchronize(input_backend);
@@ -2031,15 +2025,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             expert_size_copy + padding_end);
                     };
 
+                    auto needs_copy = [&](int32_t id) {
+                        return ggml_bitset_get(used_ids.data(), id) &&
+                            (!moe_dual_small || !ggml_moe_runtime_has_expert(st, id));
+                    };
+
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (id < n_expert && !needs_copy(id)) {
                         id++;
+                    }
+                    if (id == n_expert) {
+                        continue;
                     }
                     int32_t first_id = id;
                     int32_t last_id = first_id;
 
                     for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
+                        if (!needs_copy(id)) {
                             continue;
                         }
 

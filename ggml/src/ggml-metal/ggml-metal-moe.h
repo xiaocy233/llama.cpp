@@ -32,6 +32,7 @@ void             ggml_metal_moe_free(ggml_metal_moe_t moe);
 
 // gate mailbox, allocated on first call; false only on allocation failure
 bool ggml_metal_moe_gate_channel(ggml_metal_moe_t moe, struct ggml_moe_gate_channel * out);
+void * ggml_metal_moe_probs_buffer(ggml_metal_moe_t moe, int slot);
 
 // decode event form: one shared event per gate slot. The resolving gate kernel publishes the
 // mailbox entry; the encoder places encodeWaitForEvent(ev, seq) behind it; the worker fills the

@@ -2594,9 +2594,8 @@ static int ggml_metal_op_moe_head_publish(ggml_metal_op_t ctx, int idx) {
 // a queue-side event wait blocks the mul_mat_id behind it until the worker has filled the misses
 // and signaled this gate slot's event. The wait value is the token's gate seq, which the host
 // wrote into the seq tensor before the graph started, so it is known exactly at encode time.
-static_assert(sizeof(ggml_moe_gate_entry) == 1536);
-static_assert(offsetof(ggml_moe_gate_entry, router_probs) == 160);
-static_assert(offsetof(ggml_moe_gate_entry, selected_ids) == 1280);
+static_assert(sizeof(ggml_moe_gate_entry) == 4608);
+static_assert(offsetof(ggml_moe_gate_entry, selected_ids) == 2304);
 
 int ggml_metal_op_moe_gate(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
@@ -2655,13 +2654,15 @@ int ggml_metal_op_moe_gate(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_bytes(enc, &n_slots, sizeof(n_slots), 8);
 
     int32_t substitute = ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_SUBSTITUTE;
-    int32_t n_expert = substitute ? (int32_t) ggml_nelements(op->src[3]) : 0;
+    int32_t n_probs = substitute ? (int32_t) ggml_nelements(op->src[3]) : 0;
     float threshold = 0.0f;
     if (substitute) memcpy(&threshold, (const char *) op->op_params + 5 * sizeof(int32_t), sizeof(threshold));
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(substitute ? op->src[3] : op->src[1]), 9);
     ggml_metal_encoder_set_bytes(enc, &substitute, sizeof(substitute), 10);
-    ggml_metal_encoder_set_bytes(enc, &n_expert, sizeof(n_expert), 11);
+    ggml_metal_encoder_set_bytes(enc, &n_probs, sizeof(n_probs), 11);
     ggml_metal_encoder_set_bytes(enc, &threshold, sizeof(threshold), 12);
+    ggml_metal_encoder_set_buffer(enc, (struct ggml_metal_buffer_id) {
+            substitute ? ggml_metal_moe_probs_buffer(moe, layer) : mailbox, 0 }, 13);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 32, 1, 1);
 

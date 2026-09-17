@@ -1,4 +1,5 @@
 #include "ggml-weight-prefetch.h"
+#include "ggml-moe-backend.h"
 #include "ggml-impl.h"
 
 void ggml_weight_prefetch_plan::schedule(int n_splits, int depth) {
@@ -37,15 +38,5 @@ bool ggml_weight_prefetch_eligible(
         return false;
     }
 
-    // the prefetch copies without looking at the ids, so it must only engage where the used-experts
-    // path would have copied (nearly) everything anyway. this mirrors the condition applied to the
-    // full-copy shortcut in compute_splits; without it, decode (a handful of assignments out of
-    // hundreds of experts) would move the entire tensor per token instead of a few experts.
-    //
-    // both operands are shapes, known at graph build time, so this needs no ids readback and
-    // introduces no dependency on the router.
-    const int64_t n_expert = input->ne[2];
-    const int64_t n_assign = ggml_nelements(node->src[2]);
-
-    return n_assign >= n_expert;
+    return ggml_moe_use_bulk_copy(node->src[2]->ne[1], node->src[2]->ne[0], input->ne[2], dual ? node->src[0]->ne[2] : 0);
 }

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <cstdio>
 
 #ifndef GGML_SCHED_MAX_MOE_CACHES
 #define GGML_SCHED_MAX_MOE_CACHES 128
@@ -33,10 +34,12 @@ struct ggml_moe_slot_state : ggml_moe_cache_policy {
     ggml_backend_buffer_t pub_buf;
     int32_t  * loc_pub;         // [n_expert]
     uint32_t * pub_pass;        // [n_expert] worker sync pass that last published the expert
+    const float * router_probs;
 
     uint64_t n_hit;
     uint64_t n_miss;
     uint64_t n_tokens;
+    uint64_t n_batches;
 
     uint64_t n_load_sync, n_bytes_sync;    // brought in by the blocking fill on the consuming layer
     uint64_t n_load_pf,   n_bytes_pf;      // brought in ahead of use
@@ -49,7 +52,7 @@ struct ggml_moe_slot_state : ggml_moe_cache_policy {
     uint32_t last_seen;           // last mailbox seq the worker consumed for this layer
     uint32_t head_last_seen;      // last seq consumed from the optional head mailbox
 
-    int32_t  pred_batch[GGML_SCHED_MAX_MOE_PRED];
+    int32_t  pred_batch[GGML_MOE_GATE_MAX_IDS];
     int      n_pred_batch;
 
 };
@@ -77,6 +80,7 @@ struct ggml_moe_runtime {
     std::atomic<bool> *          moe_substitute_enabled;
     bool                         moe_host_gate;  // the backend runs its gates on the host (Metal)
     uint32_t                     moe_pass;       // bumped on every worker stream sync
+    std::vector<float> moe_probs;
 
     // Stage pageable weights before copying them past a parked device gate.
     ggml_backend_buffer_t        moe_stage_buf;
@@ -110,7 +114,7 @@ static const char * ggml_moe_runtime_host_ptr(
     return (const char *) st->cache.src[m]->data + (size_t) e * st->expert_nb[m];
 }
 
-const struct ggml_moe_slot_state * ggml_moe_runtime_bank_of(
+struct ggml_moe_slot_state * ggml_moe_runtime_bank_of(
         ggml_moe_runtime * sched, const struct ggml_tensor * src) {
     for (int c = 0; c < sched->n_moe_caches; c++) {
         for (int m = 0; m < 3; m++) {
@@ -121,6 +125,11 @@ const struct ggml_moe_slot_state * ggml_moe_runtime_bank_of(
     }
 
     return NULL;
+}
+
+bool ggml_moe_runtime_has_expert(const ggml_moe_slot_state * st, int expert) {
+    GGML_ASSERT(st == NULL || (expert >= 0 && expert < st->n_expert));
+    return st != NULL && st->slot_of_expert[expert] >= 0;
 }
 
 bool ggml_moe_runtime_bank_range(
@@ -255,6 +264,17 @@ static void ggml_moe_runtime_prefetch(
         const int32_t * experts, int n_experts) {
     ggml_backend_t bk = sched->backends[st->dev_backend_id];
 
+    st->n_pred_batch = 0;
+    for (int i = 0; i < n_experts; i++) {
+        const int32_t e = experts[i];
+        if (e >= 0 && e < st->n_expert &&
+                std::find(st->pred_batch, st->pred_batch + st->n_pred_batch, e) == st->pred_batch + st->n_pred_batch) {
+            st->pred_batch[st->n_pred_batch++] = e;
+        }
+    }
+    experts = st->pred_batch;
+    n_experts = st->n_pred_batch;
+
     for (int i = 0; i < n_experts; i++) {
         const int32_t e = experts[i];
         if (e < 0 || e >= st->n_expert || st->slot_of_expert[e] >= 0) {
@@ -277,15 +297,15 @@ static void ggml_moe_runtime_prefetch(
     }
 }
 
-static uint32_t ggml_moe_payload_hash(const struct ggml_moe_gate_entry * box, int n_expert) {
+static uint32_t ggml_moe_payload_hash(const struct ggml_moe_gate_entry * box, const float * probs, int n_probs) {
     uint32_t hash = 2166136261u;
     GGML_ASSERT(box->n_ids + box->n_pred <= GGML_MOE_GATE_MAX_IDS);
     for (uint32_t i = 0; i < box->n_ids + box->n_pred; i++) {
         hash = (hash ^ (uint32_t) box->ids[i]) * 16777619u;
     }
-    for (int i = 0; i < n_expert; i++) {
+    for (int i = 0; i < n_probs; i++) {
         uint32_t bits;
-        memcpy(&bits, &box->router_probs[i], sizeof(bits));
+        memcpy(&bits, &probs[i], sizeof(bits));
         hash = (hash ^ bits) * 16777619u;
     }
     return hash;
@@ -300,9 +320,18 @@ static void ggml_moe_runtime_service(
     ggml_moe_substitute_result selection{};
     const int32_t * original_ids = box->ids;
     if (has_substitution) {
+        int n_tokens = 0;
         const uint32_t expected_seq = box->seq;
         const int64_t verify_begin = ggml_time_us();
-        while (ggml_moe_payload_hash(box, st->n_expert) != box->payload_hash) {
+        for (;;) {
+            GGML_ASSERT(box->n_ids > 0 && box->n_ids <= (uint32_t) st->n_slots && box->n_ids % st->n_expert_used == 0);
+            n_tokens = box->n_ids / st->n_expert_used;
+            const int n_probs = n_tokens * st->n_expert;
+            GGML_ASSERT(st->router_probs != nullptr && n_probs <= (int) sched->moe_probs.size());
+            memcpy(sched->moe_probs.data(), st->router_probs, n_probs * sizeof(float));
+            if (ggml_moe_payload_hash(box, sched->moe_probs.data(), n_probs) == box->payload_hash) {
+                break;
+            }
             GGML_ASSERT(ggml_time_us() - verify_begin < 1000000);
             std::this_thread::yield();
             std::atomic_thread_fence(std::memory_order_acquire);
@@ -314,52 +343,62 @@ static void ggml_moe_runtime_service(
         original_ids = box->ids;
         adjusted = *box;
         const int n = (int) box->n_ids;
-        ggml_moe_substitute_host(original_ids, box->router_probs, st->slot_of_expert, n, st->n_expert,
-                st->n_slots, !sched->moe_substitute_enabled->load(std::memory_order_relaxed)
-                    ? 0.0f : box->substitute_threshold, selection);
-        for (int i = 0; i < n; i++) {
-            adjusted.ids[i] = selection.ids[i];
-            if (selection.replaced_mask & (1u << i)) {
-                adjusted.miss_mask &= ~(1u << i);
+        const float threshold = sched->moe_substitute_enabled->load(std::memory_order_relaxed) ? box->substitute_threshold : 0.0f;
+        adjusted.miss_mask = 0;
+        for (int t = 0; t < n_tokens; t++) {
+            const int offset = t * st->n_expert_used;
+            ggml_moe_substitute_host(original_ids + offset, sched->moe_probs.data() + t * st->n_expert,
+                    st->slot_of_expert, st->n_expert_used, st->n_expert, st->n_slots, threshold, selection);
+            for (int i = 0; i < st->n_expert_used; i++) {
+                const int e = selection.ids[i];
+                adjusted.ids[offset + i] = e;
+                if (st->slot_of_expert[e] < 0) {
+                    adjusted.miss_mask = 1;
+                }
             }
         }
-        memcpy(sched->moe_ch.ring[st->gate_slot].selected_ids, selection.ids, n * sizeof(int32_t));
+        memcpy(sched->moe_ch.ring[st->gate_slot].selected_ids, adjusted.ids, n * sizeof(int32_t));
         std::atomic_thread_fence(std::memory_order_release);
         box = &adjusted;
     }
     const int32_t * ids    = box->ids;
-    const int       n_ids  = std::min<int>(box->n_ids, st->n_expert_used);
-    const int       n_pred = std::min<int>(box->n_pred, GGML_SCHED_MAX_MOE_PRED);
+    const int       n_ids  = (int) box->n_ids;
+    const int       n_pred = (int) box->n_pred;
     const uint32_t  seq    = box->seq;
 
     ggml_backend_t bk = sched->backends[st->dev_backend_id];
 
-    st->n_tokens++;
+    GGML_ASSERT(n_ids > 0 && n_ids <= st->n_slots && n_ids % st->n_expert_used == 0);
+    GGML_ASSERT(n_ids + n_pred <= GGML_MOE_GATE_MAX_IDS);
+    st->n_tokens += n_ids / st->n_expert_used;
+    st->n_batches++;
 
     if (st->n_pred_batch > 0) {
-        if (sched->moe_stats) {
-            st->n_pf_pred += (uint64_t) st->n_pred_batch;
-            for (int j = 0; j < st->n_pred_batch; j++) {
-                for (int i = 0; i < n_ids; i++) {
-                    if (original_ids[i] == st->pred_batch[j]) {
-                        st->n_pf_useful++;
-                        break;
-                    }
+        st->n_pf_pred += (uint64_t) st->n_pred_batch;
+        for (int j = 0; j < st->n_pred_batch; j++) {
+            for (int i = 0; i < n_ids; i++) {
+                if (original_ids[i] == st->pred_batch[j]) {
+                    st->n_pf_useful++;
+                    break;
                 }
             }
         }
         st->n_pred_batch = 0;
     }
 
-    for (int i = 0; i < n_ids; i++) {
-        const int32_t e = ids[i];
-        if (e >= 0 && e < st->n_expert && st->slot_of_expert[e] >= 0) {
-            st->pinned[st->slot_of_expert[e]] = st->epoch;
-        }
-    }
-
     int n_hit  = 0;
     int n_miss = 0;
+    // Count residency before filling, including repeated assignments to the same expert.
+    for (int i = 0; i < n_ids; i++) {
+        const int32_t e = ids[i];
+        GGML_ASSERT(e >= 0 && e < st->n_expert);
+        if (st->slot_of_expert[e] >= 0) {
+            st->pinned[st->slot_of_expert[e]] = st->epoch;
+            n_hit++;
+        } else {
+            n_miss++;
+        }
+    }
 
     for (int i = 0; i < n_ids; i++) {
         const int32_t e = ids[i];
@@ -371,7 +410,6 @@ static void ggml_moe_runtime_service(
         if (v >= 0) {
             st->freq[e]++;
             st->pinned[v] = st->epoch;
-            n_hit++;
             continue;
         }
 
@@ -389,7 +427,6 @@ static void ggml_moe_runtime_service(
         st->n_load_sync++;
         st->freq[e]++;
         st->pinned[v] = st->epoch;
-        n_miss++;
     }
 
     ggml_moe_runtime_release(sched, st, seq, box->miss_mask != 0 || n_miss > 0);
@@ -407,9 +444,7 @@ static void ggml_moe_runtime_service(
             }
         }
         if (target != NULL) {
-            memcpy(target->pred_batch, ids + n_ids, (size_t) n_pred * sizeof(int32_t));
-            target->n_pred_batch = n_pred;
-            ggml_moe_runtime_prefetch(sched, target, target->pred_batch, n_pred);
+            ggml_moe_runtime_prefetch(sched, target, ids + n_ids, n_pred);
         }
     }
 }
@@ -418,12 +453,10 @@ static void ggml_moe_runtime_service_head(
         ggml_moe_runtime * sched, struct ggml_moe_slot_state * target,
         const struct ggml_moe_gate_entry * box) {
     GGML_ASSERT(box->n_ids == 0);
-    const int n_pred = std::min<int>(
-            std::min<int>(box->n_pred, target->cache.head_n_pred), GGML_SCHED_MAX_MOE_PRED);
+    const int n_pred = (int) box->n_pred;
+    GGML_ASSERT(n_pred <= GGML_MOE_GATE_MAX_IDS);
     if (n_pred > 0) {
-        memcpy(target->pred_batch, box->ids, (size_t) n_pred * sizeof(int32_t));
-        target->n_pred_batch = n_pred;
-        ggml_moe_runtime_prefetch(sched, target, target->pred_batch, n_pred);
+        ggml_moe_runtime_prefetch(sched, target, box->ids, n_pred);
     }
 
 }
@@ -478,6 +511,13 @@ static void ggml_moe_runtime_worker(ggml_moe_runtime * sched) {
             box.seq = seq;
 
             if (st->cache.head_gate_slot >= 0 && st->head_last_seen < seq) {
+                const auto * head = &sched->moe_ch.ring[st->cache.head_gate_slot];
+                if (((volatile const uint32_t *) &head->seq)[0] == seq) {
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    struct ggml_moe_gate_entry head_box;
+                    memcpy(&head_box, head, sizeof(head_box));
+                    ggml_moe_runtime_service_head(sched, st, &head_box);
+                }
                 st->head_last_seen = seq;
             }
 
@@ -725,19 +765,18 @@ bool ggml_moe_runtime_add_moe_slot_cache(
         }
     }
     st->last_seen = st->head_last_seen = sched->moe_seq;
-    if (st->cache.head_gate_slot >= 0) {
-        if (sched->moe_ch.gate_events == NULL) {
-            st->cache.head_pred_w      = NULL;
-            st->cache.head_n_pred      = 0;
-            st->cache.head_pred_source = -1;
-            st->cache.head_gate_slot   = -1;
-        }
-    }
 
     auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(bk));
     auto get_caps = (ggml_moe_backend_caps_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_get_caps");
     GGML_ASSERT(get_caps);
     const auto caps = get_caps(ggml_backend_get_device(bk));
+    if (caps.substitute && n_expert <= GGML_MOE_GATE_MAX_EXPERTS) {
+        const size_t n_probs = (std::min(n_slots, GGML_MOE_GATE_MAX_IDS) / n_expert_used) * (size_t) n_expert;
+        GGML_ASSERT(sched->moe_ch.alloc_probs != nullptr);
+        st->router_probs = sched->moe_ch.alloc_probs(sched->moe_ch.probs_ctx, st->gate_slot, n_probs);
+        GGML_ASSERT(st->router_probs != nullptr);
+        sched->moe_probs.resize(std::max(sched->moe_probs.size(), n_probs));
+    }
     sched->transfer_stream = caps.transfer_stream;
     sched->moe_host_gate = caps.host_copies;
 
@@ -829,26 +868,28 @@ const struct ggml_moe_slot_cache * ggml_moe_runtime_find_moe_head_predictor(
 
 static void ggml_moe_runtime_stats_report(ggml_moe_runtime * sched) {
     GGML_LOG_DEBUG("\n");
-    GGML_LOG_DEBUG("MoE slot cache, decode only: %d layers, one load = one expert (up+gate+down)\n",
+    GGML_LOG_DEBUG("MoE slot cache, single-token decode and small batches: %d layers, one load = one expert (up+gate+down)\n",
             sched->n_moe_caches);
-    GGML_LOG_DEBUG("  %-5s %6s %8s %8s %11s %11s %8s %11s %11s\n",
-            "layer", "slots", "tokens", "hit", "load_sync", "load_pf", "pf_prec", "MiB_sync", "MiB_pf");
+    GGML_LOG_DEBUG("  hit: resident token-expert assignments before fill; load_sync/load_pf: unique expert copies per batch; MiB: totals\n");
+    GGML_LOG_DEBUG("  pf_prec: unique predicted experts used / unique predicted experts in each batch; tokens include verification inputs and warmup\n");
+    GGML_LOG_DEBUG("  %-5s %6s %8s %8s %8s %11s %11s %8s %11s %11s\n",
+            "layer", "slots", "batches", "tokens", "hit", "load_sync", "load_pf", "pf_prec", "MiB_sync", "MiB_pf");
 
-    uint64_t t_hit = 0, t_use = 0, t_ls = 0, t_lp = 0, t_bs = 0, t_bp = 0, t_pp = 0, t_pu = 0, max_tokens = 0;
+    uint64_t t_hit = 0, t_use = 0, t_ls = 0, t_lp = 0, t_bs = 0, t_bp = 0, t_pp = 0, t_pu = 0, max_tokens = 0, max_batches = 0;
 
     for (int i = 0; i < sched->n_moe_caches; i++) {
         const struct ggml_moe_slot_state * st = sched->moe_caches[i];
-        if (st->n_tokens == 0) {
-            continue;
-        }
-        const double   tok = (double) st->n_tokens;
+        const double batch = (double) std::max<uint64_t>(1, st->n_batches);
         const uint64_t use = st->n_hit + st->n_miss;
+        char precision[32] = "N/A";
+        if (st->n_pf_pred > 0) {
+            snprintf(precision, sizeof(precision), "%.4f", (double) st->n_pf_useful / (double) st->n_pf_pred);
+        }
 
-        GGML_LOG_DEBUG("  %-5d %6d %8llu %8.4f %11.3f %11.3f %8.4f %11.1f %11.1f\n",
-                st->cache.layer, st->n_slots, (unsigned long long) st->n_tokens,
+        GGML_LOG_DEBUG("  %-5d %6d %8llu %8llu %8.4f %11.3f %11.3f %8s %11.1f %11.1f\n",
+                st->cache.layer, st->n_slots, (unsigned long long) st->n_batches, (unsigned long long) st->n_tokens,
                 use ? (double) st->n_hit / (double) use : 0.0,
-                (double) st->n_load_sync / tok, (double) st->n_load_pf / tok,
-                st->n_pf_pred ? (double) st->n_pf_useful / (double) st->n_pf_pred : 0.0,
+                (double) st->n_load_sync / batch, (double) st->n_load_pf / batch, precision,
                 (double) st->n_bytes_sync / 1024.0 / 1024.0,
                 (double) st->n_bytes_pf   / 1024.0 / 1024.0);
 
@@ -857,15 +898,19 @@ static void ggml_moe_runtime_stats_report(ggml_moe_runtime * sched) {
         t_bs  += st->n_bytes_sync; t_bp  += st->n_bytes_pf;
         t_pp  += st->n_pf_pred;    t_pu  += st->n_pf_useful;
         max_tokens = std::max(max_tokens, st->n_tokens);
+        max_batches = std::max(max_batches, st->n_batches);
     }
 
     if (max_tokens > 0) {
-        const double tok = (double) max_tokens;
-        GGML_LOG_DEBUG("  %-5s %6s %8llu %8.4f %11.3f %11.3f %8.4f %11.1f %11.1f\n",
-                "TOTAL", "", (unsigned long long) max_tokens,
+        const double batch = (double) max_batches;
+        char precision[32] = "N/A";
+        if (t_pp > 0) {
+            snprintf(precision, sizeof(precision), "%.4f", (double) t_pu / (double) t_pp);
+        }
+        GGML_LOG_DEBUG("  %-5s %6s %8llu %8llu %8.4f %11.3f %11.3f %8s %11.1f %11.1f\n",
+                "TOTAL", "", (unsigned long long) max_batches, (unsigned long long) max_tokens,
                 t_use ? (double) t_hit / (double) t_use : 0.0,
-                (double) t_ls / tok, (double) t_lp / tok,
-                t_pp ? (double) t_pu / (double) t_pp : 0.0,
+                (double) t_ls / batch, (double) t_lp / batch, precision,
                 (double) t_bs / 1024.0 / 1024.0, (double) t_bp / 1024.0 / 1024.0);
     }
 
@@ -879,7 +924,7 @@ void ggml_moe_runtime_free(ggml_moe_runtime * sched) {
         delete sched->moe_worker;
         sched->moe_worker = NULL;
     }
-    if (sched->moe_stats && sched->n_moe_caches > 0) {
+    if (sched->n_moe_caches > 0) {
         ggml_moe_runtime_stats_report(sched);
     }
     for (int i = 0; i < sched->n_moe_caches; i++) {

@@ -1053,11 +1053,14 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 }
 
 // find the first buffer type in the list that can use the tensor
-static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
+static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list, bool gpu_only = false) {
     GGML_ASSERT(!buft_list->empty());
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
+        if (gpu_only && (ggml_backend_dev_type(cur_dev) == GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_buft_is_host(cur_buft))) {
+            continue;
+        }
         if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
             return cur_buft;
         }
@@ -1174,6 +1177,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
         }
 
+        const bool is_mtp = offload_mtp && (tn.bid >= (int) hparams.n_layer() || info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT);
         ggml_backend_buffer_type_t buft = nullptr;
 
         // check overrides
@@ -1182,6 +1186,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
+                    if (is_mtp && ggml_backend_buft_is_host(overrides->buft)) {
+                        break;
+                    }
                     if (cache_disk && ggml_backend_buft_is_host(overrides->buft)) {
                         // a host-targeted expert override becomes disk-resident: no data is read,
                         // the offloader pread()s the experts on demand
@@ -1209,10 +1216,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            buft = select_weight_buft(hparams, t_meta, op, buft_list, is_mtp);
             if (!buft) {
+                if (is_mtp) {
+                    throw std::runtime_error(format("MTP tensor %s has no compatible GPU buffer type; CPU fallback is disabled", tn.str().c_str()));
+                }
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
+        }
+
+        if (is_mtp) {
+            auto * dev = ggml_backend_buft_get_device(buft);
+            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_buft_is_host(buft) || !weight_buft_supported(hparams, t_meta, op, buft, dev)) {
+                throw std::runtime_error(format("MTP tensor %s must use a compatible GPU buffer type", tn.str().c_str()));
+            }
+            LLAMA_LOG_DEBUG("MTP weight %s (%zu bytes) buffer type = %s\n", tn.str().c_str(), ggml_nbytes(t_meta), ggml_backend_buft_name(buft));
         }
 
         // avoid using a host buffer when using mmap

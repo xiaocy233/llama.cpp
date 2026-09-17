@@ -82,6 +82,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    bool offload_mtp = false;
 
     llama_files files;
     llama_ftype ftype;

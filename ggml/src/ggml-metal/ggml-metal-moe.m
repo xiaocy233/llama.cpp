@@ -47,6 +47,7 @@ struct ggml_metal_moe {
     // ---- gate mailbox (shared by the host and device) ----
     struct ggml_moe_gate_channel ch;
     bool ch_init;
+    id<MTLBuffer> probs[GGML_MOE_GATE_MAX_LAYERS];
 
     // ---- fill pool ----
     pthread_t       threads[16];
@@ -229,10 +230,29 @@ void ggml_metal_moe_free(ggml_metal_moe_t moe) {
     pthread_mutex_destroy(&moe->mu);
     pthread_cond_destroy(&moe->cv_submit);
     pthread_cond_destroy(&moe->cv_done);
+    for (int i = 0; i < GGML_MOE_GATE_MAX_LAYERS; i++) {
+        [moe->probs[i] release];
+    }
     // the mailbox MTLBuffer is intentionally not freed: llama_context destroys the backends before
     // the scheduler, and the scheduler's stats report (in ggml_backend_sched_free) still reads the
     // timeout counters through the saved channel pointers. ~54 KB once per process.
     free(moe);
+}
+
+static float * ggml_metal_moe_alloc_probs(void * context, int slot, size_t n_probs) {
+    ggml_metal_moe_t moe = context;
+    GGML_ASSERT(slot >= 0 && slot < GGML_MOE_GATE_MAX_LAYERS);
+    if (moe->probs[slot] == nil) {
+        id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(moe->dev);
+        moe->probs[slot] = [device newBufferWithLength:n_probs * sizeof(float) options:MTLResourceStorageModeShared];
+    }
+    GGML_ASSERT(moe->probs[slot] != nil && moe->probs[slot].length >= n_probs * sizeof(float));
+    return moe->probs[slot].contents;
+}
+
+void * ggml_metal_moe_probs_buffer(ggml_metal_moe_t moe, int slot) {
+    GGML_ASSERT(slot >= 0 && slot < GGML_MOE_GATE_MAX_LAYERS && moe->probs[slot] != nil);
+    return moe->probs[slot];
 }
 
 bool ggml_metal_moe_gate_channel(ggml_metal_moe_t moe, struct ggml_moe_gate_channel * out) {
@@ -258,6 +278,8 @@ bool ggml_metal_moe_gate_channel(ggml_metal_moe_t moe, struct ggml_moe_gate_chan
             moe->ch.release = (volatile uint32_t *) ((char *) buf.contents + sz_ring);
             moe->ch.timeout = (volatile int32_t *)  ((char *) buf.contents + sz_ring + sz_rel);
             moe->ch.gate_events = NULL;   // filled below, once the channel is first handed out
+            moe->ch.alloc_probs = ggml_metal_moe_alloc_probs;
+            moe->ch.probs_ctx = moe;
             ggml_metal_device_set_moe_mailbox(moe->dev, buf);
             moe->ch_init = true;
         }
@@ -446,7 +468,7 @@ bool ggml_metal_moe_host_gate(ggml_metal_moe_t moe, const struct ggml_tensor * n
     for (int i = 0; i < n_ids; i++) {
         const int32_t e = ids[i];
         if (e >= 0 && loc[e] >= n_slots) {
-            mask |= 1u << i;
+            mask = 1u;
         }
     }
     box->miss_mask = mask;

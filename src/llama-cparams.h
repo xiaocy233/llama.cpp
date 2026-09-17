@@ -52,6 +52,7 @@ struct llama_cparams {
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
+    bool no_moe_offload;
     bool kv_unified;
     bool pipeline_parallel;
 

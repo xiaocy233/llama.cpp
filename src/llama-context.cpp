@@ -277,8 +277,9 @@ llama_context::llama_context(
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
 
-    cparams.op_offload = params.op_offload;
-    cparams.kv_unified = params.kv_unified;
+    cparams.op_offload     = params.op_offload;
+    cparams.no_moe_offload = params.no_moe_offload;
+    cparams.kv_unified     = params.kv_unified;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -623,14 +624,14 @@ void llama_context::sched_reserve() {
     const bool moe_disk_prefill =
         model.n_cache_layers() >= 0 && !model.moe_slot_layers.empty() &&
         model.moe_slot_layers.front().src_fd >= 0;
-    if (model.n_cache_layers() >= 0 && !moe_disk_prefill) {
+    if (!cparams.no_moe_offload && model.n_cache_layers() >= 0 && !moe_disk_prefill) {
         ggml_backend_sched_set_weight_prefetch(sched.get(), LLAMA_MOE_PREFETCH_RING_DEPTH);
     }
 
     // Register the MoE expert slot caches. Has to happen before the first reserve: the remap node is
     // only emitted for tensors that have a registered cache, so the graph shape depends on this.
-    if (!model.moe_slot_layers.empty()) {
-        init_moe_slot_caches();
+    init_moe_slot_caches();
+    if (!moe_slot_caches.empty()) {
         for (const auto & c : moe_slot_caches) {
             ggml_backend_sched_add_moe_slot_cache(sched.get(), &c, (int) model.hparams.n_expert_used);
         }
@@ -642,7 +643,7 @@ void llama_context::sched_reserve() {
     // prefill graphs bind to it, decode keeps the slot-cache path above.
     {
         const bool prefill_supported = !backends.empty() && llama_moe_prefill_offload::supported(backends.front().get());
-        if (model.moe_disk_fds.empty() == false && prefill_supported) {
+        if (!cparams.no_moe_offload && model.moe_disk_fds.empty() == false && prefill_supported) {
             const int n_ring = model.n_cache_prefill_buffers() > 0 ? model.n_cache_prefill_buffers() : 2;
             moe_prefill = std::make_unique<llama_moe_prefill_offload>(backends.front().get(), n_ring);
             for (const auto & L : model.moe_slot_layers) {
@@ -1462,9 +1463,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (cparams.moe_substitute_threshold > 0.0f) {
         constexpr int32_t protected_tokens = 5;
-        bool enabled = ubatch.n_tokens == 1;
-        for (int32_t s = 0; enabled && s < ubatch.n_seq_id[0]; ++s) {
-            const auto it = moe_generation_counts.find(ubatch.seq_id[0][s]);
+        bool enabled = ubatch.n_seqs_unq > 0;
+        for (uint32_t s = 0; enabled && s < ubatch.n_seqs_unq; ++s) {
+            const auto it = moe_generation_counts.find(ubatch.seq_id_unq[s]);
             enabled = it != moe_generation_counts.end() && it->second >= protected_tokens;
         }
         ggml_backend_sched_set_moe_substitute_enabled(sched.get(), enabled);
@@ -3610,6 +3611,7 @@ llama_context_params llama_context_default_params() {
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
+        /*.no_moe_offload               =*/ false,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,

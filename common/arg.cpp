@@ -4098,6 +4098,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
 
     add_opt(common_arg(
+        {"--mtp-ub"}, "N",
+        string_format("physical maximum batch size for MTP only (default: %d, limited by --batch-size)", params.speculative.n_ubatch_mtp),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--mtp-ub must be greater than 0");
+            }
+            params.speculative.n_ubatch_mtp = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MTP_UB"));
+
+    add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
         [](common_params & params, const std::string & value) {

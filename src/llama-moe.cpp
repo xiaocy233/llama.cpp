@@ -5,7 +5,7 @@
 #include <stdexcept>
 
 void llama_context::init_moe_slot_caches() {
-    if (model.moe_slot_layers.empty() || !moe_slot_caches.empty()) {
+    if (cparams.no_moe_offload || model.moe_slot_layers.empty() || !moe_slot_caches.empty()) {
         return;
     }
 

@@ -5,6 +5,7 @@
 #include "../ggml/src/ggml-moe-backend.h"
 
 #include <cassert>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -184,7 +185,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
-    // Expert prediction for the next cached layer, decode only.
+    // Expert prediction for batches that fit in the slot cache.
     //
     // cur is the router's input: past the attention residual and this layer's ffn norm. Feeding it
     // to the *next* layer's router is the cheapest possible guess at what that layer will select -
@@ -195,16 +196,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Runs on the device next to the real router. build_lora_mm_id appends it to the ids the gate
     // reads, so it reaches the host inside the entry the gate publishes anyway. Nothing downstream
     // reads it, so a bad guess cannot change the output.
-    if (n_tokens == 1) {
+    if (n_tokens > 0 && n_expert_used > 0 && n_tokens <= GGML_MOE_GATE_MAX_IDS / n_expert_used) {
         const ggml_moe_slot_cache * head = ggml_backend_sched_find_moe_head_predictor(sched, il);
-        if (head && head->head_pred_w && head->head_n_pred > 0 && head->head_gate_slot >= 0) {
+        if (head && head->head_pred_w && head->head_n_pred > 0 && head->head_gate_slot >= 0 &&
+                !ggml_moe_use_bulk_copy(n_tokens, n_expert_used, head->n_expert, head->n_slots)) {
             ggml_tensor * pl = ggml_mul_mat(ctx0, head->head_pred_w, cur);
-            ggml_tensor * pi = ggml_top_k(ctx0, pl, head->head_n_pred);
+            ggml_tensor * pi = ggml_top_k(ctx0, pl, std::min<int64_t>(head->head_n_pred, GGML_MOE_GATE_MAX_IDS / n_tokens));
             cb(pl, "ffn_moe_head_pred_logits", il);
             if (router_logits != nullptr) {
                 ggml_build_forward_expand(gf, router_logits);
             }
             ggml_build_forward_expand(gf, pl);
+            selected_experts = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+            pi = ggml_is_contiguous(pi) ? pi : ggml_cont(ctx0, pi);
             selected_experts = ggml_moe_head(
                     ctx0, selected_experts, pi, head->gate_seq, head->head_gate_slot);
             cb(selected_experts, "ffn_moe_head_join", il);
@@ -214,32 +218,40 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (sc == nullptr) {
             sc = ggml_backend_sched_find_moe_slot_cache(sched, gate_exps);
         }
-        if (sc && sc->pred_w && sc->n_pred > 0) {
-            ggml_tensor * pl = ggml_mul_mat(ctx0, sc->pred_w, cur);      // [n_expert, 1]
-            ggml_tensor * pi = ggml_top_k(ctx0, pl, sc->n_pred);         // [n_pred, 1] I32
-            cb(pl, "ffn_moe_pred_logits", il);
-            moe_slot_preds.push_back({ sc->loc_map, pi });
+        if (sc && sc->pred_w && sc->n_pred > 0 && !ggml_moe_use_bulk_copy(n_tokens, n_expert_used, sc->n_expert, sc->n_slots)) {
+            const int64_t max_pred = GGML_MOE_GATE_MAX_IDS / n_tokens - n_expert_used;
+            if (max_pred > 0) {
+                ggml_tensor * pl = ggml_mul_mat(ctx0, sc->pred_w, cur);      // [n_expert, n_tokens]
+                ggml_tensor * pi = ggml_top_k(ctx0, pl, std::min<int64_t>(sc->n_pred, max_pred));
+                cb(pl, "ffn_moe_pred_logits", il);
+                moe_slot_preds.push_back({ sc->loc_map, pi });
+            }
         }
     }
 
-    if (n_tokens == 1 && cparams.moe_substitute_threshold > 0.0f) {
+    if (cparams.moe_substitute_threshold > 0.0f) {
         GGML_ASSERT(arch == LLM_ARCH_QWEN35MOE && norm_w && gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX);
         const ggml_moe_slot_cache * cache = ggml_backend_sched_find_moe_slot_cache(sched, up_exps);
         if (!cache) cache = ggml_backend_sched_find_moe_slot_cache(sched, gate_exps);
-        if (cache) {
+        if (cache && !ggml_moe_use_bulk_copy(n_tokens, n_expert_used, cache->n_expert, cache->n_slots)
+                && n_tokens * n_expert_used <= GGML_MOE_GATE_MAX_IDS) {
             auto * device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cache->slots[0]->buffer));
             GGML_ASSERT(ggml_moe_backend_get_caps(device).substitute);
             ggml_tensor * input_ids = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+            input_ids = ggml_reshape_1d(ctx0, input_ids, n_expert_used * n_tokens);
             for (const auto & prediction : moe_slot_preds) {
                 if (prediction.loc_map == cache->loc_map) {
-                    input_ids = ggml_concat(ctx0, input_ids, prediction.ids, 0);
+                    auto * pred_ids = ggml_is_contiguous(prediction.ids) ? prediction.ids : ggml_cont(ctx0, prediction.ids);
+                    pred_ids = ggml_reshape_1d(ctx0, pred_ids, ggml_nelements(pred_ids));
+                    input_ids = ggml_concat(ctx0, input_ids, pred_ids, 0);
                     break;
                 }
             }
+            auto * router_probs = ggml_reshape_2d(ctx0, probs, n_expert, n_tokens);
             ggml_tensor * decision = ggml_moe_gate_substitute(ctx0, cache->loc_map, input_ids, cache->gate_seq,
-                    probs, cache->gate_slot, n_expert_used, cache->n_slots, cparams.moe_substitute_threshold);
-            ggml_tensor * resolved = ggml_view_2d(ctx0, decision, n_expert_used, 1, decision->nb[1], 0);
-            selected_experts = ggml_view_2d(ctx0, decision, n_expert_used, 1, decision->nb[1], n_expert_used * sizeof(int32_t));
+                    router_probs, cache->gate_slot, n_expert_used * n_tokens, cache->n_slots, cparams.moe_substitute_threshold);
+            ggml_tensor * resolved = ggml_view_2d(ctx0, decision, n_expert_used, n_tokens, n_expert_used * sizeof(int32_t), 0);
+            selected_experts = ggml_view_2d(ctx0, decision, n_expert_used, n_tokens, n_expert_used * sizeof(int32_t), n_expert_used * n_tokens * sizeof(int32_t));
             moe_slot_remaps.push_back({cache->loc_map, selected_experts, resolved});
             cb(selected_experts, "ffn_moe_substituted_ids", il);
         }

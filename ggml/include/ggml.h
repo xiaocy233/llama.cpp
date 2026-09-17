@@ -1465,7 +1465,8 @@ extern "C" {
     // the host for the ones that are not resident. Runs on the device, so no host round trip cuts
     // the layer in two. See probe/GATE-PLAN.md.
     //
-    // Metal decode gate. I32 [n_ids, 2]: resolved slots and selected logical expert IDs.
+    // Substitution gate. I32 [n_ids, 2]: resolved slots and selected logical expert IDs, token-major.
+    // probs is F32 [n_expert, n_tokens]; n_ids is n_expert_used * n_tokens.
     GGML_API struct ggml_tensor * ggml_moe_gate_substitute(
             struct ggml_context * ctx,
             struct ggml_tensor * loc_map,

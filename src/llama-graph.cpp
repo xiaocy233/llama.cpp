@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "../ggml/src/ggml-moe-backend.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1525,7 +1526,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
     // MoE expert slot cache:
-    //   Decode (n_tokens==1): MUL_MAT_ID(slots, b, moe_gate(loc_map, ids, seq))
+    //   Batches that fit: MUL_MAT_ID(slots, b, moe_gate(loc_map, ids, seq))
     //   Prefill: dual-base MUL_MAT_ID(slots, b, ids, host_bank, loc_map)
     ggml_tensor * res = nullptr;
 
@@ -1539,7 +1540,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             }
         }
 
-        if (slots != nullptr && ids->ne[1] == 1 && sc->gate_seq != nullptr) {
+        if (slots != nullptr && sc->gate_seq != nullptr && ids->ne[1] > 0 && ggml_nelements(ids) <= GGML_MOE_GATE_MAX_IDS &&
+                !ggml_moe_use_bulk_copy(ids->ne[1], ids->ne[0], sc->n_expert, sc->n_slots)) {
             ggml_tensor * ids_use = nullptr;
             for (const auto & r : moe_slot_remaps) {
                 if (r.loc_map == sc->loc_map && r.ids == ids) {
@@ -1550,16 +1552,19 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             if (ids_use == nullptr) {
                 // the guess for the next layer travels with the ids, so the gate publishes both in
                 // one mailbox entry. The gate resolves the head only; the tail is for the worker.
-                ggml_tensor * ids_in = ids;
+                ggml_tensor * ids_in = ggml_is_contiguous(ids) ? ids : ggml_cont(ctx0, ids);
+                ids_in = ggml_reshape_1d(ctx0, ids_in, ggml_nelements(ids));
                 for (const auto & p : moe_slot_preds) {
                     if (p.loc_map == sc->loc_map) {
-                        ids_in = ggml_concat(ctx0, ids, p.ids, 0);
+                        ggml_tensor * pred = ggml_is_contiguous(p.ids) ? p.ids : ggml_cont(ctx0, p.ids);
+                        pred = ggml_reshape_1d(ctx0, pred, ggml_nelements(p.ids));
+                        ids_in = ggml_concat(ctx0, ids_in, pred, 0);
                         break;
                     }
                 }
 
                 ids_use = ggml_moe_gate(ctx0, sc->loc_map, ids_in, sc->gate_seq,
-                        sc->gate_slot, (int) ids->ne[0], sc->n_slots);
+                        sc->gate_slot, (int) ggml_nelements(ids), sc->n_slots);
                 ids_use = ggml_reshape_2d(ctx0, ids_use, ids->ne[0], ids->ne[1]);
                 moe_slot_remaps.push_back({ sc->loc_map, ids, ids_use });
             }

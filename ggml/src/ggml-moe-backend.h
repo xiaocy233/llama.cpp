@@ -1,6 +1,12 @@
 #pragma once
 #include "ggml-backend.h"
 
+inline bool ggml_moe_use_bulk_copy(int64_t n_tokens, int64_t n_expert_used, int64_t n_expert, int64_t n_slots = 0) {
+    GGML_ASSERT(n_tokens >= 0 && n_expert_used > 0 && n_expert > 0 && n_slots >= 0);
+    // With slots, keep the whole batch in cache. Without slots, retain the full-bank threshold.
+    return n_slots > 0 ? n_tokens > n_slots / n_expert_used : n_tokens > (n_expert - 1) / n_expert_used;
+}
+
 struct ggml_moe_backend_caps {
     int transfer_stream;
     bool host_copies;

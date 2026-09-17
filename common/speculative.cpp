@@ -2278,10 +2278,19 @@ common_params common_base_params_to_speculative(const common_params & params) {
     common_params result = params;
 
     if (has_draft) {
-        result.devices               = params_spec.devices;
-        result.model                 = params_spec.mparams;
-        result.n_gpu_layers          = params_spec.n_gpu_layers;
-        result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+        result.devices      = params_spec.devices;
+        result.model        = params_spec.mparams;
+
+        // Keep draft weights on the device.
+        result.n_gpu_layers = -2;
+        result.tensor_buft_overrides.clear();
+
+        result.n_cache_layers          = -1;
+        result.n_cache_slots           = 0;
+        result.n_cache_predict         = 0;
+        result.n_cache_pin             = -1;
+        result.cache_disk              = false;
+        result.n_cache_prefill_buffers = 0;
 
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
@@ -2292,6 +2301,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
+
+    if (std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end()) {
+        result.n_ubatch = params.speculative.n_ubatch_mtp;
+    }
 
     return result;
 }
@@ -2318,6 +2331,8 @@ common_speculative_init_result::common_speculative_init_result(
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    cparams.no_moe_offload = true;
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;

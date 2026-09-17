@@ -3407,7 +3407,7 @@ struct ggml_tensor * ggml_moe_gate(
     GGML_ASSERT(ggml_nelements(seq) == 1);
     GGML_ASSERT(ggml_is_contiguous(ids_in));
     GGML_ASSERT(layer >= 0);
-    GGML_ASSERT(n_slots > 0);
+    GGML_ASSERT(n_slots >= n_ids);
     GGML_ASSERT(n_ids > 0 && n_ids <= GGML_MOE_GATE_MAX_IDS && n_ids <= ggml_nelements(ids_in));
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_ids);
@@ -3433,10 +3433,11 @@ struct ggml_tensor * ggml_moe_gate_substitute(
         struct ggml_tensor * seq, struct ggml_tensor * probs,
         int layer, int n_ids, int n_slots, float threshold) {
     GGML_ASSERT(loc_map->type == GGML_TYPE_I32 && ids_in->type == GGML_TYPE_I32 && seq->type == GGML_TYPE_I32);
-    GGML_ASSERT(probs->type == GGML_TYPE_F32 && ggml_nelements(probs) == ggml_nelements(loc_map));
+    GGML_ASSERT(probs->type == GGML_TYPE_F32 && probs->ne[0] == ggml_nelements(loc_map));
     GGML_ASSERT(ggml_is_contiguous(ids_in) && ggml_is_contiguous(probs));
     GGML_ASSERT(n_ids > 0 && n_ids <= GGML_MOE_GATE_MAX_IDS && n_slots >= n_ids);
-    GGML_ASSERT(ggml_nelements(probs) > 0 && ggml_nelements(probs) <= GGML_MOE_GATE_MAX_EXPERTS);
+    GGML_ASSERT(probs->ne[0] > 0 && probs->ne[0] <= GGML_MOE_GATE_MAX_EXPERTS);
+    GGML_ASSERT(ggml_is_matrix(probs) && probs->ne[1] > 0 && n_ids % probs->ne[1] == 0);
     GGML_ASSERT(ggml_nelements(seq) == 1 && layer >= 0 && layer < GGML_MOE_GATE_MAX_LAYERS);
     GGML_ASSERT(isfinite(threshold) && threshold >= 0 && threshold <= 1);
     int n_pred = (int) ggml_nelements(ids_in) - n_ids;

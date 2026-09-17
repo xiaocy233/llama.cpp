@@ -719,6 +719,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
     }
     if (moe_gate_ch.ring_host != nullptr) {
+        for (float * probs : moe_gate_ch.probs_host) {
+            if (probs != nullptr) {
+                CUDA_CHECK(cudaFreeHost(probs));
+            }
+        }
         CUDA_CHECK(cudaFreeHost(moe_gate_ch.ring_host));
         CUDA_CHECK(cudaFreeHost(moe_gate_ch.release_host));
         CUDA_CHECK(cudaFreeHost(moe_gate_ch.timeout_host));
@@ -2584,6 +2589,20 @@ static void ggml_backend_cuda_moe_gate_release_stream(ggml_backend_t backend, in
     ggml_cuda_moe_gate_release(*cuda_ctx, cuda_ctx->stream(cuda_ctx->device, stream), layer, seq);
 }
 
+static float * ggml_backend_cuda_moe_alloc_probs(void * context, int slot, size_t n_probs) {
+    auto * ctx = (ggml_backend_cuda_context *) context;
+    auto & ch = ctx->moe_gate_ch;
+    GGML_ASSERT(slot >= 0 && slot < GGML_MOE_GATE_MAX_LAYERS);
+    ggml_cuda_set_device(ctx->device);
+    if (ch.probs_host[slot] == nullptr) {
+        CUDA_CHECK(cudaHostAlloc(&ch.probs_host[slot], n_probs * sizeof(float), cudaHostAllocMapped));
+        CUDA_CHECK(cudaHostGetDevicePointer(&ch.probs_dev[slot], ch.probs_host[slot], 0));
+        ch.n_probs[slot] = n_probs;
+    }
+    GGML_ASSERT(ch.n_probs[slot] >= n_probs);
+    return ch.probs_host[slot];
+}
+
 static bool ggml_backend_cuda_moe_gate_channel(ggml_backend_t backend, ggml_moe_gate_channel * out) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -2595,6 +2614,8 @@ static bool ggml_backend_cuda_moe_gate_channel(ggml_backend_t backend, ggml_moe_
     out->gate_events = NULL;   // park form: the device kernel waits on release[], no host signal
     out->gate_signal = NULL;
     out->gate_ctx    = NULL;
+    out->alloc_probs = ggml_backend_cuda_moe_alloc_probs;
+    out->probs_ctx   = cuda_ctx;
 
     return true;
 }
@@ -5220,15 +5241,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        );
             } break;
         case GGML_OP_MOE_GATE:
+            if (ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_HEAD) {
+                return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                       ggml_get_op_params_i32(op, 0) >= 0 && ggml_get_op_params_i32(op, 0) < GGML_MOE_GATE_MAX_LAYERS &&
+                       ggml_get_op_params_i32(op, 1) > 0 && ggml_get_op_params_i32(op, 1) <= GGML_MOE_GATE_MAX_IDS &&
+                       ggml_get_op_params_i32(op, 2) >= 0 && ggml_get_op_params_i32(op, 2) <= GGML_MOE_GATE_MAX_IDS;
+            }
             return ggml_is_contiguous(op->src[1]) &&
                    (ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_NORMAL ||
                     (ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_SUBSTITUTE &&
                      op->src[3] && op->src[3]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[3]) &&
-                     ggml_nelements(op->src[3]) <= GGML_MOE_GATE_MAX_EXPERTS)) &&
+                     ggml_is_matrix(op->src[3]) && op->src[3]->ne[0] == ggml_nelements(op->src[0]) &&
+                     op->src[3]->ne[0] <= GGML_MOE_GATE_MAX_EXPERTS && op->src[3]->ne[1] > 0 &&
+                     ggml_get_op_params_i32(op, 1) % op->src[3]->ne[1] == 0)) &&
                    ggml_get_op_params_i32(op, 0) >= 0 &&
                    ggml_get_op_params_i32(op, 0) < GGML_MOE_GATE_MAX_LAYERS &&
                    ggml_get_op_params_i32(op, 1) > 0 &&
-                   ggml_get_op_params_i32(op, 1) <= 32 &&
+                   ggml_get_op_params_i32(op, 1) <= ggml_get_op_params_i32(op, 3) &&
                    ggml_get_op_params_i32(op, 1) + ggml_get_op_params_i32(op, 2) <= GGML_MOE_GATE_MAX_IDS;
         case GGML_OP_CONV_TRANSPOSE_1D:
             {

@@ -11620,9 +11620,8 @@ kernel void kernel_moe_interceptor(
 }
 
 // mailbox entry layout, mirroring struct ggml_moe_gate_entry (ggml-backend.h):
-//   uint32 seq@0, layer@4, miss_mask@8, n_ids@12, n_pred@16, hash@20, mode@24, threshold@28, int32 ids[32]@32
-#define MOE_GATE_ENTRY_SIZE 1536
-#define MOE_GATE_PROBS_OFF  160
+//   uint32 seq@0, layer@4, miss_mask@8, n_ids@12, n_pred@16, hash@20, mode@24, threshold@28, int32 ids[512]@32
+#define MOE_GATE_ENTRY_SIZE 4608
 #define MOE_GATE_IDS_OFF    32
 
 kernel void kernel_moe_head_publish(
@@ -11683,8 +11682,9 @@ kernel void kernel_moe_gate(
         constant     int32_t & n_slots [[buffer(8)]],
         device const float * router_probs [[buffer(9)]],
         constant int32_t & substitute [[buffer(10)]],
-        constant int32_t & n_expert [[buffer(11)]],
+        constant int32_t & n_probs [[buffer(11)]],
         constant float & threshold [[buffer(12)]],
+        device volatile float * probs_out [[buffer(13)]],
         uint tidx [[thread_index_in_threadgroup]],
         uint nt   [[threads_per_threadgroup]])
 {
@@ -11700,12 +11700,12 @@ kernel void kernel_moe_gate(
     device volatile uint32_t * box_hdr = (device volatile uint32_t *) box_c;
     device volatile int32_t  * box_ids = (device volatile int32_t  *) (box_c + IDS_OFF);
 
-    // miss mask over the routed ids: bit i = loc_map[ids[i]] says "not resident"
+    // Record whether any routed expert is missing.
     uint miss = 0;
     for (int i = 0; i < n_ids; i++) {
         const int32_t e = ids_in[i];
         if (e >= 0 && loc_map[e] >= n_slots) {
-            miss |= (1u << i);
+            miss = 1u;
         }
     }
 
@@ -11718,10 +11718,9 @@ kernel void kernel_moe_gate(
         if (substitute) payload_hash = (payload_hash ^ as_type<uint>(value)) * 16777619u;
     }
     if (substitute) {
-        device volatile float * target = (device volatile float *) (box_c + MOE_GATE_PROBS_OFF);
-        for (int i = 0; i < n_expert; i++) {
+        for (int i = 0; i < n_probs; i++) {
             const float value = router_probs[i];
-            target[i] = value;
+            probs_out[i] = value;
             payload_hash = (payload_hash ^ as_type<uint>(value)) * 16777619u;
         }
     }

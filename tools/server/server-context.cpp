@@ -918,6 +918,9 @@ public:
             // we don't call it again here to avoid double free
             destroy();
         }
+        if (common_log_get_verbosity_thold() >= LOG_LEVEL_DEBUG) {
+            common_log_flush(common_log_main());
+        }
     }
 
 private:
@@ -1131,6 +1134,7 @@ private:
 
                 auto mparams_dft = common_model_params_to_llama(params_dft);
                 auto cparams_dft = common_context_params_to_llama(params_dft);
+                cparams_dft.no_moe_offload = true;
                 if (spec_mtp) {
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                 }
