@@ -24,6 +24,7 @@
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
+#include "ggml-cuda/draft-acceptance.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
@@ -4626,6 +4627,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                static const bool fusion_audit = getenv("GGML_CUDA_FUSION_AUDIT") != nullptr;
+                if (fusion_audit && nodes_to_skip) {
+                    fprintf(stderr, "[fusion_audit] %s %s -> %s %s ne=%lld,%lld,%lld,%lld skip=%d\n",
+                            node->name, ggml_op_name(node->op), cgraph->nodes[i + nodes_to_skip]->name,
+                            ggml_op_name(cgraph->nodes[i + nodes_to_skip]->op), (long long) node->ne[0],
+                            (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3], nodes_to_skip);
+                }
+
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -5753,16 +5762,25 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            )
                        );
             } break;
+        case GGML_OP_MOE_CPU:
+            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
         case GGML_OP_MOE_GATE:
+            if (ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_HEAD) {
+                return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                       ggml_get_op_params_i32(op, 0) >= 0 && ggml_get_op_params_i32(op, 0) < GGML_MOE_GATE_MAX_LAYERS &&
+                       ggml_get_op_params_i32(op, 1) > 0 && ggml_get_op_params_i32(op, 1) <= GGML_MOE_GATE_MAX_IDS &&
+                       ggml_get_op_params_i32(op, 2) >= 0 && ggml_get_op_params_i32(op, 2) <= GGML_MOE_GATE_MAX_IDS;
+            }
             return ggml_is_contiguous(op->src[1]) &&
                    (ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_NORMAL ||
+                    ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_HYBRID ||
                     (ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_SUBSTITUTE &&
                      op->src[3] && op->src[3]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[3]) &&
                      ggml_nelements(op->src[3]) <= GGML_MOE_GATE_MAX_EXPERTS)) &&
                    ggml_get_op_params_i32(op, 0) >= 0 &&
                    ggml_get_op_params_i32(op, 0) < GGML_MOE_GATE_MAX_LAYERS &&
                    ggml_get_op_params_i32(op, 1) > 0 &&
-                   ggml_get_op_params_i32(op, 1) <= 32 &&
+                   (ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_HYBRID || ggml_get_op_params_i32(op, 1) <= ggml_get_op_params_i32(op, 3)) &&
                    ggml_get_op_params_i32(op, 1) + ggml_get_op_params_i32(op, 2) <= GGML_MOE_GATE_MAX_IDS;
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
@@ -6104,11 +6122,43 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static int ggml_backend_cuda_moe_cpu_max_tokens(ggml_backend_t backend, ggml_type type) {
+    const auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    return ggml_is_quantized(type) ? get_mmvq_mmid_max_batch(type, ggml_cuda_info().devices[ctx->device].cc) : 0;
+}
+
+static bool ggml_backend_cuda_moe_cpu_merge_begin(ggml_backend_t backend, ggml_tensor * dst, const float * values, const int32_t * rows, int count, const uint32_t * complete) {
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    return ggml_cuda_moe_cpu_merge_begin(*ctx, dst, values, rows, count, complete);
+}
+
+static void ggml_backend_cuda_moe_cpu_merge(ggml_backend_t backend, ggml_tensor * dst, const float * values, const int32_t * rows, int count) {
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_moe_cpu_merge(*ctx, dst, values, rows, count);
+}
+
 static ggml_moe_backend_caps ggml_backend_cuda_moe_get_caps(ggml_backend_dev_t) {
     return { 3, false, true };
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_moe_cpu_max_tokens") == 0) {
+        return (void *) ggml_backend_cuda_moe_cpu_max_tokens;
+    }
+    if (strcmp(name, "ggml_backend_moe_cpu_merge_begin") == 0) {
+        return (void *) ggml_backend_cuda_moe_cpu_merge_begin;
+    }
+    if (strcmp(name, "ggml_backend_moe_cpu_merge") == 0) {
+        return (void *) ggml_backend_cuda_moe_cpu_merge;
+    }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_draft_acceptance_init") == 0) {
+        return (void *) ggml_cuda_draft_acceptance_init;
+    }
+#endif
     if (strcmp(name, "ggml_backend_moe_get_caps") == 0) {
         return (void *) ggml_backend_cuda_moe_get_caps;
     }

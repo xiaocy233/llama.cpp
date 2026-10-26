@@ -10,7 +10,7 @@ struct ggml_moe_substitute_result {
 
 static inline void ggml_moe_substitute_host(const int32_t * ids, const float * probs, const int32_t * map,
         int n_ids, int n_expert, int n_slots, float threshold, ggml_moe_substitute_result & out) {
-    GGML_ASSERT(n_ids > 0 && n_ids <= GGML_MOE_GATE_MAX_IDS);
+    GGML_ASSERT(n_ids > 0 && n_ids <= 32 && n_ids <= GGML_MOE_GATE_MAX_IDS);
     GGML_ASSERT(n_expert > 0 && n_expert <= GGML_MOE_GATE_MAX_EXPERTS);
     GGML_ASSERT(n_slots >= n_ids && std::isfinite(threshold) && threshold >= 0 && threshold <= 1);
     bool used[GGML_MOE_GATE_MAX_EXPERTS] = {};

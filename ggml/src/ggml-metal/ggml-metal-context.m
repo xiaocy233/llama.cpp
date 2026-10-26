@@ -530,9 +530,8 @@ static enum ggml_status ggml_metal_graph_compute_gated(ggml_metal_t ctx, struct 
                     ctx->cmd_buf_last = cmd_buf;
 
                     ggml_metal_op_t ctx_op = ggml_metal_op_init(
-                        ctx->dev, cmd_buf, gf, seg_start, i,
-                        ctx->use_fusion, ctx->use_concurrency,
-                        /* use_capture = */ false, ctx->debug_graph, ctx->debug_fusion);
+                        ctx->dev, cmd_buf, gf, ctx->finfo, seg_start, i,
+                        ctx->use_concurrency, /* use_capture = */ false, ctx->debug_graph);
 
                     for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
                         const int res = ggml_metal_op_encode(ctx_op, idx);

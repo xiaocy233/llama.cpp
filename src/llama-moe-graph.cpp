@@ -5,6 +5,7 @@
 #include "../ggml/src/ggml-moe-backend.h"
 
 #include <cassert>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -184,7 +185,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
-    // Expert prediction for the next cached layer, decode only.
+    // Expert prediction for batches that fit in the slot cache.
     //
     // cur is the router's input: past the attention residual and this layer's ffn norm. Feeding it
     // to the *next* layer's router is the cheapest possible guess at what that layer will select -
@@ -195,16 +196,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Runs on the device next to the real router. build_lora_mm_id appends it to the ids the gate
     // reads, so it reaches the host inside the entry the gate publishes anyway. Nothing downstream
     // reads it, so a bad guess cannot change the output.
-    if (n_tokens == 1) {
+    if (n_tokens > 0 && n_expert_used > 0 && n_tokens <= GGML_MOE_GATE_MAX_IDS / n_expert_used) {
         const ggml_moe_slot_cache * head = ggml_backend_sched_find_moe_head_predictor(sched, il);
-        if (head && head->head_pred_w && head->head_n_pred > 0 && head->head_gate_slot >= 0) {
+        if (head && head->head_pred_w && head->head_n_pred > 0 && head->head_gate_slot >= 0 &&
+                ggml_moe_batch_fits_slots(n_tokens, n_expert_used, head->n_slots)) {
             ggml_tensor * pl = ggml_mul_mat(ctx0, head->head_pred_w, cur);
-            ggml_tensor * pi = ggml_argsort_top_k(ctx0, pl, head->head_n_pred);
+            ggml_tensor * pi = ggml_argsort_top_k(ctx0, pl, std::min<int64_t>(head->head_n_pred, GGML_MOE_GATE_MAX_IDS / n_tokens));
             cb(pl, "ffn_moe_head_pred_logits", il);
             if (router_logits != nullptr) {
                 ggml_build_forward_expand(gf, router_logits);
             }
             ggml_build_forward_expand(gf, pl);
+            selected_experts = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+            pi = ggml_is_contiguous(pi) ? pi : ggml_cont(ctx0, pi);
             selected_experts = ggml_moe_head(
                     ctx0, selected_experts, pi, head->gate_seq, head->head_gate_slot);
             cb(selected_experts, "ffn_moe_head_join", il);
@@ -215,10 +219,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             sc = ggml_backend_sched_find_moe_slot_cache(sched, gate_exps);
         }
         if (sc && sc->pred_w && sc->n_pred > 0) {
-            ggml_tensor * pl = ggml_mul_mat(ctx0, sc->pred_w, cur);      // [n_expert, 1]
-            ggml_tensor * pi = ggml_argsort_top_k(ctx0, pl, sc->n_pred);         // [n_pred, 1] I32
-            cb(pl, "ffn_moe_pred_logits", il);
-            moe_slot_preds.push_back({ sc->loc_map, pi });
+            const int64_t max_pred = GGML_MOE_GATE_MAX_IDS / n_tokens - n_expert_used;
+            if (max_pred > 0) {
+                ggml_tensor * pl = ggml_mul_mat(ctx0, sc->pred_w, cur);      // [n_expert, n_tokens]
+                ggml_tensor * pi = ggml_argsort_top_k(ctx0, pl, std::min<int64_t>(sc->n_pred, max_pred));
+                cb(pl, "ffn_moe_pred_logits", il);
+                moe_slot_preds.push_back({ sc->loc_map, pi });
+            }
         }
     }
 
@@ -318,155 +325,187 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps    = bind(down_exps);
     }
 
-    if (gate_up_exps) {
-        // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
-        cb(gate_up, "ffn_moe_gate_up", il);
-
-        if (up_exps_s) {
-            cb(gate_up, "ffn_moe_gate_up_scaled", il);
+    const ggml_moe_slot_cache * hybrid = ggml_backend_sched_find_moe_slot_cache(sched, up_exps);
+    const bool hybrid_ffn = hybrid && hybrid->cpu_expert_max_tokens > 0 && n_tokens > 0 && n_tokens <= hybrid->cpu_expert_max_tokens &&
+            n_tokens * n_expert_used <= GGML_MOE_GATE_MAX_IDS && (arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP) && cparams.moe_substitute_threshold == 0.0f &&
+            type_op == LLM_FFN_SILU && !weight_before_ffn && gate_exps && !gate_up_exps &&
+            !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
+            (!loras || loras->empty()) && hparams.swiglu_clamp_exp[il] <= 1e-6f;
+    if (hybrid_ffn) {
+        ggml_tensor * input_ids = ggml_reshape_1d(ctx0, ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts), n_tokens * n_expert_used);
+        for (const auto & prediction : moe_slot_preds) {
+            if (prediction.loc_map == hybrid->loc_map) {
+                input_ids = ggml_concat(ctx0, input_ids, ggml_reshape_1d(ctx0, ggml_is_contiguous(prediction.ids) ? prediction.ids : ggml_cont(ctx0, prediction.ids), ggml_nelements(prediction.ids)), 0);
+                break;
+            }
         }
-
-        if (gate_up_exps_b) {
-            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
-            cb(gate_up, "ffn_moe_gate_up_biased", il);
+        ggml_tensor * cpu_start = nullptr;
+        if (hybrid->cpu_expert_early) {
+            cpu_start = ggml_moe_cpu_stage(ctx0, ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur), input_ids, hybrid->gate_slot);
         }
-
-        const int64_t n_ff = gate_up->ne[0] / 2;
-        cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
-        cb(cur, "ffn_moe_gate", il);
-        up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
-        cb(up, "ffn_moe_up", il);
+        ggml_tensor * resolved = ggml_moe_gate_hybrid(ctx0, hybrid->loc_map, input_ids, hybrid->gate_seq,
+                hybrid->gate_slot, n_tokens * n_expert_used, hybrid->n_slots);
+        if (cpu_start) resolved->src[3] = cpu_start;
+        resolved = ggml_reshape_2d(ctx0, resolved, n_expert_used, n_tokens);
+        if (!cpu_start) cpu_start = ggml_moe_cpu_start(ctx0, ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur), resolved, hybrid->gate_slot);
+        up = ggml_mul_mat_id(ctx0, hybrid->slots[1], cpu_start, resolved);
+        cur = ggml_mul_mat_id(ctx0, hybrid->slots[0], cpu_start, resolved);
+        cur = ggml_swiglu_split(ctx0, cur, up);
+        experts = ggml_mul_mat_id(ctx0, hybrid->slots[2], cur, resolved);
+        experts = ggml_moe_cpu_finish(ctx0, experts, cpu_start);
+        cb(experts, "ffn_moe_down", il);
     } else {
-        // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
-        cb(up, "ffn_moe_up", il);
+        if (gate_up_exps) {
+            // merged gate_up path: one mul_mat_id, then split into gate and up views
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+            cb(gate_up, "ffn_moe_gate_up", il);
 
-        if (up_exps_s) {
-            cb(up, "ffn_moe_up_scaled", il);
-        }
-
-        if (up_exps_b) {
-            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
-            cb(up, "ffn_moe_up_biased", il);
-        }
-
-        if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
-            cb(cur, "ffn_moe_gate", il);
-        } else {
-            cur = up;
-        }
-
-        if (gate_exps_s) {
-            cb(cur, "ffn_moe_gate_scaled", il);
-        }
-
-        if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
-            cb(cur, "ffn_moe_gate_biased", il);
-        }
-    }
-
-    const bool has_gate = gate_exps || gate_up_exps;
-
-    switch (type_op) {
-        case LLM_FFN_SILU:
-            if (gate_exps) {
-                if (il >= 0) {
-                    const float limit = hparams.swiglu_clamp_exp[il];
-                    constexpr float eps = 1e-6f;
-                    if (limit > eps) {
-                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
-                            cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
-                        } else {
-                            up = ggml_clamp(ctx0, up, -limit, limit);
-                            cb(up, "ffn_moe_up_clamped", il);
-                            ggml_tensor * gate_act = ggml_silu(ctx0, cur);
-                            cb(gate_act, "ffn_moe_silu", il);
-                            gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
-                            cb(gate_act, "ffn_moe_silu_clamped", il);
-                            cur = ggml_mul(ctx0, gate_act, up);
-                        }
-                        cb(cur, "ffn_moe_swiglu_limited", il);
-                        break;
-                    }
-                }
+            if (up_exps_s) {
+                cb(gate_up, "ffn_moe_gate_up_scaled", il);
             }
 
-            if (has_gate) {
-                cur = ggml_swiglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_swiglu", il);
-            } else {
-                cur = ggml_silu(ctx0, cur);
-                cb(cur, "ffn_moe_silu", il);
-            } break;
-        case LLM_FFN_SITU:
-            {
-                // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
-                GGML_ASSERT(has_gate);
-                const float beta = hparams.situ_beta;
-                const float lb   = hparams.situ_linear_beta;
+            if (gate_up_exps_b) {
+                gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+                cb(gate_up, "ffn_moe_gate_up_biased", il);
+            }
 
-                ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                if (lb > 0.0f) {
-                    up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
+            const int64_t n_ff = gate_up->ne[0] / 2;
+            cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+            cb(cur, "ffn_moe_gate", il);
+            up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+            cb(up, "ffn_moe_up", il);
+        } else {
+            // separate gate and up path
+            up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cb(up, "ffn_moe_up", il);
+
+            if (up_exps_s) {
+                cb(up, "ffn_moe_up_scaled", il);
+            }
+
+            if (up_exps_b) {
+                up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+                cb(up, "ffn_moe_up_biased", il);
+            }
+
+            if (gate_exps) {
+                cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+                cb(cur, "ffn_moe_gate", il);
+            } else {
+                cur = up;
+            }
+
+            if (gate_exps_s) {
+                cb(cur, "ffn_moe_gate_scaled", il);
+            }
+
+            if (gate_exps_b) {
+                cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+                cb(cur, "ffn_moe_gate_biased", il);
+            }
+        }
+
+        const bool has_gate = gate_exps || gate_up_exps;
+
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                if (gate_exps) {
+                    if (il >= 0) {
+                        const float limit = hparams.swiglu_clamp_exp[il];
+                        constexpr float eps = 1e-6f;
+                        if (limit > eps) {
+                            if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
+                                cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
+                            } else {
+                                up = ggml_clamp(ctx0, up, -limit, limit);
+                                cb(up, "ffn_moe_up_clamped", il);
+                                ggml_tensor * gate_act = ggml_silu(ctx0, cur);
+                                cb(gate_act, "ffn_moe_silu", il);
+                                gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+                                cb(gate_act, "ffn_moe_silu_clamped", il);
+                                cur = ggml_mul(ctx0, gate_act, up);
+                            }
+                            cb(cur, "ffn_moe_swiglu_limited", il);
+                            break;
+                        }
+                    }
                 }
-                cur = ggml_mul(ctx0, act, up);
-                cb(cur, "ffn_moe_situ", il);
-            } break;
-        case LLM_FFN_GELU:
-            if (has_gate) {
-                cur = ggml_geglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_geglu", il);
-            } else {
-                cur = ggml_gelu(ctx0, cur);
-                cb(cur, "ffn_moe_gelu", il);
-            } break;
-        case LLM_FFN_SWIGLU_OAI_MOE:
-            {
-                // TODO: move to hparams?
-                constexpr float alpha = 1.702f;
-                constexpr float limit = 7.0f;
-                cur = ggml_swiglu_oai(ctx0, cur, up, alpha, limit);
-                cb(cur, "ffn_moe_swiglu_oai", il);
-            } break;
-        case LLM_FFN_RELU:
-            if (has_gate) {
-                cur = ggml_reglu_split(ctx0, cur, up);
-                cb(cur, "ffn_moe_reglu", il);
-            } else {
-                cur = ggml_relu(ctx0, cur);
-                cb(cur, "ffn_moe_relu", il);
-            } break;
-        case LLM_FFN_RELU_SQR:
-            if (has_gate) {
-                // TODO: add support for gated squared relu
-                GGML_ABORT("fatal error: gated squared relu not implemented");
-            } else {
-                cur = ggml_relu(ctx0, cur);
-                cur = ggml_sqr(ctx0, cur);
-                cb(cur, "ffn_moe_relu_sqr", il);
-            } break;
-        default:
-            GGML_ABORT("fatal error");
-    }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
-    if (arch == LLM_ARCH_MISTRAL4) {
-        // src1 can exceed F16 range
-        ggml_prec_set_src(experts, GGML_PREC_F32, 1);
-    }
-    cb(experts, "ffn_moe_down", il);
+                if (has_gate) {
+                    cur = ggml_swiglu_split(ctx0, cur, up);
+                    cb(cur, "ffn_moe_swiglu", il);
+                } else {
+                    cur = ggml_silu(ctx0, cur);
+                    cb(cur, "ffn_moe_silu", il);
+                } break;
+            case LLM_FFN_SITU:
+                {
+                    // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
+                    GGML_ASSERT(has_gate);
+                    const float beta = hparams.situ_beta;
+                    const float lb   = hparams.situ_linear_beta;
 
-    if (down_exps_s) {
-        cb(experts, "ffn_moe_down_scaled", il);
-    }
+                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
+                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
+                    if (lb > 0.0f) {
+                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
+                    }
+                    cur = ggml_mul(ctx0, act, up);
+                    cb(cur, "ffn_moe_situ", il);
+                } break;
+            case LLM_FFN_GELU:
+                if (has_gate) {
+                    cur = ggml_geglu_split(ctx0, cur, up);
+                    cb(cur, "ffn_moe_geglu", il);
+                } else {
+                    cur = ggml_gelu(ctx0, cur);
+                    cb(cur, "ffn_moe_gelu", il);
+                } break;
+            case LLM_FFN_SWIGLU_OAI_MOE:
+                {
+                    // TODO: move to hparams?
+                    constexpr float alpha = 1.702f;
+                    constexpr float limit = 7.0f;
+                    cur = ggml_swiglu_oai(ctx0, cur, up, alpha, limit);
+                    cb(cur, "ffn_moe_swiglu_oai", il);
+                } break;
+            case LLM_FFN_RELU:
+                if (has_gate) {
+                    cur = ggml_reglu_split(ctx0, cur, up);
+                    cb(cur, "ffn_moe_reglu", il);
+                } else {
+                    cur = ggml_relu(ctx0, cur);
+                    cb(cur, "ffn_moe_relu", il);
+                } break;
+            case LLM_FFN_RELU_SQR:
+                if (has_gate) {
+                    // TODO: add support for gated squared relu
+                    GGML_ABORT("fatal error: gated squared relu not implemented");
+                } else {
+                    cur = ggml_relu(ctx0, cur);
+                    cur = ggml_sqr(ctx0, cur);
+                    cb(cur, "ffn_moe_relu_sqr", il);
+                } break;
+            default:
+                GGML_ABORT("fatal error");
+        }
 
-    if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
-        cb(experts, "ffn_moe_down_biased", il);
+        experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+        if (arch == LLM_ARCH_MISTRAL4) {
+            // src1 can exceed F16 range
+            ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+        }
+        cb(experts, "ffn_moe_down", il);
+
+        if (down_exps_s) {
+            cb(experts, "ffn_moe_down_scaled", il);
+        }
+
+        if (down_exps_b) {
+            experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+            cb(experts, "ffn_moe_down_biased", il);
+        }
+
     }
 
     if (!weight_before_ffn) {

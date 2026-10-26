@@ -448,8 +448,6 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, res_hc);
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = res_hc;
-
         if (hparams.is_ple(il)) {
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
         }
@@ -461,6 +459,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_attn_up,
                 model.layers[il].hc_attn_inject,
                 &inject, il);
+
+        res->t_layer_inp[il] = cur;
 
         ggml_build_forward_expand(gf, cur);
 

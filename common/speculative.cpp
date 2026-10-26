@@ -1,6 +1,10 @@
 #include "speculative.h"
 
 #include "common.h"
+#include "draft-acceptance-trace.h"
+#include "draft-acceptance-model.h"
+#include "draft-acceptance-gpu.h"
+#include "draft-acceptance-profile.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "llama.h"
@@ -981,6 +985,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
+    std::unique_ptr<common_draft_acceptance_trace> acceptance_trace;
+    std::unique_ptr<common_draft_acceptance_model> acceptance_model;
+    std::unique_ptr<common_draft_acceptance_audit> acceptance_audit;
+    std::unique_ptr<common_draft_acceptance_gpu> acceptance_gpu;
+    bool acceptance_gpu_check = false;
+    uint64_t acceptance_checked = 0;
+    float acceptance_max_feature_error = 0.0f;
+    float acceptance_max_probability_error = 0.0f;
 
     common_batch batch;        // noise tokens
     common_batch batch_inject; // target features for KV cache injection
@@ -1120,9 +1132,50 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
+        if (const char * path = std::getenv("LLAMA_DFLASH_ACCEPT_TRACE")) {
+            if (is_dspark || is_dflash2 || n_seq != 1 || this->params.p_min != 0.0f) {
+                throw std::runtime_error("acceptance trace requires single-slot DFlash and p_min=0");
+            }
+            acceptance_trace = std::make_unique<common_draft_acceptance_trace>(path, ctx_dft);
+        }
+        if (const char * path = std::getenv("LLAMA_DFLASH_ACCEPT_MODEL")) {
+            if (is_dspark || is_dflash2 || n_seq != 1 || this->params.p_min != 0.0f || this->params.n_max != 7 || this->params.n_min != 0 || acceptance_trace) {
+                throw std::runtime_error("acceptance model requires single-slot DFlash, n_max=7, n_min=0, p_min=0, and no trace");
+            }
+            acceptance_model = std::make_unique<common_draft_acceptance_model>(path);
+            if (acceptance_model->hidden && (acceptance_model->hidden != (uint32_t) llama_model_n_embd_out(model_dft) || llama_pooling_type(ctx_dft) != LLAMA_POOLING_TYPE_NONE)) {
+                throw std::runtime_error("DFlash acceptance hidden features do not match the model");
+            }
+            const char * device = std::getenv("LLAMA_DFLASH_ACCEPT_DEVICE");
+            device = device ? device : "auto";
+            if (std::strcmp(device, "auto") && std::strcmp(device, "cpu") && std::strcmp(device, "cuda")) {
+                throw std::runtime_error("LLAMA_DFLASH_ACCEPT_DEVICE must be auto, cpu, or cuda");
+            }
+            if (std::strcmp(device, "cpu") && common_draft_acceptance_gpu::supported(model_dft)) {
+                acceptance_gpu = std::make_unique<common_draft_acceptance_gpu>();
+            } else if (!std::strcmp(device, "cuda")) {
+                throw std::runtime_error("CUDA acceptance predictor requires one supported GPU");
+            }
+            const char * check = std::getenv("LLAMA_DFLASH_ACCEPT_GPU_CHECK");
+            acceptance_gpu_check = check && std::atoi(check) != 0;
+            if (acceptance_gpu_check && !acceptance_gpu) {
+                throw std::runtime_error("GPU acceptance parity check requires the CUDA predictor");
+            }
+            LOG_INF("%s: acceptance predictor device=%s, parity_check=%d\n", __func__, acceptance_gpu ? "cuda" : "cpu", int(acceptance_gpu_check));
+        }
+        if (const char * path = std::getenv("LLAMA_DFLASH_ACCEPT_AUDIT")) {
+            if (is_dspark || is_dflash2 || n_seq != 1) {
+                throw std::runtime_error("acceptance audit requires single-slot DFlash");
+            }
+            acceptance_audit = std::make_unique<common_draft_acceptance_audit>(path);
+        }
     }
 
     ~common_speculative_impl_draft_dflash() override {
+        if (acceptance_gpu_check) {
+            LOG_INF("DFlash GPU acceptance parity: rounds=%llu max_feature_error=%.9g max_probability_error=%.9g\n",
+                    (unsigned long long) acceptance_checked, acceptance_max_feature_error, acceptance_max_probability_error);
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1142,6 +1195,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         const int32_t N = (int32_t) prompt.size();
+        if (acceptance_trace) {
+            acceptance_trace->begin(N);
+        }
+        if (acceptance_audit) {
+            acceptance_audit->begin();
+        }
         if (N <= 0) {
             return;
         }
@@ -1242,6 +1301,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        common_dflash_profile_window();
+        DFLASH_PROFILE("dflash.draft");
+
         batch.clear();
 
         // build one batch holding every drafting sequence's noise block into a single decode)
@@ -1273,9 +1335,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        const bool capture_hidden = acceptance_trace || (acceptance_model && acceptance_model->hidden && (!acceptance_gpu || acceptance_gpu_check));
         // decode all sequence's noise block in a single batch
+        if (capture_hidden) {
+            llama_set_embeddings(ctx_dft, true);
+        }
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {
+            if (capture_hidden) {
+                llama_set_embeddings(ctx_dft, false);
+            }
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
         }
@@ -1292,6 +1361,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto * smpl = smpls[seq_id].get();
 
             auto & result = *dp.result;
+            ggml_draft_acceptance_batch acceptance_batch{};
+            acceptance_batch.first_row = beg + 1;
+            acceptance_batch.position_log1p = float(std::log1p(double(dp.pos0)));
 
             if (is_dflash2) {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
@@ -1353,10 +1425,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
+                DFLASH_PROFILE("dflash.sampling");
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     common_sampler_sample(smpl, ctx_dft, beg + i, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                    if (acceptance_gpu) {
+                        GGML_ASSERT(cur_p->size >= GGML_DRAFT_ACCEPTANCE_TOP_K);
+                        acceptance_batch.tokens[i - 1] = cur_p->data[0].id;
+                        for (int k = 0; k < GGML_DRAFT_ACCEPTANCE_TOP_K; ++k) {
+                            acceptance_batch.top_logits[i - 1][k] = cur_p->data[k].logit;
+                        }
+                    }
 
                     for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                         LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
@@ -1376,14 +1457,104 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             }
 
+            int64_t predictor_us = 0;
+            ggml_draft_acceptance_result gpu_result{};
+            if (acceptance_gpu) {
+                DFLASH_PROFILE("dflash.predictor.gpu");
+                GGML_ASSERT(result.size() == GGML_DRAFT_ACCEPTANCE_COUNT);
+                const int64_t started = ggml_time_us();
+                gpu_result = acceptance_gpu->evaluate(ctx_dft, *acceptance_model, acceptance_batch);
+                predictor_us = ggml_time_us() - started;
+                if (!acceptance_gpu_check) {
+                    result.resize(gpu_result.kept);
+                }
+            }
+            if (acceptance_model && (!acceptance_gpu || acceptance_gpu_check)) {
+                DFLASH_PROFILE("dflash.predictor");
+                const int64_t started = ggml_time_us();
+                const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                std::vector<float> input(acceptance_model->inputs);
+                float prefix_logp = 0.0f, prefix_min = 1.0f, survival = 1.0f;
+                size_t keep = 0;
+                bool stopped = false;
+                for (size_t j = 0; j < result.size(); ++j) {
+                    const auto values = common_draft_acceptance_stats(llama_get_logits_ith(ctx_dft, beg + 1 + j), vocab, result[j]);
+                    std::copy(values.begin(), values.end(), input.begin());
+                    prefix_logp += values[0];
+                    prefix_min = std::min(prefix_min, std::exp(values[0]));
+                    input[4] = float(j + 1) / acceptance_model->drafts;
+                    input[5] = acceptance_model->drafts;
+                    input[6] = float(std::log1p(double(dp.pos0)));
+                    input[7] = prefix_logp;
+                    input[8] = prefix_min;
+                    if (acceptance_model->hidden) {
+                        const float * embedding = llama_get_embeddings_ith(ctx_dft, beg + 1 + j);
+                        if (!embedding) {
+                            throw std::runtime_error("missing DFlash acceptance hidden features");
+                        }
+                        std::copy(embedding, embedding + acceptance_model->hidden, input.begin() + 9);
+                    }
+                    const float probability = acceptance_model->probability(input.data());
+                    if (acceptance_gpu_check) {
+                        for (size_t k = 0; k < values.size(); ++k) {
+                            const float error = std::fabs(values[k] - gpu_result.stats[j][k]);
+                            acceptance_max_feature_error = std::max(acceptance_max_feature_error, error);
+                            if (error > 2e-5f * (1.0f + std::fabs(values[k]))) {
+                                throw std::runtime_error("GPU acceptance feature parity failed");
+                            }
+                        }
+                        const float error = std::fabs(probability - gpu_result.probabilities[j]);
+                        acceptance_max_probability_error = std::max(acceptance_max_probability_error, error);
+                        if (error > 2e-5f) {
+                            throw std::runtime_error("GPU acceptance probability parity failed");
+                        }
+                    }
+                    if (stopped) {
+                        continue;
+                    }
+                    survival *= probability;
+                    if (survival < acceptance_model->threshold) {
+                        if (!acceptance_gpu_check) {
+                            break;
+                        }
+                        stopped = true;
+                        continue;
+                    }
+                    ++keep;
+                }
+                result.resize(keep);
+                if (acceptance_gpu_check) {
+                    if (int(keep) != gpu_result.kept) {
+                        throw std::runtime_error("GPU acceptance cutoff parity failed");
+                    }
+                    ++acceptance_checked;
+                }
+                predictor_us = ggml_time_us() - started;
+            }
+
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+            if (acceptance_trace) {
+                acceptance_trace->capture(ctx_dft, beg + 1, result, dp.n_max, dp.pos0);
+            }
+            if (acceptance_audit) {
+                const size_t kept = dp.n_max > 0 ? std::min(result.size(), size_t(dp.n_max)) : result.size();
+                acceptance_audit->draft(dp.pos0, n_block_tokens - 1, kept, predictor_us);
+            }
+        }
+        if (capture_hidden) {
+            llama_set_embeddings(ctx_dft, false);
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted, bool is_other) override {
+        if (acceptance_trace && !is_other) {
+            acceptance_trace->accept(n_accepted);
+        }
+        if (acceptance_audit && !is_other) {
+            acceptance_audit->finish(n_accepted);
+        }
     }
 };
 
@@ -2529,6 +2700,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
+
+    if (std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                  COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end()) {
+        result.n_ubatch = params_spec.n_ubatch_mtp;
+    }
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;

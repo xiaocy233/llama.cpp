@@ -130,6 +130,9 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// Borrow the last single-ubatch outputs. They remain valid until the next encode/decode/reserve.
+LLAMA_API bool llama_get_draft_acceptance_inputs(struct llama_context * ctx, struct ggml_tensor ** logits, struct ggml_tensor ** hidden, ggml_backend_t * backend);
+
 //
 // model/context data extraction
 //

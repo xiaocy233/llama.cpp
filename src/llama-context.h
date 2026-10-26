@@ -83,6 +83,7 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    bool get_draft_acceptance_inputs(ggml_tensor ** logits_out, ggml_tensor ** hidden_out, ggml_backend_t * backend_out);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);

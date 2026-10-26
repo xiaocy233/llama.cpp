@@ -1662,6 +1662,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.n_cache_layers  = params.n_cache_layers;
     mparams.n_cache_slots   = params.n_cache_slots;
+    mparams.cache_profile   = params.cache_profile.empty() ? nullptr : params.cache_profile.c_str();
     mparams.n_cache_predict = params.n_cache_predict;
     mparams.n_cache_pin     = params.n_cache_pin;
     mparams.cache_disk      = params.cache_disk;

@@ -357,6 +357,19 @@ void ggml_cuda_mul_mat_q_dual(
     const int64_t n_expert = ggml_nelements(loc_map);
     const int     n_phys   = (int) src0->ne[2];
 
+    // Both weight banks can use temporary buffers with stale padding.
+    for (const ggml_tensor * weight : {slots, ring}) {
+        if (ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size_data  = ggml_nbytes(weight);
+            const size_t size_alloc = ggml_backend_buffer_get_alloc_size(weight->buffer, weight);
+            if (size_alloc > size_data) {
+                GGML_ASSERT(ggml_is_contiguously_allocated(weight));
+                GGML_ASSERT(!weight->view_src);
+                CUDA_CHECK(cudaMemsetAsync((char *) weight->data + size_data, 0, size_alloc - size_data, stream));
+            }
+        }
+    }
+
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s1  =  dst->nb[1] / ts_dst;

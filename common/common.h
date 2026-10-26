@@ -328,6 +328,7 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_ubatch_mtp = 128; // physical batch size for MTP prompt processing
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -537,6 +538,7 @@ struct common_params {
     int32_t n_cache_layers = -1;   // shallow layers kept fully in VRAM, -1 = unset
     float moe_substitute_threshold = 0.0f; // normalized routing weight cutoff; 0 disables substitution
     int32_t n_cache_slots  = 0;    // expert slots per streaming layer, 0 = no slot cache
+    std::string cache_profile;     // activation profile for initial slot contents
     int32_t n_cache_predict = 0;   // experts predicted one layer ahead and prefetched, 0 = off
     int32_t n_cache_pin    = -1;   // MiB of host weights to page-lock, -1 = auto (min(host-offload, cudaMallocHost max) - 200 MiB), 0 = none
     bool    cache_disk     = false; // streaming layers' experts stay in the GGUF file (pread on demand), Metal only

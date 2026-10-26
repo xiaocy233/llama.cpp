@@ -602,6 +602,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_MOE_GATE,
+        GGML_OP_MOE_CPU,
 
         GGML_OP_COUNT,
     };
@@ -1520,7 +1521,15 @@ extern "C" {
     // the host for the ones that are not resident. Runs on the device, so no host round trip cuts
     // the layer in two. See probe/GATE-PLAN.md.
     //
-    // Metal decode gate. I32 [n_ids, 2]: resolved slots and selected logical expert IDs.
+    // Scheduler boundaries for a CPU expert branch. Both results alias their first input.
+    GGML_API struct ggml_tensor * ggml_moe_cpu_stage(struct ggml_context * ctx, struct ggml_tensor * input, struct ggml_tensor * ids, int layer);
+    GGML_API struct ggml_tensor * ggml_moe_cpu_start(struct ggml_context * ctx, struct ggml_tensor * input, struct ggml_tensor * resolved_ids, int layer);
+    GGML_API struct ggml_tensor * ggml_moe_cpu_finish(struct ggml_context * ctx, struct ggml_tensor * output, struct ggml_tensor * start);
+
+    GGML_API struct ggml_tensor * ggml_moe_gate_hybrid(struct ggml_context * ctx, struct ggml_tensor * loc_map, struct ggml_tensor * ids, struct ggml_tensor * seq, int layer, int n_ids, int n_slots);
+
+    // Substitution gate. I32 [n_ids, 2]: resolved slots and selected logical expert IDs, token-major.
+    // probs is F32 [n_expert, n_tokens]; n_ids is n_expert_used * n_tokens.
     GGML_API struct ggml_tensor * ggml_moe_gate_substitute(
             struct ggml_context * ctx,
             struct ggml_tensor * loc_map,

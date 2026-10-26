@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "../common/draft-acceptance-profile.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -673,7 +674,9 @@ void llama_context::sched_reserve() {
     if (!model.moe_slot_layers.empty()) {
         init_moe_slot_caches();
         for (const auto & c : moe_slot_caches) {
-            ggml_backend_sched_add_moe_slot_cache(sched.get(), &c, (int) model.hparams.n_expert_used);
+            if (!ggml_backend_sched_add_moe_slot_cache(sched.get(), &c, (int) model.hparams.n_expert_used(c.layer)) && c.n_initial > 0) {
+                throw std::runtime_error("failed to register MoE slot cache for layer " + std::to_string(c.layer));
+            }
         }
         ggml_backend_sched_set_moe_gate_seq(sched.get(), moe_slot_caches.front().gate_seq);
     }
@@ -1005,6 +1008,30 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
     }
 
     return j;
+}
+
+bool llama_context::get_draft_acceptance_inputs(ggml_tensor ** logits_out, ggml_tensor ** hidden_out, ggml_backend_t * backend_out) {
+    if (!gf_res_prev_active) {
+        return false;
+    }
+    auto * logits_tensor = gf_res_prev_active->get_logits();
+    auto * hidden_tensor = gf_res_prev_active->get_embd();
+    if (!logits_tensor || !hidden_tensor || logits_tensor->ne[1] != n_outputs || hidden_tensor->ne[1] != n_outputs) {
+        return false;
+    }
+    auto backend = ggml_backend_sched_get_tensor_backend(sched.get(), logits_tensor);
+    if (!backend || backend != ggml_backend_sched_get_tensor_backend(sched.get(), hidden_tensor)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_outputs; ++i) {
+        if (output_resolve_row(i) != i) {
+            return false;
+        }
+    }
+    *logits_out = logits_tensor;
+    *hidden_out = hidden_tensor;
+    *backend_out = backend;
+    return true;
 }
 
 float * llama_context::get_logits_ith(int32_t i) {
@@ -1506,6 +1533,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = nullptr;
         res->reset();
 
+        DFLASH_PROFILE(model.hparams.n_expert > 0 ? "target.graph_build_alloc" : "draft.graph_build_alloc", ubatch.n_tokens);
+
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
@@ -1563,6 +1592,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    DFLASH_PROFILE("llama.encode", batch_inp.tokens.size());
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1802,6 +1832,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    DFLASH_PROFILE(model.hparams.n_expert > 0 ? "llama.decode.target" : "llama.decode.draft", batch_inp.tokens.size());
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -4072,6 +4103,10 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+bool llama_get_draft_acceptance_inputs(llama_context * ctx, ggml_tensor ** logits, ggml_tensor ** hidden, ggml_backend_t * backend) {
+    return ctx->get_draft_acceptance_inputs(logits, hidden, backend);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

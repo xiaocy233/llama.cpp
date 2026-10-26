@@ -2070,8 +2070,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // the slot cache needs the weights placed, so this has to come after load_all_data
-    if (params.n_cache_slots > 0) {
-        init_moe_slot_caches(params.n_cache_slots, params.n_cache_predict, ml);
+    if (params.n_cache_slots > 0 || (params.cache_profile && params.cache_profile[0])) {
+        init_moe_slot_caches(params.n_cache_slots, params.n_cache_predict, params.cache_profile, ml);
     }
 
     return true;
@@ -3060,6 +3060,7 @@ llama_model_params llama_model_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.n_cache_layers              =*/ -1,
         /*.n_cache_slots               =*/ 0,
+        /*.cache_profile               =*/ nullptr,
         /*.n_cache_predict             =*/ 0,
         /*.n_cache_pin                 =*/ -1,
         /*.cache_disk                  =*/ false,

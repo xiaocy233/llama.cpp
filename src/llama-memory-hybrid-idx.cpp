@@ -449,9 +449,22 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             }
         }
 
-        // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
-        // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        bool tail_updated = false;
+        if (hparams_idx.indexer_kpool_by_order && !sq.shared && !sq.cells.empty() && !sp.empty() &&
+                mem_idx_stale[s] != POS_CLEAN && mem_idx_stale[s] > sq.pos_min && sq.pos_min == sp.begin()->first) {
+            // A suffix edit keeps the earlier cells and complete pools valid.
+            const auto first = std::make_pair(mem_idx_stale[s], uint32_t(0));
+            n_kept = std::lower_bound(sq.cells.begin(), sq.cells.end(), first) - sq.cells.begin();
+            sq.cells.resize(n_kept);
+            sq.cells.insert(sq.cells.end(), sp.lower_bound(first), sp.end());
+            if (sq.cells.size() == sp.size()) {
+                sq.pools.resize(n_kept / kpool);
+                sq.j_next = sq.pools.size() * kpool;
+                tail_updated = true;
+            }
+        }
+
+        if (!tail_updated && (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN)) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;

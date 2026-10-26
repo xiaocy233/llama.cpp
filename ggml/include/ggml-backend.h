@@ -329,19 +329,20 @@ extern "C" {
     // The backend owns this memory. It has to: it is mapped page-locked memory, and a CUDA host
     // buffer is not a supported buffer type on a discrete GPU, so it cannot be a plain tensor src
     // without the scheduler making a device copy of it.
-    #define GGML_MOE_GATE_MAX_IDS    32   // n_expert_used + n_pred; miss_mask still caps n_ids at 32
+    #define GGML_MOE_GATE_MAX_IDS    256  // selected and predicted IDs in a small batch
     #define GGML_MOE_GATE_MAX_EXPERTS 256
     #define GGML_MOE_GATE_MAX_LAYERS 256
     #define GGML_MOE_GATE_MODE_NORMAL 0
     #define GGML_MOE_GATE_MODE_HEAD   1
     #define GGML_MOE_GATE_MODE_SUBSTITUTE 2
+    #define GGML_MOE_GATE_MODE_HYBRID 3
 
     // One entry per gate, rewritten every token. The worker has a whole token to read an entry
     // before the device comes back to it, and seq lets it tell a stale entry from a fresh one.
     struct ggml_moe_gate_entry {
         uint32_t seq;         // written last, after a system fence: this is the handshake
         uint32_t layer;
-        uint32_t miss_mask;   // bit i = ids[i] was not resident when the gate published
+        uint32_t miss_mask;   // per-ID bits for <= 32 IDs; otherwise any miss is 1
         uint32_t n_ids;
         uint32_t n_pred;
         uint32_t payload_hash; // substitute mode: FNV-1a over IDs and router probabilities
@@ -349,9 +350,9 @@ extern "C" {
         float substitute_threshold;
         int32_t  ids[GGML_MOE_GATE_MAX_IDS];   // n_ids of this layer, then n_pred predicted
         float router_probs[GGML_MOE_GATE_MAX_EXPERTS];
-        uint8_t response_align[96]; // CPU response starts on a separate 256-byte block
+        uint8_t response_align[224]; // CPU response starts on a separate 256-byte block
         int32_t selected_ids[GGML_MOE_GATE_MAX_IDS]; // CPU-owned response, separate from GPU publication
-        uint8_t response_tail[128];
+        uint8_t response_tail[256];
     };
 
     struct ggml_moe_gate_channel {
@@ -389,12 +390,19 @@ extern "C" {
         struct ggml_tensor * gate_seq;   // device I32 [1], the token counter, shared by every cache
         int n_expert;                    // expert count
         int n_slots;                     // cache capacity (CLI)
+        const int32_t * initial_experts;  // n_initial unique expert IDs, copied at registration
+        int n_initial;
+        const uint32_t * initial_freq; // n_expert counters, copied at registration; NULL starts at zero
         int layer;                       // for logging only
         int gate_slot;                   // mailbox index, filled in by the scheduler
         // Set when src[] is page-locked. A pageable source makes the driver stage the copy itself,
         // and that staging can wait on the device - which deadlocks against a parked gate. The
         // scheduler stages those through its own buffer instead.
         bool pinned;
+
+        // Set by the scheduler when CPU expert execution is enabled.
+        int cpu_expert_max_tokens;
+        bool cpu_expert_early;
 
         // Disk-resident bank: src_fd >= 0 means the bank is not in host memory at all
         // (src[m]->data is a marker pointer); expert e of matrix m is pread() from file offset

@@ -1551,9 +1551,112 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+
+static bool ggml_cpu_moe_single_row(const struct ggml_tensor * node) {
+    const struct ggml_tensor * w = node->src[0];
+    const struct ggml_tensor * x = node->src[1];
+    const struct ggml_tensor * ids = node->src[2];
+
+    return node->op == GGML_OP_MUL_MAT_ID &&
+        (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_1) &&
+        (!w->buffer || ggml_backend_buffer_is_host(w->buffer)) && !w->extra &&
+        w->ne[3] == 1 && w->nb[0] == ggml_type_size(w->type) &&
+        w->nb[1] == ggml_row_size(w->type, w->ne[0]) &&
+        x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) &&
+        x->ne[0] == w->ne[0] && x->ne[1] == 1 && x->ne[3] == 1 &&
+        ids->type == GGML_TYPE_I32 && ids->ne[0] == 1 &&
+        ids->ne[1] == x->ne[2] && ids->ne[2] == 1 && ids->ne[3] == 1 &&
+        node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
+        node->ne[0] == w->ne[1] && node->ne[1] == 1 &&
+        node->ne[2] == x->ne[2] && node->ne[3] == 1;
+}
+
+static void ggml_cpu_moe_quantize(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * node) {
+    const struct ggml_tensor * x = node->src[1];
+    const enum ggml_type type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+    const ggml_from_float_t from_float = type_traits_cpu[type].from_float;
+    const int64_t bs = ggml_blck_size(type);
+    const size_t row_size = ggml_row_size(type, x->ne[0]);
+    const int64_t begin = (params->ith * (x->ne[0]/bs)) / params->nth;
+    const int64_t end = ((params->ith + 1) * (x->ne[0]/bs)) / params->nth;
+    GGML_ASSERT(params->wsize >= row_size * (size_t) x->ne[2]);
+
+    for (int64_t e = 0; e < x->ne[2]; ++e) {
+        if (begin < end) {
+            from_float((const float *) ((const char *) x->data + e*x->nb[2]) + begin*bs,
+                       (char *) params->wdata + e*row_size + begin*ggml_type_size(type), (end - begin)*bs);
+        }
+    }
+    ggml_barrier(params->threadpool);
+}
+
+static void ggml_compute_forward_mul_mat_id_single_row(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * w = dst->src[0];
+    const struct ggml_tensor * ids = dst->src[2];
+    const ggml_vec_dot_t dot = type_traits_cpu[w->type].vec_dot;
+    const size_t row_size = ggml_row_size(type_traits_cpu[w->type].vec_dot_type, w->ne[0]);
+    const int64_t blocks = (w->ne[1] + 15)/16;
+    const int64_t begin = 16 * ((params->ith * blocks)/params->nth);
+    const int64_t end = MIN(16 * (((params->ith + 1) * blocks)/params->nth), w->ne[1]);
+
+    ggml_cpu_moe_quantize(params, dst);
+    for (int64_t e = 0; e < ids->ne[1]; ++e) {
+        const int32_t id = *(const int32_t *) ((const char *) ids->data + e*ids->nb[1]);
+        GGML_ASSERT(id >= 0 && id < w->ne[2]);
+        const char * weights = (const char *) w->data + id*w->nb[2];
+        const char * x = (const char *) params->wdata + e*row_size;
+        float * out = (float *) ((char *) dst->data + e*dst->nb[2]);
+        for (int64_t row = begin; row < end; ++row) {
+            dot(w->ne[0], out + row, 0, weights + row*w->nb[1], 0, x, 0, 1);
+        }
+    }
+}
+
+static void ggml_compute_forward_moe_swiglu_fused(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * gate = dst->src[0];
+    const struct ggml_tensor * up = dst->src[1];
+    const struct ggml_tensor * wg = gate->src[0];
+    const struct ggml_tensor * wu = up->src[0];
+    const struct ggml_tensor * ids = gate->src[2];
+    const ggml_vec_dot_t dot = type_traits_cpu[wg->type].vec_dot;
+    const size_t row_size = ggml_row_size(type_traits_cpu[wg->type].vec_dot_type, wg->ne[0]);
+    const int64_t blocks = (wg->ne[1] + 15)/16;
+    const int64_t begin = 16 * ((params->ith * blocks)/params->nth);
+    const int64_t end = MIN(16 * (((params->ith + 1) * blocks)/params->nth), wg->ne[1]);
+
+    ggml_cpu_moe_quantize(params, gate);
+    for (int64_t e = 0; e < ids->ne[1]; ++e) {
+        const int32_t id = *(const int32_t *) ((const char *) ids->data + e*ids->nb[1]);
+        GGML_ASSERT(id >= 0 && id < wg->ne[2]);
+        const char * g = (const char *) wg->data + id*wg->nb[2];
+        const char * u = (const char *) wu->data + id*wu->nb[2];
+        const char * x = (const char *) params->wdata + e*row_size;
+        float * out = (float *) ((char *) dst->data + e*dst->nb[2]);
+        const int n = wg->ne[0];
+        const size_t gate_stride = wg->nb[1], up_stride = wu->nb[1];
+        for (int64_t row = begin; row < end; ++row) {
+            float gv = 0, uv = 0;
+            dot(n, &gv, 0, g + row*gate_stride, 0, x, 0, 1);
+            dot(n, &uv, 0, u + row*up_stride, 0, x, 0, 1);
+            out[row] = ggml_silu_f32(gv) * uv;
+        }
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+
+    if (!params->use_ref && ggml_cpu_moe_single_row(dst)) {
+        ggml_compute_forward_mul_mat_id_single_row(params, dst);
+        return;
+    }
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -3075,6 +3178,26 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+
+    if (node->op == GGML_OP_MUL_MAT_ID && node_n + 2 < cgraph->n_nodes) {
+        const enum ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+        const int outputs[] = { node_n + 2 };
+        struct ggml_tensor * other = cgraph->nodes[node_n + 1];
+        struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
+        if (other->op == GGML_OP_MUL_MAT_ID && glu->op == GGML_OP_GLU &&
+            ((glu->src[0] == node && glu->src[1] == other) || (glu->src[1] == node && glu->src[0] == other)) &&
+            ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+            ggml_cpu_moe_single_row(node) && ggml_cpu_moe_single_row(other) &&
+            node->src[1] == other->src[1] && node->src[2] == other->src[2] &&
+            node->src[0]->type == GGML_TYPE_Q4_K && node->src[0]->type == other->src[0]->type &&
+            ggml_are_same_shape(node->src[0], other->src[0]) &&
+            ggml_are_same_shape(glu, node) && ggml_is_contiguous(glu) &&
+            ggml_can_fuse_subgraph(cgraph, node_n, 3, ops, outputs, 1)) {
+            ggml_compute_forward_moe_swiglu_fused(params, glu);
+            return 2;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion

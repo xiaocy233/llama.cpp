@@ -2839,9 +2839,9 @@ static int ggml_metal_op_moe_head_publish(ggml_metal_op_t ctx, int idx) {
 // a queue-side event wait blocks the mul_mat_id behind it until the worker has filled the misses
 // and signaled this gate slot's event. The wait value is the token's gate seq, which the host
 // wrote into the seq tensor before the graph started, so it is known exactly at encode time.
-static_assert(sizeof(ggml_moe_gate_entry) == 1536);
-static_assert(offsetof(ggml_moe_gate_entry, router_probs) == 160);
-static_assert(offsetof(ggml_moe_gate_entry, selected_ids) == 1280);
+static_assert(sizeof(ggml_moe_gate_entry) == 3584);
+static_assert(offsetof(ggml_moe_gate_entry, router_probs) == 1056);
+static_assert(offsetof(ggml_moe_gate_entry, selected_ids) == 2304);
 
 int ggml_metal_op_moe_gate(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);

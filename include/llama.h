@@ -361,6 +361,10 @@ extern "C" {
         // 0 disables the slot cache, so every expert a token uses is copied for that token.
         int32_t n_cache_slots;
 
+        // Activation profile JSON used to preload the highest-ranked experts into each slot cache.
+        // NULL disables preloading. The file is read during model loading.
+        const char * cache_profile;
+
         // number of experts to predict one layer ahead and prefetch into the slot cache. The guess
         // comes from applying the next cached layer's router to this layer's hidden state. 0 = off,
         // in which case every miss is fetched synchronously by the layer that needs it. Only has an

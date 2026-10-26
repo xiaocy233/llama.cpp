@@ -11,6 +11,8 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-moe-runtime.h"
+#include "ggml-moe-backend.h"
+#include <climits>
 #include "ggml-weight-prefetch.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -1967,6 +1969,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<ggml_bitset_t> used_ids;
     std::vector<uint8_t> verify_buf;   // GGML_SCHED_PREFETCH_VERIFY only
 
+    struct moe_batch_plan {
+        ggml_moe_slot_state * state;
+        ggml_tensor * ids;
+        bool bulk;
+    };
+    std::vector<moe_batch_plan> moe_batches;
+
     // ---- weight prefetch (ggml_backend_sched_set_weight_prefetch) ----
     // Use the allocation plan so that each copy starts within its allocated lifetime.
     //
@@ -2151,21 +2160,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (moe_classic || moe_dual)) {
 
-                    // dual Prefill: the ids index the logical experts and loc_map - not this copy -
-                    // decides which of them are read here, so the used-experts scan does not apply
-                    if (moe_dual) {
-                        const struct ggml_moe_slot_state * st =
-                            ggml_moe_runtime_bank_of(sched->moe, input);
-
-                        int    ie  = 0;
-                        size_t off = 0;
-                        size_t len = 0;
-                        while (ggml_moe_runtime_bank_range(st, input, &ie, &off, &len)) {
-                            ggml_backend_tensor_set_async(split_backend, input_cpy,
-                                    (const char *) input->data + off, off, len);
-                        }
-                        continue;
-                    }
+                    struct ggml_moe_slot_state * st = moe_dual ?
+                        ggml_moe_runtime_bank_of(sched->moe, input) : nullptr;
+                    const bool bulk_copy = !moe_dual && ggml_moe_use_full_bank_copy(node->src[2]->ne[1], node->src[2]->ne[0], input->ne[2]);
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
@@ -2183,16 +2180,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // The n_assign >= n_expert gate is what keeps decode on the used-experts path: with
                     // one token there are only n_expert_used assignments, so copying whole tensors
                     // would move far more bytes than needed.
-                    if (sched->full_weight_copy && node->op == GGML_OP_MUL_MAT_ID) {
-                        ggml_tensor * ids = node->src[2];
-
-                        // n_tokens * n_expert_used, i.e. the number of (token, expert) assignments
-                        const int64_t n_assign = ggml_nelements(ids);
-
-                        if (n_assign >= n_expert) {
-                            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
-                            continue;
-                        }
+                    if (sched->full_weight_copy && !moe_dual && bulk_copy) {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        continue;
                     }
 
                     ggml_backend_synchronize(input_backend);
@@ -2234,6 +2224,65 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    if (moe_dual) {
+                        bool bulk = true;
+                        if (st != nullptr) {
+                            ggml_tensor * ids_key = node->src[2];
+                            for (int i = 0; i < split->n_inputs; ++i) {
+                                if (ids_key == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                                    ids_key = split->inputs[i];
+                                    break;
+                                }
+                            }
+                            auto plan = std::find_if(moe_batches.begin(), moe_batches.end(), [&](const moe_batch_plan & p) {
+                                return p.state == st && p.ids == ids_key;
+                            });
+                            if (plan != moe_batches.end()) {
+                                bulk = plan->bulk;
+                            } else {
+                                std::vector<int32_t> logical_ids;
+                                for (int64_t t = 0; t < ids_tensor->ne[1]; ++t) {
+                                    for (int64_t k = 0; k < ids_tensor->ne[0]; ++k) {
+                                        logical_ids.push_back(ids[t * ids_tensor->nb[1]/sizeof(int32_t) + k * ids_tensor->nb[0]/sizeof(int32_t)]);
+                                    }
+                                }
+                                std::vector<int32_t> predicted;
+                                if (node->src[5] != nullptr) {
+                                    ggml_tensor * pred = node->src[5];
+                                    ggml_backend_t pred_backend = split_backend;
+                                    for (int i = input_id + 1; i < split->n_inputs; ++i) {
+                                        if (pred == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                                            pred = split->inputs[i];
+                                            pred_backend = ggml_backend_sched_get_tensor_backend(sched, pred);
+                                            break;
+                                        }
+                                    }
+                                    GGML_ASSERT(pred->type == GGML_TYPE_I32 && ggml_is_matrix(pred));
+                                    std::vector<int32_t> raw(ggml_nbytes(pred) / sizeof(int32_t));
+                                    ggml_backend_tensor_get_async(pred_backend, pred, raw.data(), 0, ggml_nbytes(pred));
+                                    ggml_backend_synchronize(pred_backend);
+                                    for (int64_t t = 0; t < pred->ne[1]; ++t) {
+                                        for (int64_t k = 0; k < pred->ne[0]; ++k) {
+                                            predicted.push_back(raw[t * pred->nb[1]/sizeof(int32_t) + k * pred->nb[0]/sizeof(int32_t)]);
+                                        }
+                                    }
+                                }
+                                GGML_ASSERT(logical_ids.size() <= INT_MAX && predicted.size() <= GGML_MOE_GATE_MAX_IDS);
+                                bulk = ggml_moe_runtime_prepare_batch(sched->moe, st, logical_ids.data(), (int) logical_ids.size(), predicted.data(), (int) predicted.size());
+                                moe_batches.push_back({st, ids_key, bulk});
+                            }
+                        }
+                        if (bulk) {
+                            int ie = 0;
+                            size_t off = 0;
+                            size_t len = 0;
+                            while (ggml_moe_runtime_bank_range(st, input, &ie, &off, &len)) {
+                                ggml_backend_tensor_set_async(split_backend, input_cpy, (const char *) input->data + off, off, len);
+                            }
+                        }
+                        continue;
+                    }
+
                     // report how many experts the router actually selected. This decides whether a
                     // full-tensor copy costs extra bytes over the used-experts copy, which is the
                     // premise of removing the ids dependency. Model/prompt property, not hardware.
@@ -2254,8 +2303,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     };
 
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
                         id++;
+                    }
+                    if (id == n_expert) {
+                        continue;
                     }
                     int32_t first_id = id;
                     int32_t last_id = first_id;
@@ -2317,7 +2369,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_moe_runtime_publish_split(sched->moe, &split->graph);
         }
 
-        if (!sched->callback_eval) {
+        const bool has_cpu_experts = std::any_of(split->graph.nodes, split->graph.nodes + split->graph.n_nodes,
+                [](const ggml_tensor * node) { return node->op == GGML_OP_MOE_CPU; });
+        if (!sched->callback_eval && !has_cpu_experts) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -2328,25 +2382,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 struct ggml_tensor * t = split->graph.nodes[j0];
 
                 // check if the user needs data from this node
-                bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                bool need = sched->callback_eval && sched->callback_eval(t, true, sched->callback_eval_user_data);
+                const bool cpu_node = t->op == GGML_OP_MOE_CPU;
 
                 int j1 = j0;
 
                 // determine the range [j0, j1] of nodes that can be computed together
-                while (!need && j1 < split->graph.n_nodes - 1) {
+                while (!need && !cpu_node && j1 < split->graph.n_nodes - 1 &&
+                        split->graph.nodes[j1 + 1]->op != GGML_OP_MOE_CPU) {
                     t = split->graph.nodes[++j1];
-                    need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                    need = sched->callback_eval && sched->callback_eval(t, true, sched->callback_eval_user_data);
                 }
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
-                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                enum ggml_status ec = cpu_node ? ggml_moe_runtime_compute_cpu_node(sched->moe, split_backend, t) :
+                    ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
 
-                // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
+                if (need) {
+                    ggml_backend_synchronize(split_backend);
+                }
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
@@ -3155,6 +3213,7 @@ void ggml_backend_sched_set_moe_gate_seq(ggml_backend_sched_t sched, ggml_tensor
 void ggml_backend_sched_set_moe_substitute_enabled(ggml_backend_sched_t sched, bool enabled) {
     ggml_moe_runtime_set_moe_substitute_enabled(sched->moe, enabled);
 }
+
 const ggml_moe_slot_cache * ggml_backend_sched_find_moe_slot_cache(ggml_backend_sched_t sched, const ggml_tensor * src) {
     return sched ? ggml_moe_runtime_find_moe_slot_cache(sched->moe, src) : nullptr;
 }

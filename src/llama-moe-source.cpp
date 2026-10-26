@@ -1,7 +1,10 @@
 #include "llama-model.h"
 #include "llama-model-loader.h"
+#include "llama-moe-profile.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-impl.h"
+
+#include <cstdlib>
 
 #if defined(__APPLE__)
 #include <unistd.h>
@@ -76,9 +79,11 @@ ggml_backend_buffer_type_t llama_moe_cache_disk_buft(void) {
         /* .iface   = */ {
             /* .get_name         = */ llama_moe_disk_buft_get_name,
             /* .alloc_buffer     = */ llama_moe_disk_buft_alloc_buffer,
+            /* .alloc_buffer_n   = */ nullptr,
             /* .get_alignment    = */ llama_moe_disk_buft_get_alignment,
             /* .get_max_size     = */ nullptr,
             /* .get_alloc_size   = */ nullptr,
+            /* .get_alloc_size_n = */ nullptr,
             /* .is_host          = */ llama_moe_disk_buft_is_host,
         },
         /* .device  = */ nullptr,
@@ -89,12 +94,31 @@ ggml_backend_buffer_type_t llama_moe_cache_disk_buft(void) {
 }
 
 // Record shared weight sources. Each context allocates its own slots and location maps.
-void llama_model::init_moe_slot_caches(int n_slots, int n_pred, const llama_model_loader & ml) {
+void llama_model::init_moe_slot_caches(int n_slots, int n_pred, const char * profile_path, const llama_model_loader & ml) {
     moe_slot_layers.clear();
 
+    const bool use_profile = profile_path && profile_path[0];
+    if (use_profile && n_slots <= 0) {
+        throw std::runtime_error("--cache-profile requires --n-cache-slots > 0");
+    }
     if (n_slots <= 0) {
         return;
     }
+    uint32_t prior_tokens = use_profile ? 16 : 0;
+    const char * prior = getenv("GGML_MOE_CACHE_PRIOR_TOKENS");
+    if (prior) {
+        char * end = nullptr;
+        const long value = std::strtol(prior, &end, 10);
+        if (end == prior || *end || value < 0 || value > 65535) {
+            throw std::runtime_error("GGML_MOE_CACHE_PRIOR_TOKENS must be an integer from 0 to 65535");
+        }
+        prior_tokens = (uint32_t) value;
+    }
+    if (prior_tokens > 0 && !use_profile) {
+        throw std::runtime_error("GGML_MOE_CACHE_PRIOR_TOKENS requires --cache-profile");
+    }
+    std::vector<std::vector<uint32_t>> initial_freq;
+    const auto ranks = use_profile ? llama_moe_profile_load(profile_path, llm_arch_name(arch), hparams.n_layer(), hparams.n_expert, hparams.n_expert_used(), hparams.n_embd, prior_tokens, &initial_freq) : std::vector<std::vector<int32_t>>{};
 
     // collect the layers that stream: expert tensors present and host-resident (a DISK bank
     // counts as host-resident: its bytes are one pread away)
@@ -131,11 +155,17 @@ void llama_model::init_moe_slot_caches(int n_slots, int n_pred, const llama_mode
     }
 
     if (cands.empty()) {
+        if (use_profile) {
+            throw std::runtime_error("--cache-profile found no supported host-resident expert layers");
+        }
         return;
     }
 
     const int n_expert = (int) cands[0].src[0]->ne[2];
     if (n_slots >= n_expert) {
+        if (use_profile) {
+            throw std::runtime_error("--cache-profile requires fewer slots than experts");
+        }
         return;
     }
 
@@ -153,12 +183,20 @@ void llama_model::init_moe_slot_caches(int n_slots, int n_pred, const llama_mode
         }
     }
     if (buft_dev == nullptr) {
+        if (use_profile) {
+            throw std::runtime_error("--cache-profile requires a device slot cache");
+        }
         return;
     }
 
     std::vector<moe_slot_layer> built;
     for (const auto & c : cands) {
         moe_slot_layer L;
+        if (use_profile) {
+            const auto & rank = ranks.at(c.il);
+            L.initial_experts.assign(rank.begin(), rank.begin() + n_slots);
+            L.initial_freq = initial_freq.at(c.il);
+        }
         L.layer    = c.il;
         L.n_expert = n_expert;
         L.n_slots  = n_slots;

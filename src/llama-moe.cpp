@@ -31,6 +31,9 @@ void llama_context::init_moe_slot_caches() {
         c.gate_seq    = gate_seq;
         c.n_expert    = L.n_expert;
         c.n_slots     = L.n_slots;
+        c.initial_experts = L.initial_experts.data();
+        c.n_initial       = (int) L.initial_experts.size();
+        c.initial_freq    = L.initial_freq.empty() ? nullptr : L.initial_freq.data();
         c.layer       = L.layer;
         c.pinned      = L.pinned;
         c.src_fd      = L.src_fd;

@@ -791,9 +791,9 @@ kernel void kernel_moe_interceptor(
 }
 
 // mailbox entry layout, mirroring struct ggml_moe_gate_entry (ggml-backend.h):
-//   uint32 seq@0, layer@4, miss_mask@8, n_ids@12, n_pred@16, hash@20, mode@24, threshold@28, int32 ids[32]@32
-#define MOE_GATE_ENTRY_SIZE 1536
-#define MOE_GATE_PROBS_OFF  160
+//   uint32 seq@0, layer@4, miss_mask@8, n_ids@12, n_pred@16, hash@20, mode@24, threshold@28, int32 ids[256]@32
+#define MOE_GATE_ENTRY_SIZE 3584
+#define MOE_GATE_PROBS_OFF  1056
 #define MOE_GATE_IDS_OFF    32
 
 kernel void kernel_moe_head_publish(
@@ -876,7 +876,7 @@ kernel void kernel_moe_gate(
     for (int i = 0; i < n_ids; i++) {
         const int32_t e = ids_in[i];
         if (e >= 0 && loc_map[e] >= n_slots) {
-            miss |= (1u << i);
+            miss |= n_ids <= 32 ? (1u << i) : 1u;
         }
     }
 

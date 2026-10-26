@@ -2818,6 +2818,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CACHE_SLOTS"));
     add_opt(common_arg(
+        {"--cache-profile"}, "FILE",
+        "preload the top --n-cache-slots experts per streamed layer from an activation profile JSON (default: disabled)\n"
+        "with a profile, default to prediction protection, LFU decay every 8 batches, and a 16-token frequency prior; GGML_MOE_* overrides apply",
+        [](common_params & params, const std::string & value) {
+            params.cache_profile = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PROFILE"));
+    add_opt(common_arg(
         {"--moe-substitute-threshold"}, "N",
         "replace missing experts below normalized routing weight N with resident experts\n"
         "Qwen3.5 MoE, CUDA/Metal slot-cache decode only; range [0, 1] (default: 0, disabled)",
@@ -4073,6 +4081,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     // speculative parameters
     //
 
+    add_opt(common_arg(
+        {"--spec-mtp-ubatch"}, "N",
+        string_format("physical maximum batch size for MTP prompt processing (default: %d)", params.speculative.draft.n_ubatch_mtp),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--spec-mtp-ubatch must be positive");
+            }
+            params.speculative.draft.n_ubatch_mtp = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_UBATCH"));
     add_opt(common_arg(
         {"--spec-draft-hf", "-hfd", "-hfrd", "--hf-repo-draft"}, "<user>/<model>[:quant]",
         "Same as --hf-repo, but for the draft model (default: unused)",
