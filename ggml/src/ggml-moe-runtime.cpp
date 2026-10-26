@@ -62,6 +62,7 @@ struct ggml_moe_cpu_state {
     uint64_t cpu_assignments = 0;
     uint64_t gpu_assignments = 0;
     uint64_t cold_experts = 0;
+    uint64_t peak_experts = 0;
     uint64_t avoided_bytes = 0;
     int64_t cpu_us = 0;
     std::atomic<uint32_t> ready_seq{0};
@@ -153,6 +154,7 @@ struct ggml_moe_runtime {
     std::mutex moe_mutex;
     int cpu_max_tokens;
     int cpu_min_tokens;
+    int cpu_max_experts;
     int cpu_reuse_window;
     ggml_backend_t cpu_backend;
     ggml_threadpool_t cpu_threadpool;
@@ -201,6 +203,9 @@ ggml_moe_runtime * ggml_moe_runtime_new(ggml_backend_t * backends, int n_backend
         sched->cpu_balance = policy && strcmp(policy, "balanced") == 0;
         sched->cpu_max_tokens = env_int("GGML_MOE_HYBRID_MAX_TOKENS", 8, 1, 8);
         sched->cpu_min_tokens = env_int("GGML_MOE_HYBRID_MIN_TOKENS", 2, 1, GGML_MOE_GATE_MAX_IDS + 1);
+        sched->cpu_max_experts = env_int("GGML_MOE_HYBRID_MAX_EXPERTS", -1, -1, GGML_MOE_GATE_MAX_IDS);
+        GGML_ASSERT(sched->cpu_max_experts < 0 || !sched->cpu_balance);
+        GGML_LOG_INFO("MoE CPU task cap=%d experts per layer batch\n", sched->cpu_max_experts);
         sched->cpu_reuse_window = env_int("GGML_MOE_HYBRID_REUSE_WINDOW", 1, 0, 1024);
         for (auto backend : sched->backends) {
             if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -437,6 +442,21 @@ static int32_t ggml_moe_runtime_cache_victim(
     return victim;
 }
 
+static std::vector<int> ggml_moe_runtime_cpu_limited(ggml_moe_runtime * sched, ggml_moe_slot_state * st, const std::vector<int> & counts, uint64_t step) {
+    std::vector<int> selected;
+    for (int e = 0; e < st->n_expert; e++) {
+        const bool recent = st->cpu->last_used[e] > 0 && step - st->cpu->last_used[e] <= (uint64_t) sched->cpu_reuse_window;
+        if (counts[e] > 0 && counts[e] < sched->cpu_min_tokens && st->slot_of_expert[e] < 0 && !recent) {
+            selected.push_back(e);
+        }
+    }
+    std::stable_sort(selected.begin(), selected.end(), [&](int a, int b) { return counts[a] < counts[b]; });
+    if ((int) selected.size() > sched->cpu_max_experts) {
+        selected.resize(sched->cpu_max_experts);
+    }
+    return selected;
+}
+
 static void ggml_moe_runtime_prefetch(
         ggml_moe_runtime * sched, struct ggml_moe_slot_state * st,
         const int32_t * experts, int n_experts, int n_tokens) {
@@ -453,9 +473,12 @@ static void ggml_moe_runtime_prefetch(
     }
     std::vector<int> cpu_pred;
     if (st->cache.cpu_expert_early && cpu_filter) cpu_pred = ggml_moe_runtime_balance(st, counts);
+    if (!st->cache.cpu_expert_early && cpu_filter && sched->cpu_max_experts >= 0) {
+        cpu_pred = ggml_moe_runtime_cpu_limited(sched, st, counts, st->cpu->step + 1);
+    }
     for (int i = 0; i < n_experts; i++) {
         const int32_t e = experts[i];
-        if (st->cache.cpu_expert_early) {
+        if (st->cache.cpu_expert_early || (cpu_filter && sched->cpu_max_experts >= 0)) {
             if (std::find(cpu_pred.begin(), cpu_pred.end(), e) != cpu_pred.end()) continue;
         } else if (cpu_filter && e >= 0 && e < st->n_expert && st->slot_of_expert[e] < 0) {
             const auto & cpu = *st->cpu;
@@ -609,11 +632,12 @@ static bool ggml_moe_runtime_select_cpu(ggml_moe_runtime * sched, ggml_moe_slot_
         GGML_ASSERT(ids[i] >= 0 && ids[i] < st->n_expert);
         counts[ids[i]]++;
     }
-    const auto cpu_budget = st->cache.cpu_expert_early ? ggml_moe_runtime_balance(st, counts) : std::vector<int>{};
+    const auto cpu_budget = st->cache.cpu_expert_early ? ggml_moe_runtime_balance(st, counts) :
+            sched->cpu_max_experts >= 0 ? ggml_moe_runtime_cpu_limited(sched, st, counts, cpu.step) : std::vector<int>{};
     std::vector<int> candidates;
     for (int e = 0; e < st->n_expert; ++e) {
         const bool recent = cpu.last_used[e] > 0 && cpu.step - cpu.last_used[e] <= (uint64_t) sched->cpu_reuse_window;
-        const bool gpu = st->cache.cpu_expert_early ? std::find(cpu_budget.begin(), cpu_budget.end(), e) == cpu_budget.end() :
+        const bool gpu = (st->cache.cpu_expert_early || sched->cpu_max_experts >= 0) ? std::find(cpu_budget.begin(), cpu_budget.end(), e) == cpu_budget.end() :
                 st->slot_of_expert[e] >= 0 || counts[e] >= sched->cpu_min_tokens || recent;
         if (counts[e] && gpu) {
             candidates.push_back(e);
@@ -631,6 +655,12 @@ static bool ggml_moe_runtime_select_cpu(ggml_moe_runtime * sched, ggml_moe_slot_
     for (int e : candidates) {
         on_gpu[e] = true;
     }
+    uint64_t cpu_experts = 0;
+    for (int e = 0; e < st->n_expert; e++) {
+        cpu_experts += counts[e] > 0 && !on_gpu[e];
+    }
+    GGML_ASSERT(sched->cpu_max_experts < 0 || cpu_experts <= (uint64_t) sched->cpu_max_experts);
+    cpu.peak_experts = std::max(cpu.peak_experts, cpu_experts);
     std::vector<int32_t> hot;
     for (int i = 0; i < n_ids; ++i) {
         if (on_gpu[ids[i]]) {
@@ -1641,6 +1671,11 @@ static void ggml_moe_runtime_stats_report(ggml_moe_runtime * sched) {
                     (unsigned long long) c.gpu_assignments, (unsigned long long) c.cold_experts,
                     c.avoided_bytes / 1048576.0, c.cpu_us / 1000.0, c.join_us / 1000.0, c.cost.a_us, c.cost.b_us, c.h2d_gbs);
         }
+        GGML_LOG_INFO("MoE pilot layer=%d slots=%d batches=%llu tokens=%llu sync_bytes=%llu pf_bytes=%llu cpu_experts=%llu cpu_peak=%llu cpu_assign=%llu gpu_assign=%llu\n",
+                st->cache.layer, st->n_slots, (unsigned long long) st->n_batches, (unsigned long long) st->n_tokens,
+                (unsigned long long) st->n_bytes_sync, (unsigned long long) st->n_bytes_pf,
+                (unsigned long long) (st->cpu ? st->cpu->cold_experts : 0), (unsigned long long) (st->cpu ? st->cpu->peak_experts : 0),
+                (unsigned long long) (st->cpu ? st->cpu->cpu_assignments : 0), (unsigned long long) (st->cpu ? st->cpu->gpu_assignments : 0));
         const double batch = (double) std::max<uint64_t>(1, st->n_batches);
         const uint64_t use = st->n_hit + st->n_miss;
         char precision[32] = "N/A";

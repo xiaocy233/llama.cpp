@@ -33,7 +33,7 @@ T_H2D = g * expert_bytes / (h2d_gbs * 1000)
 score = max(T_CPU, T_H2D)
 ```
 
-Here `g` is the number of unique misses copied to GPU, and `x` is the number of token-expert assignments computed by CPU. Choose the lowest score subject to available GPU slots; equal scores favor fewer GPU copies. All misses may go to CPU. There is no CPU assignment cap, and `GGML_MOE_HYBRID_MAX_ASSIGNMENTS` is no longer read. Backend batch and tensor capacity limits still apply. The GPU compute and merge terms are unchanged and are not added to this cost model.
+Here `g` is the number of unique misses copied to GPU, and `x` is the number of token-expert assignments computed by CPU. Choose the lowest score subject to available GPU slots; equal scores favor fewer GPU copies. All misses may go to CPU. The balanced policy has no CPU assignment cap, and `GGML_MOE_HYBRID_MAX_ASSIGNMENTS` is no longer read. Backend batch and tensor capacity limits still apply. The GPU compute and merge terms are unchanged and are not added to this cost model.
 
 For single-token decode, `x` is the number of CPU experts. Repeated tokens on the same expert count separately, as the current CPU path performs separate matrix-vector work. Applying this single-token fit to repeated-token work or to more than 10 assignments is an approximation; these cases are not separately calibrated.
 
@@ -45,3 +45,21 @@ ggml-moe-latency-v2
 ```
 
 The second line describes fields, not a usable measurement. Coefficients must come from a new offline calibration; no historical benchmark values are built into the runtime.
+
+## CPU expert cap for parameter sweeps
+
+Use the legacy policy to bound the number of distinct CPU experts in each layer batch:
+
+```sh
+export GGML_MOE_HYBRID=1
+export GGML_MOE_HYBRID_POLICY=legacy
+export GGML_MOE_HYBRID_MAX_EXPERTS=8
+```
+
+The default is `-1`, which leaves the legacy selection unchanged. A value of `0` keeps all expert work on GPU; a positive value caps distinct CPU experts, not token-expert assignments or CPU threads. Candidates must be uncached, below `GGML_MOE_HYBRID_MIN_TOKENS`, and outside `GGML_MOE_HYBRID_REUSE_WINDOW`. The selector prefers fewer token assignments, and prefetching excludes at most the selected CPU candidates. `GGML_MOE_HYBRID_MAX_TOKENS` separately limits the batch size eligible for hybrid execution.
+
+An enabled cap is incompatible with `GGML_MOE_HYBRID_POLICY=balanced`. GPU slots must also hold the experts assigned to GPU: the runtime asserts if slot overflow would force more experts onto CPU than the cap permits. For the experiment's maximum of eight verification positions with top-8 routing, 64 slots per layer avoid this capacity conflict. This is a constraint of the current implementation.
+
+The `MoE pilot` shutdown records report per-layer synchronous and prefetched weight bytes, CPU/GPU token-expert assignments, and `cpu_peak`, the largest number of distinct CPU experts in a batch. These are context-lifetime counters, including prefill and all requests; transfer bytes are not exposed transfer time.
+
+Server response `timings` also includes `decode_rounds`, `draft_verif_steps`, and `decode_output_tokens`. Decode rounds include ordinary decode iterations and speculative verification iterations; the first output token comes from prefill and is excluded. `decode_output_tokens` is `max(predicted_n - 1, 0)`. For a nonzero decode token count, compute TPOT as `predicted_ms / decode_output_tokens`, and average committed tokens per round as `decode_output_tokens / decode_rounds`. This adds measurements without changing the existing generation timer.

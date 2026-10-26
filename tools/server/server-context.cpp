@@ -4208,6 +4208,7 @@ private:
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
+            if (slot.stats.n_gen > 0) { slot.stats.n_decode_iterations++; }
             slot.stats.n_gen += 1;
 
             if (slot.stats.n_gen == 1) {
@@ -4337,6 +4338,7 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+            slot.stats.n_decode_iterations++;
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
