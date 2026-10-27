@@ -48,6 +48,7 @@ inline ggml_moe_backend_caps ggml_moe_backend_get_caps(ggml_backend_dev_t device
 using ggml_moe_cpu_max_tokens_fn = int (*)(ggml_backend_t, ggml_type);
 using ggml_moe_cpu_merge_begin_fn = bool (*)(ggml_backend_t, ggml_tensor *, const float *, const int32_t *, int, const uint32_t *);
 using ggml_moe_cpu_merge_fn = void (*)(ggml_backend_t, ggml_tensor *, const float *, const int32_t *, int);
+using ggml_moe_tune_timer_fn = double (*)(ggml_backend_t, void **, int);
 
 struct ggml_moe_prefill {
     void * context;

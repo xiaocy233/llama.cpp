@@ -5,6 +5,7 @@
 // try as much as possible to not include this header in the rest of the codebase
 
 #include "llama.h"
+#include "ggml-moe-tune.h"
 
 #include <cstdint>
 #include <map>
@@ -15,6 +16,9 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_tokens,
         uint32_t n_seqs,
         uint32_t n_outputs);
+
+LLAMA_API bool llama_moe_tune_begin(llama_context * ctx, int width, int cpu_cap, bool profile, bool fixed);
+LLAMA_API int llama_moe_tune_end(llama_context * ctx, ggml_moe_tune_layer * layers, int capacity);
 
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);

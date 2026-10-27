@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -1441,6 +1442,7 @@ private:
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
                 }
+                if (slot.can_speculate()) common_speculative_end(spec.get(), slot.id, slot.stats.n_gen_steps(), false);
             };
 
             slot.reset();
@@ -1838,6 +1840,11 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (std::getenv("LLAMA_MOE_AUTOTUNE") && task.params.sampling.temp != 0) {
+            send_error(task, "MoE autotuning requires temperature=0", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2280,6 +2287,7 @@ private:
         res->generation_params = slot.task->params; // copy the parameters
 
         queue_results.send(std::move(res));
+        if (slot.can_speculate()) common_speculative_end(spec.get(), slot.id, slot.stats.n_gen_steps(), true);
     }
 
     void send_embedding(const server_slot & slot, const common_batch & batch) {
@@ -4206,6 +4214,7 @@ private:
             common_sampler_accept(slot.smpl.get(), id, true);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+            if (slot.can_speculate() && slot.stats.n_gen > 0) common_speculative_observe(spec.get(), slot.id, 0);
             const int64_t t_now = ggml_time_us();
 
             if (slot.stats.n_gen > 0) { slot.stats.n_decode_iterations++; }
@@ -4321,6 +4330,7 @@ private:
                 }
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_speculative_observe(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
             }

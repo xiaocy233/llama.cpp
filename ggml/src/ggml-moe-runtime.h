@@ -1,5 +1,6 @@
 #pragma once
 #include "ggml-backend.h"
+#include "ggml-moe-tune.h"
 
 struct ggml_moe_runtime;
 struct ggml_moe_slot_state;
@@ -21,3 +22,5 @@ void ggml_moe_runtime_set_moe_gate_seq(ggml_moe_runtime * runtime, ggml_tensor *
 void ggml_moe_runtime_set_moe_substitute_enabled(ggml_moe_runtime * runtime, bool enabled);
 const ggml_moe_slot_cache * ggml_moe_runtime_find_moe_slot_cache(ggml_moe_runtime * runtime, const ggml_tensor * src);
 const ggml_moe_slot_cache * ggml_moe_runtime_find_moe_head_predictor(ggml_moe_runtime * runtime, int source_layer);
+bool ggml_moe_runtime_tune_begin(ggml_moe_runtime * runtime, int width, int cpu_cap, bool profile, bool fixed);
+int ggml_moe_runtime_tune_end(ggml_moe_runtime * runtime, ggml_moe_tune_layer * layers, int capacity);

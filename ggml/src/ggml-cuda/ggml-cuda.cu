@@ -6143,7 +6143,45 @@ static ggml_moe_backend_caps ggml_backend_cuda_moe_get_caps(ggml_backend_dev_t) 
     return { 3, false, true };
 }
 
+static double ggml_backend_cuda_moe_tune_timer(ggml_backend_t backend, void ** handle, int phase) {
+    struct timer_state { cudaEvent_t begin; cudaEvent_t end; };
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    auto * timer = (timer_state *) *handle;
+    if (phase < 0) {
+        if (timer) {
+            CUDA_CHECK(cudaEventDestroy(timer->begin));
+            CUDA_CHECK(cudaEventDestroy(timer->end));
+            delete timer;
+            *handle = nullptr;
+        }
+        return 0;
+    }
+    if (!timer) {
+        timer = new timer_state;
+        CUDA_CHECK(cudaEventCreate(&timer->begin));
+        CUDA_CHECK(cudaEventCreate(&timer->end));
+        *handle = timer;
+    }
+    if (phase == 0) {
+        CUDA_CHECK(cudaEventRecord(timer->begin, ctx->stream()));
+        return 0;
+    }
+    if (phase == 2) {
+        CUDA_CHECK(cudaEventRecord(timer->end, ctx->stream()));
+        return 0;
+    }
+    GGML_ASSERT(phase == 3);
+    CUDA_CHECK(cudaEventSynchronize(timer->end));
+    float ms = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, timer->begin, timer->end));
+    return ms * 1000.0;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_moe_tune_timer") == 0) {
+        return (void *) ggml_backend_cuda_moe_tune_timer;
+    }
     if (strcmp(name, "ggml_backend_moe_cpu_max_tokens") == 0) {
         return (void *) ggml_backend_cuda_moe_cpu_max_tokens;
     }

@@ -91,6 +91,9 @@ add_library(${TARGET}
     llguidance.cpp
     log.cpp
     log.h
+    moe-autotune.cpp
+    moe-autotune.h
+    moe-autotune-model.h
     ngram-cache.cpp
     ngram-cache.h
     ngram-map.cpp

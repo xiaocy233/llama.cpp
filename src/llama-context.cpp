@@ -26,6 +26,16 @@
 // llama_context
 //
 
+bool llama_moe_tune_begin(llama_context * ctx, int width, int cpu_cap, bool profile, bool fixed) {
+    ctx->synchronize();
+    return ggml_backend_sched_moe_tune_begin(ctx->get_sched(), width, cpu_cap, profile, fixed);
+}
+
+int llama_moe_tune_end(llama_context * ctx, ggml_moe_tune_layer * layers, int capacity) {
+    ctx->synchronize();
+    return ggml_backend_sched_moe_tune_end(ctx->get_sched(), layers, capacity);
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
