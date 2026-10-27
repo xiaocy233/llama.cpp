@@ -1,8 +1,8 @@
-# DFlash tuning and online observation
+# MoE tuning and online observation
 
 Use `scripts/moe_adaptive.py` for both standalone tuning and online observation. **Standalone `tune` collects data and returns recommended parameters in one invocation. Online `serve` collects every 20 output tokens, searches once after each completed response, and applies the result to the next request.** The search backend is invoked by the tool; no manual handoff is required for standalone tuning.
 
-The initial supported execution path is batch-one DFlash with seven draft tokens, greedy target sampling, pinned CUDA expert slots, LFU replacement, and legacy CPU diversion. GPU cache capacity and resident layers are fixed inputs. The experimental collector is enabled only by `LLAMA_MOE_AUTOTUNE=offline|online`.
+Supported execution paths are batch-one DFlash with seven draft tokens and single-head MTP with one to seven draft tokens. Both require greedy target sampling, pinned CUDA expert slots, LFU replacement, and legacy CPU diversion. MTP with shared KV, multiple heads, or probabilistic drafting is not supported by the tuner. GPU cache capacity and resident layers are fixed inputs. The experimental collector is enabled only by `LLAMA_MOE_AUTOTUNE=offline|online`.
 
 ## Build
 
@@ -22,6 +22,19 @@ python3 scripts/moe_adaptive.py tune \
 
 This starts one server, loads the models once, and sends one completion request. After eight initial full verification rounds, the default budget samples verification sizes 1, 2, 4, and 8, first with CPU cap 0 and then cap 4. Each service cell has one warmup round and one measured round: 16 short rounds total, embedded in the same generation. Warmup excludes first-use graph/buffer/thread setup from fitted costs. Every round still produces ordinary output tokens. There is no separate bandwidth or CPU microbenchmark process and no configuration sweep.
 
+For MTP, select `--spec-type draft-mtp`. A target GGUF containing MTP heads does not need `--draft-model`; a separate MTP model can be supplied with that option. `--draft-max` is fixed for a tuning session and defaults to 7. Smaller MTP limits use only supported verification sizes, including the maximum batch size, with fewer calibration rounds.
+
+```sh
+python3 scripts/moe_adaptive.py tune \
+    --server build/bin/llama-server --spec-type draft-mtp \
+    --model /path/to/target-with-mtp.gguf --draft-max 7 \
+    --prompt /path/to/coding-prompt.txt --gpu GPU-UUID \
+    --slots 64 --cache-layers 4 --ctx 8192 --tokens 256 \
+    --output /path/to/new-mtp-tuning
+```
+
+MTP records `draft_prefix_us`, the cumulative elapsed time at each sampled candidate. A threshold that retains K tokens normally executes K+1 draft steps because the rejected candidate must first be generated. At the draft limit it executes only K steps. The TPOT model uses this observed prefix cost plus the measured draft setup/finish residual; DFlash retains its measured whole-block draft cost. Online MTP stops at the configured threshold on sampled and unsampled rounds alike. It does not generate extra candidates for observation. Candidates requiring unseen routes, acceptance, or draft steps remain unsupported. MTP catch-up performed during verification stays in the measured verification residual. Profiles include the draft type and maximum length, so MTP and DFlash profiles cannot be mixed.
+
 After collection, the tool closes its server and automatically searches the saved measurements using the CPU. It writes `search.json`, includes the recommendation in `summary.json` and `session.json`, and reports collection time, search time, and total time. The default backend is `llama-moe-autotune` beside the supplied server executable; `--tool` overrides its path. The executable is checked before loading models. `calibrate` remains an alias for the same complete workflow.
 
 `--cost-rounds 0` disables directed cost samples. A compatible `--profile` also skips them. Missing measurements remain missing; the collector does not fabricate service costs. The profile identity covers model/executable/shared-library file identities, device, CPU affinity and threads, context size, prompt-length bucket, expert shapes, and slots. Use one writer per profile.
@@ -30,7 +43,7 @@ The command prints the observed confidence vectors, accepted/retained lengths, c
 
 ## Collect during requests, tune between requests
 
-The native `llama-server` collector samples every 20 committed output tokens. After a complete response has been queued for delivery, it searches once and retains the chosen configuration for the next request. The current request never changes configuration. Python is optional; it only supplies native environment settings.
+The native `llama-server` collector samples every 20 committed output tokens. After a complete response has been queued for delivery, it searches once and retains the chosen configuration for the next request. The current request never changes configuration. Python is optional; it only supplies native environment settings. Use `--spec-type draft-mtp` and the same model options as above to serve MTP with this lifecycle.
 
 ```sh
 python3 scripts/moe_adaptive.py serve \
@@ -89,4 +102,4 @@ The runner builds a common width-24 predictor graph. `npred` selects the per-pos
 python3 scripts/moe_adaptive.py report /path/to/new-observation --summary-only
 ```
 
-Native controls use the `LLAMA_MOE_AUTOTUNE_` prefix: required `OUTPUT`; optional `PROFILE`, `PROFILE_KEY`, `WINDOW`, `SAMPLE_TOKENS`, `ADAPT`, `COST_ROUNDS`, `MAX_PRED`, `DETAIL`, and the initial online configuration `NPRED`, `THRESHOLD`, `CPU_CAP`. The runner forces online `COST_ROUNDS=0`, and the native collector independently disables online probes. Do not combine this initial path with an acceptance predictor, expert substitution, a different CPU/cache policy, or checkpoint replay. Recurrent models require at least seven rollback snapshots.
+Native controls use the `LLAMA_MOE_AUTOTUNE_` prefix: required `OUTPUT`; optional `PROFILE`, `PROFILE_KEY`, `WINDOW`, `SAMPLE_TOKENS`, `ADAPT`, `COST_ROUNDS`, `MAX_PRED`, `DETAIL`, and the initial online configuration `NPRED`, `THRESHOLD`, `CPU_CAP`. The runner forces online `COST_ROUNDS=0`, and the native collector independently disables online probes. Do not combine this initial path with an acceptance predictor, expert substitution, a different CPU/cache policy, or checkpoint replay. Recurrent models require at least one rollback snapshot per possible draft token.

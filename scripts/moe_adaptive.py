@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DFlash standalone tuning and request-level online adaptation."""
+"""MoE standalone tuning and request-level adaptation for DFlash and MTP."""
 
 import argparse
 import hashlib
@@ -78,7 +78,10 @@ def require_idle_gpu(gpu):
 
 def launch(args, port):
     profile = args.profile.resolve() if args.profile else args.output / "costs.json"
-    key = {"target": file_identity(args.model), "draft": file_identity(args.draft_model),
+    spec_type = getattr(args, "spec_type", "draft-dflash")
+    draft_max = getattr(args, "draft_max", 7)
+    key = {"target": file_identity(args.model), "draft": file_identity(args.draft_model or args.model),
+           "spec_type": spec_type, "draft_max": draft_max,
            "binary": file_identity(args.server),
            "runtime_libraries": {p.name: file_identity(p.resolve()) for p in sorted(args.server.parent.glob("*.so*")) if p.is_file()},
            "gpu": args.gpu, "threads": args.threads,
@@ -97,15 +100,17 @@ def launch(args, port):
                 "LLAMA_MOE_AUTOTUNE_CPU_CAP": str(args.cpu_cap),
                 "LLAMA_MOE_AUTOTUNE_MAX_PRED": "24",
                 "LLAMA_MOE_AUTOTUNE_DETAIL": str(int(args.detail or args.action != "serve"))})
-    command = [str(args.server), "-m", str(args.model), "-md", str(args.draft_model),
-               "--spec-type", "draft-dflash", "-ngl", "99", "-ngld", "99", "-c", str(args.ctx),
+    command = [str(args.server), "-m", str(args.model),
+               "--spec-type", spec_type, "-ngl", "99", "-ngld", "99", "-c", str(args.ctx),
                "-b", "512", "-ub", "512", "-np", "1", "-t", str(args.threads), "-tb", str(args.threads),
                "--host", "127.0.0.1", "--port", str(port), "--fit", "off", "--load-mode", "none",
                "--no-warmup", "--temp", "0", "--ctx-checkpoints", "0", "--reasoning", "off", "--moe-substitute-threshold", "0",
                "--n-cache-layers", str(args.cache_layers), "--n-cache-slots", str(args.slots),
                "--n-cache-predict", "24", "--n-cache-pin", "32768",
-               "--spec-draft-n-max", "7", "--spec-draft-n-min", "0", "--spec-draft-p-min", "0",
+               "--spec-draft-n-max", str(draft_max), "--spec-draft-n-min", "0", "--spec-draft-p-min", "0",
                "--spec-draft-threads", str(args.threads), "--spec-draft-threads-batch", str(args.threads)]
+    if args.draft_model:
+        command += ["-md", str(args.draft_model)]
     return command, environment(env), {"identity": key, "command": command, "environment": env}
 
 
@@ -186,8 +191,14 @@ def report(root, print_rounds=True):
 
 def run(args):
     args.output = args.output.resolve()
-    for name in ("server", "model", "draft_model"):
+    for name in ("server", "model"):
         setattr(args, name, getattr(args, name).resolve(strict=True))
+    if args.draft_model:
+        args.draft_model = args.draft_model.resolve(strict=True)
+    if args.spec_type == "draft-dflash" and (not args.draft_model or args.draft_max != 7):
+        raise ValueError("DFlash requires --draft-model and --draft-max 7")
+    if not 1 <= args.draft_max <= 7:
+        raise ValueError("Draft maximum must be between 1 and 7")
     if args.action != "serve":
         if not args.prompt:
             raise ValueError("tune requires --prompt")
@@ -216,7 +227,7 @@ def run(args):
     command, env, manifest = launch(args, port)
     write_json(args.output / "manifest.json", manifest)
     if args.action == "serve":
-        print(f"Online DFlash (collect during generation; tune after each request): http://127.0.0.1:{port}", flush=True)
+        print(f"Online {args.spec_type} (collect during generation; tune after each request): http://127.0.0.1:{port}", flush=True)
         print(f"Telemetry: {args.output / 'telemetry.jsonl'}", flush=True)
         os.execve(str(args.server), command, env)
     started = time.perf_counter()
@@ -311,7 +322,9 @@ def main():
             p.add_argument("--sample-tokens", type=int, default=20, help="Collect after each N output tokens; default 20, plus the first decode step")
             p.add_argument("--observe-only", action="store_true", help="Collect without selecting a configuration for the next request")
         p.add_argument("--model", type=Path, required=True)
-        p.add_argument("--draft-model", type=Path, required=True)
+        p.add_argument("--spec-type", choices=("draft-dflash", "draft-mtp"), default="draft-dflash")
+        p.add_argument("--draft-max", type=int, default=7, help="Fixed draft limit: 7 for DFlash, 1..7 for MTP")
+        p.add_argument("--draft-model", type=Path, help="Required for DFlash; MTP defaults to the heads embedded in --model")
         p.add_argument("--gpu", required=True)
         p.add_argument("--output", type=Path, required=True)
         p.add_argument("--profile", type=Path, help="Read/update a compatible cost profile; default OUTPUT/costs.json")

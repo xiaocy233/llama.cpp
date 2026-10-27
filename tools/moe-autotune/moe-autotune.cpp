@@ -19,12 +19,14 @@ static double duration(const tune_json & value) {
     return n;
 }
 
-static round_sample read_round(const tune_json & j) {
+static round_sample read_round(const tune_json & j, int max_draft, bool sequential) {
     round_sample sample;
     sample.round = bounded(j.at("round"), 0, 1000000000);
-    sample.kept = bounded(j.at("kept"), 7, 7);
-    sample.accepted = bounded(j.at("accepted"), 0, 7);
-    if (j.at("confidence").size() != 7) throw std::runtime_error("expected seven draft confidences");
+    sample.max_draft = max_draft;
+    if (j.contains("max_draft") && bounded(j.at("max_draft"), 1, 7) != max_draft) throw std::runtime_error("inconsistent draft limit");
+    sample.kept = bounded(j.at("kept"), max_draft, max_draft);
+    sample.accepted = bounded(j.at("accepted"), 0, max_draft);
+    if (j.at("confidence").size() != size_t(max_draft)) throw std::runtime_error("expected a complete draft confidence vector");
     for (const auto & p : j.at("confidence")) {
         const double v = duration(p);
         if (v > 1) throw std::runtime_error("invalid confidence");
@@ -32,6 +34,18 @@ static round_sample read_round(const tune_json & j) {
     }
     sample.draft_us = duration(j.at("draft_ms")) * 1000;
     sample.verify_us = duration(j.at("verify_ms")) * 1000;
+    if (sequential) {
+        const auto & prefix = j.at("draft_prefix_us");
+        if (!prefix.is_array() || prefix.size() != size_t(max_draft)) throw std::runtime_error("invalid sequential draft timing dimensions");
+        double previous = 0;
+        for (const auto & value : prefix) {
+            const double us = duration(value);
+            if (us < previous || us > sample.draft_us + 1e-6) throw std::runtime_error("invalid sequential draft timing order");
+            sample.draft_prefix_us.push_back(us);
+            previous = us;
+        }
+    }
+    const int batch = max_draft + 1;
     const auto & layers = j.at("layers");
     if (layers.empty() || layers.size() > 128) throw std::runtime_error("invalid layer count");
     for (const auto & v : layers) {
@@ -43,7 +57,7 @@ static round_sample read_round(const tune_json & j) {
         l.width = bounded(v.at("width"), 1, 1000000);
         if (v.at("bytes").size() != 3 || v.at("types").size() != 3 || v.at("owners").size() != size_t(l.slots) ||
                 v.at("prefetchable").size() != size_t(l.slots) || v.at("lfu").size() != size_t(l.experts) ||
-                v.at("actual").size() != size_t(8 * l.top_k) || v.at("predicted").size() > 256 || v.at("predicted").size() % 8) {
+                v.at("actual").size() != size_t(batch * l.top_k) || v.at("predicted").size() > 256 || v.at("predicted").size() % batch) {
             throw std::runtime_error("invalid layer dimensions");
         }
         for (int m = 0; m < 3; ++m) {
@@ -82,7 +96,8 @@ int main(int argc, char ** argv) {
         if (!file) throw std::runtime_error("cannot open telemetry");
         latency_model model;
         std::deque<round_sample> samples;
-        int request = 0, width = 24, window = 32;
+        int request = 0, width = 24, window = 32, max_draft = 7;
+        bool sequential = false;
         bool have_costs = false;
         std::string line;
         while (std::getline(file, line)) {
@@ -92,6 +107,10 @@ int main(int argc, char ** argv) {
             if (event == "start") {
                 width = bounded(j.at("built_prediction_width"), 0, 24);
                 window = bounded(j.at("window_rounds"), 16, 128);
+                max_draft = bounded(j.value("max_draft", tune_json(7)), 1, 7);
+                const std::string type = j.value("spec_type", "draft-dflash");
+                if (type != "draft-dflash" && type != "draft-mtp") throw std::runtime_error("unsupported draft type");
+                sequential = type == "draft-mtp";
                 continue;
             }
             if (event == "request") {
@@ -103,7 +122,7 @@ int main(int argc, char ** argv) {
             }
             if (!request || (j.contains("request") && j.at("request") != request)) continue;
             if (event == "round" && j.value("workload_sample", false) && j.contains("layers")) {
-                samples.push_back(read_round(j));
+                samples.push_back(read_round(j, max_draft, sequential));
                 while (samples.size() > size_t(window)) samples.pop_front();
             }
             if (j.contains("costs")) { model.restore(j.at("costs")); have_costs = true; }

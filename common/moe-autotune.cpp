@@ -34,6 +34,8 @@ int env_int(const char * key, int fallback, int low, int high) {
 struct common_moe_autotune::impl {
     llama_context * target;
     llama_context * draft;
+    int max_draft;
+    bool sequential;
     bool online, adaptive, active = false, pending = false, collecting = false, probing = false, profiled = false, loaded = false, detail = false;
     int request = 0, round = 0, max_width, window, cost_limit, cost_done = 0, prompt_tokens = 0;
     int sampled_rounds = 0;
@@ -52,7 +54,8 @@ struct common_moe_autotune::impl {
     round_sample current;
     configuration configured, executing;
 
-    impl(llama_context * target, llama_context * draft) : target(target), draft(draft) {
+    impl(llama_context * target, llama_context * draft, int max_draft, bool sequential) : target(target), draft(draft), max_draft(max_draft), sequential(sequential) {
+        if (max_draft < 1 || max_draft > 7) throw std::runtime_error("autotune supports between one and seven draft tokens");
         const std::string mode = std::getenv("LLAMA_MOE_AUTOTUNE");
         if (mode != "offline" && mode != "online") throw std::runtime_error("LLAMA_MOE_AUTOTUNE must be offline or online");
         online = mode == "online";
@@ -79,7 +82,8 @@ struct common_moe_autotune::impl {
                 if (!*value || *end || !std::isfinite(configured.threshold) || configured.threshold < 0 || configured.threshold > 1) throw std::runtime_error("invalid online collection threshold");
             }
         }
-        emit({{"event", "start"}, {"version", 2}, {"mode", mode}, {"collection_only", !adaptive}, {"configured", configured.json()}, {"window_rounds", window},
+        emit({{"event", "start"}, {"version", 3}, {"mode", mode}, {"spec_type", sequential ? "draft-mtp" : "draft-dflash"}, {"max_draft", max_draft},
+              {"collection_only", !adaptive}, {"configured", configured.json()}, {"window_rounds", window},
               {"sample_tokens", sampling.interval}, {"sampling_unit", online ? "output_tokens" : "decode_rounds"},
               {"search_at", adaptive ? "request_end" : "disabled"}, {"frequency_scope", "sampled_rounds"},
               {"cost_round_budget", cost_limit}, {"built_prediction_width", max_width},
@@ -106,6 +110,7 @@ struct common_moe_autotune::impl {
         if (const char * t = std::getenv("GGML_MOE_HYBRID_THREADS")) id += std::string("|threads=") + t;
         if (const char * t = std::getenv("LLAMA_MOE_AUTOTUNE_PROFILE_KEY")) id += std::string("|") + t;
         id += "|context=" + std::to_string(llama_n_ctx(target)) + "|prompt_bucket=" + std::to_string(prompt_tokens / 256);
+        id += std::string("|drafter=") + (sequential ? "mtp" : "dflash") + "|max_draft=" + std::to_string(max_draft);
         for (const auto & l : layers) id += "|" + std::to_string(l.layer) + ":" + std::to_string(l.slots) + ":" + shape_key(l);
         return id;
     }
@@ -186,7 +191,7 @@ struct common_moe_autotune::impl {
     }
 };
 
-common_moe_autotune::common_moe_autotune(llama_context * target, llama_context * draft) : state(new impl(target, draft)) {}
+common_moe_autotune::common_moe_autotune(llama_context * target, llama_context * draft, int max_draft, bool sequential) : state(new impl(target, draft, max_draft, sequential)) {}
 
 common_moe_autotune::~common_moe_autotune() {
     try { if (state->active) state->report("final"); }
@@ -217,17 +222,20 @@ bool common_moe_autotune::prepare() {
     s.executing = s.online ? s.configured : configuration{};
     s.probing = false; s.force_keep = -1;
     // Warm each service shape once before measuring it.
-    if (!s.online && !s.loaded && s.round >= 8 && s.cost_done < s.cost_limit) {
-        static const int sizes[] = {1, 2, 4, 8};
+    std::vector<int> sizes;
+    for (int b : {1, 2, 4, 8}) if (b <= s.max_draft + 1) sizes.push_back(b);
+    if (sizes.back() != s.max_draft + 1) sizes.push_back(s.max_draft + 1);
+    if (!s.online && !s.loaded && s.round >= 8 && s.cost_done < std::min(s.cost_limit, 4 * int(sizes.size()))) {
         const int cell = s.cost_done / 2;
-        s.executing = {0, 0, (cell % 8) < 4 ? 0 : 4};
-        s.force_keep = sizes[cell % 4] - 1;
+        s.executing = {0, 0, cell < int(sizes.size()) ? 0 : 4};
+        s.force_keep = sizes[cell % sizes.size()] - 1;
         s.probing = true;
     }
     s.profiled = s.online || (s.probing ? s.cost_done % 2 == 1 : s.round % 8 == 0);
     if (!llama_moe_tune_begin(s.target, s.executing.width, s.executing.cpu, s.profiled, s.online)) throw std::runtime_error("autotune needs pinned CUDA expert slots, legacy CPU diversion, and LFU");
     s.sampling.sampled();
     s.current = {};
+    s.current.max_draft = s.max_draft;
     s.control_us += ggml_time_us() - s.round_start;
     return true;
 }
@@ -236,10 +244,22 @@ float common_moe_autotune::threshold() const {
     return state->configured.threshold;
 }
 
+void common_moe_autotune::record_draft_token(float confidence) {
+    auto & s = *state;
+    if (!s.sequential || !s.collecting || !s.pending || s.current.confidence.size() >= size_t(s.max_draft)) throw std::runtime_error("invalid sequential draft observation");
+    if (!std::isfinite(confidence) || confidence < 0 || confidence > 1) throw std::runtime_error("invalid draft confidence");
+    s.current.confidence.push_back(confidence);
+    s.current.draft_prefix_us.push_back(ggml_time_us() - s.round_start);
+}
+
+size_t common_moe_autotune::finish_draft(int limit, int position) {
+    return truncate(state->current.confidence, limit, position);
+}
+
 size_t common_moe_autotune::truncate(const std::vector<float> & confidence, int limit, int position) {
     auto & s = *state;
-    if (!s.pending || !s.collecting || confidence.empty() || confidence.size() > 7) throw std::runtime_error("invalid DFlash autotune draft");
-    for (float p : confidence) if (!std::isfinite(p) || p < 0 || p > 1) throw std::runtime_error("invalid DFlash confidence");
+    if (!s.pending || !s.collecting || confidence.empty() || confidence.size() > size_t(s.max_draft)) throw std::runtime_error("invalid autotune draft");
+    for (float p : confidence) if (!std::isfinite(p) || p < 0 || p > 1) throw std::runtime_error("invalid draft confidence");
     s.current.confidence = confidence;
     s.position = position;
     int keep = prefix_length(confidence, s.executing.threshold);
@@ -278,10 +298,11 @@ void common_moe_autotune::finish(int accepted) {
     for (const auto & l : s.current.layers) if (l.n_ids != (s.current.kept + 1) * l.top_k) throw std::runtime_error("autotune verification shape mismatch");
     if (s.signature.empty()) { s.signature = s.identity(s.current.layers); s.load_profile(); }
     if (s.round > 1 && (!s.probing || s.cost_done % 2 == 1)) s.learn(s.current);
-    const bool full = s.current.kept == int(s.current.confidence.size()) && s.current.kept == 7;
+    const bool full = s.current.kept == int(s.current.confidence.size()) && s.current.kept == s.max_draft;
     // Threshold-selected full drafts bias acceptance statistics. Use untruncated rounds.
     const bool reference = full && s.executing.threshold == 0;
-    const bool search_sample = s.current.confidence.size() == 7 && s.current.kept == prefix_length(s.current.confidence, s.executing.threshold);
+    const bool observed_end = int(s.current.confidence.size()) == s.max_draft || s.current.kept < int(s.current.confidence.size());
+    const bool search_sample = observed_end && s.current.kept == prefix_length(s.current.confidence, s.executing.threshold);
     if (reference) ++s.full_seen;
     int loads = 0, prefetches = 0, assignments = 0;
     double gate = 0, service = 0;
@@ -298,6 +319,7 @@ void common_moe_autotune::finish(int accepted) {
     tune_json record = {{"event", "round"}, {"request", s.request}, {"round", s.round}, {"position", s.position},
             {"output_tokens_before", s.sampling.tokens}, {"next_sample_tokens", s.sampling.next},
             {"config", s.executing.json()}, {"confidence", s.current.confidence}, {"kept", s.current.kept},
+            {"max_draft", s.max_draft}, {"draft_prefix_us", s.current.draft_prefix_us},
             {"accepted", accepted}, {"right_censored", !full && accepted == s.current.kept}, {"full", full}, {"workload_sample", reference}, {"search_sample", search_sample},
             {"cost_probe", s.probing}, {"profiled", s.profiled}, {"draft_ms", s.current.draft_us / 1000},
             {"verify_ms", s.current.verify_us / 1000}, {"gate_ms", gate / 1000},

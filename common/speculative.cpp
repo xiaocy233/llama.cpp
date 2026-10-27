@@ -1592,6 +1592,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
+    std::unique_ptr<common_moe_autotune> autotune;
 
     common_batch batch;
 
@@ -1702,6 +1703,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        if (std::getenv("LLAMA_MOE_AUTOTUNE")) {
+            if (n_seq != 1 || is_mem_shared || chain_heads || this->params.probabilistic || this->params.p_min != 0.0f || this->params.n_min != 0 || this->params.n_max < 1 || this->params.n_max > 7) {
+                throw std::runtime_error("autotune requires single-slot, single-head greedy MTP, n_max=1..7, n_min=0, p_min=0, without shared KV");
+            }
+            const auto * model_tgt = llama_get_model(ctx_tgt);
+            if ((llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) && llama_n_rs_seq(ctx_tgt) < uint32_t(this->params.n_max)) {
+                throw std::runtime_error("autotune requires a recurrent rollback snapshot for each draft token");
+            }
+            autotune = std::make_unique<common_moe_autotune>(ctx_tgt, ctx_dft, this->params.n_max, true);
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1721,6 +1733,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+        if (autotune) autotune->begin(prompt.size());
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1851,6 +1864,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        if (autotune && dparams[0].temp != 0) throw std::runtime_error("autotune currently requires greedy target sampling (temperature=0)");
+        const bool tune_sample = autotune && autotune->prepare();
+        const float draft_p_min = autotune ? autotune->threshold() : params.p_min;
+
         batch.clear();
 
         // keep track of which sequences are still drafting
@@ -1942,8 +1959,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
+                if (tune_sample) autotune->record_draft_token(cur_p->data[0].p);
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < draft_p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -2002,6 +2020,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
         }
 
+        if (tune_sample) dparams[0].result->resize(autotune->finish_draft(dparams[0].n_max, dparams[0].pos0));
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -2027,6 +2047,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    void observe(llama_seq_id /*seq_id*/, uint16_t n_accepted) override {
+        if (autotune) autotune->finish(n_accepted);
+    }
+
+    void end(llama_seq_id /*seq_id*/, uint64_t output_tokens, bool completed) override {
+        if (autotune) autotune->end(output_tokens, completed);
     }
 };
 

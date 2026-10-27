@@ -63,9 +63,17 @@ inline std::string shape_key(const ggml_moe_tune_layer & l) {
 
 struct round_sample {
     std::vector<float> confidence;
+    std::vector<double> draft_prefix_us;
     std::vector<ggml_moe_tune_layer> layers;
-    int accepted = 0, kept = 0, round = 0;
+    int accepted = 0, kept = 0, round = 0, max_draft = 7;
     double draft_us = 0, verify_us = 0;
+
+    double draft_cost(int kept_prefix) const {
+        if (draft_prefix_us.empty()) return draft_us;
+        // A rejected candidate still requires one draft forward pass.
+        const int executed = std::min(kept_prefix + 1, int(draft_prefix_us.size()));
+        return draft_prefix_us[executed - 1] + std::max(0.0, draft_us - draft_prefix_us.back());
+    }
 };
 
 struct token_sample_schedule {
@@ -206,7 +214,7 @@ struct latency_model {
         predictions_by_cpu result;
         int estimated = 0;
         const double other = interpolate(base, b, estimated);
-        for (auto & p : result) p = {other < 0 ? -1 : sample.draft_us + other, estimated};
+        for (auto & p : result) p = {other < 0 ? -1 : sample.draft_cost(b - 1) + other, estimated};
         if (other < 0) return result;
         const double gap = other / std::max<size_t>(1, sample.layers.size());
         std::array<double, 4> overlap{gap, gap, gap, gap};
@@ -283,7 +291,7 @@ struct latency_model {
             if (tpot < best_tpot) { best_tpot = tpot; best = cfg; }
         }
         const int64_t elapsed = ggml_time_us() - started;
-        const int full = std::count_if(samples.begin(), samples.end(), [](const round_sample & s) { return s.kept == 7; });
+        const int full = std::count_if(samples.begin(), samples.end(), [](const round_sample & s) { return s.kept == s.max_draft; });
         return {{"event", "recommendation"}, {"samples", samples.size()}, {"full_samples", full}, {"supported_candidates", valid},
                 {"selected", valid ? best.json() : tune_json(nullptr)}, {"search_ms", elapsed / 1000.0}, {"ranking", ranking}};
     }
