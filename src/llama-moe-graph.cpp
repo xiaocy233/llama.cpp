@@ -515,8 +515,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_build_forward_expand(gf, experts);
 
-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
-
     assert(n_expert_used > 0);
 
     // order the views before the adds
@@ -524,6 +522,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
     // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
     const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+    std::vector<ggml_tensor *> cur_experts(n_expert_used_il);
     for (uint32_t i = 0; i < n_expert_used_il; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 

@@ -1175,13 +1175,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             acceptance_audit = std::make_unique<common_draft_acceptance_audit>(path);
         }
         if (std::getenv("LLAMA_MOE_AUTOTUNE")) {
-            if (is_dspark || is_dflash2 || n_seq != 1 || this->params.p_min != 0.0f || this->params.n_max != 7 || this->params.n_min != 0 || acceptance_trace || acceptance_model) {
-                throw std::runtime_error("autotune requires single-slot DFlash, n_max=7, n_min=0, p_min=0, without acceptance trace/model");
+            if (is_dspark || n_seq != 1 || this->params.p_min != 0.0f || this->params.n_min != 0 || acceptance_trace || acceptance_model) {
+                throw std::runtime_error("autotune requires single-slot DFlash, n_min=0, p_min=0, without acceptance trace/model");
             }
-            if ((llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) && llama_n_rs_seq(ctx_tgt) < 7) {
-                throw std::runtime_error("autotune requires at least seven recurrent rollback snapshots");
+            if ((llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) && llama_n_rs_seq(ctx_tgt) < uint32_t(this->params.n_max)) {
+                throw std::runtime_error("autotune requires one recurrent rollback snapshot per draft token");
             }
-            autotune = std::make_unique<common_moe_autotune>(ctx_tgt, ctx_dft);
+            autotune = std::make_unique<common_moe_autotune>(ctx_tgt, ctx_dft, this->params.n_max);
         }
     }
 
@@ -1212,7 +1212,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (acceptance_trace) {
             acceptance_trace->begin(N);
         }
-        if (autotune) autotune->begin(N);
+        if (autotune) autotune->begin(prompt);
         if (acceptance_audit) {
             acceptance_audit->begin();
         }
@@ -1398,19 +1398,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + selector_top_k));
-                    if (params.p_min > 0.0f) {
+                    if (tune_sample || draft_p_min > 0.0f) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < selector_top_k; ++k) {
                             sum += std::exp(scores[k] - scores[predecessor]);
                         }
-                        if (1.0f / sum < params.p_min) {
+                        const float confidence = 1.0f / sum;
+                        if (tune_sample) tune_confidence.push_back(confidence);
+                        if (!tune_sample && confidence < draft_p_min) {
                             break;
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
                 }
 
+                if (tune_sample) result.resize(autotune->truncate(tune_confidence, dp.n_max, dp.pos0));
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
                 }
@@ -1733,7 +1736,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
-        if (autotune) autotune->begin(prompt.size());
+        if (autotune) autotune->begin(prompt);
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1801,6 +1804,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
 
+                if (batch_in.tokens[k].pos[0] == 0) {
+                    // A new sequence has no hidden row from the preceding token.
+                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                }
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()
                     : h_tgt + (size_t) (k - 1) * n_embd;

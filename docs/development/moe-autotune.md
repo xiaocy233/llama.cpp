@@ -1,14 +1,20 @@
-# MoE tuning and online observation
+# MoE 自动调优与在线采集
 
-Use `scripts/moe_adaptive.py` for both standalone tuning and online observation. **Standalone `tune` collects data and returns recommended parameters in one invocation. Online `serve` collects every 20 output tokens, searches once after each completed response, and applies the result to the next request.** The search backend is invoked by the tool; no manual handoff is required for standalone tuning.
+独立调优和在线采集统一使用 `scripts/moe_adaptive.py`。**独立模式 `tune` 一次完成数据采集、参数搜索和结果输出。在线模式 `serve` 每隔 20 个输出 token 采集一次详细数据，保留各截断阈值分支的候选配置，并利用后续完整请求比较性能。配置调整只对下一次请求生效。** 独立调优使用服务端内置的搜索与候选管理逻辑，不需要另起搜索进程，也不需要手动传递采集结果。
 
-Supported execution paths are batch-one DFlash with seven draft tokens and single-head MTP with one to seven draft tokens. Both require greedy target sampling, pinned CUDA expert slots, LFU replacement, and legacy CPU diversion. MTP with shared KV, multiple heads, or probabilistic drafting is not supported by the tuner. GPU cache capacity and resident layers are fixed inputs. The experimental collector is enabled only by `LLAMA_MOE_AUTOTUNE=offline|online`.
+当前支持 batch=1 的 DFlash（包括 DFlash2）和单 head MTP，最大草稿长度为 1～7 个 token。两者都要求目标模型使用贪心采样，并采用 CUDA 专家槽位缓存、LFU 替换和 legacy CPU 分流策略。DFlash 使用受草稿模型训练块大小限制后的有效草稿长度，并不要求固定投 7 个 token。当前 CPU/GPU 联合执行成本模型最多支持 8 个验证位置。调优器暂不支持共享 KV、多 head 或概率式草稿生成的 MTP。GPU 缓存容量和常驻层数是固定输入，不参与寻优。只有设置 `LLAMA_MOE_AUTOTUNE=offline|online` 时，才会启用这套实验性采集功能。
 
-## Build
+专家和缓存快照按每层的专家数量、槽位数量分配，不设固定的专家总数上限。路由缓冲区的 256 项限制针对一次验证中的 token-专家分配条目数，不是模型的专家总数。采集器要求每层缓存槽位不少于单 token 激活专家数 top-k 的四倍，且 top-k 不超过 32。满足这一条件不代表更长的验证批次一定装得下。CPU 分流完成后，如果分配给 GPU 的去重专家数超过该层槽位数，运行时会触发断言，并打印层号、token 数、GPU 专家数和槽位数。搜索会跳过超出容量的候选配置，不会悄悄把超出的专家转交 CPU。
 
-On the CUDA machine, build `llama-server` and `llama-moe-autotune`. The numerical search tool itself uses the CPU and requires no model files. The collector reuses the existing routing/copy/CPU paths; it does not change quantization or target routing decisions.
+专家权重在主存中仅部分锁页或完全使用可分页内存时，也可以调优。数据传输继续使用现有的中转路径。调优器沿用锁页内存下的传输估计和重叠假设，不会自动探测锁页预算，也没有单独建立可分页内存的成本模型。如果主存中转开销较大，预测结果可能偏乐观。
 
-## Standalone tuning: collect, search, and report
+DFlash2 使用选中候选在给定前驱条件下的 selector 分数 softmax 概率作为置信度，与现有 `p_min` 规则一致。阈值决定保留选中路径的多长前缀；草稿耗时仍然使用实测的整个草稿块耗时。
+
+## 构建
+
+在 CUDA 机器上构建 `llama-server`，供 `tune` 和 `serve` 使用。如果还需要对已保存的数据显式执行 `search`，再构建 `llama-moe-autotune`；该搜索程序只使用 CPU，不需要加载模型文件。采集器复用现有路由、拷贝和 CPU 计算路径，不改变量化方式或目标模型的真实路由决策。
+
+## 独立调优：采集、搜索和输出结果
 
 ```sh
 python3 scripts/moe_adaptive.py tune \
@@ -16,34 +22,40 @@ python3 scripts/moe_adaptive.py tune \
     --model /path/to/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
     --draft-model /path/to/Qwen3.6-35B-A3B-DFlash-bf16.gguf \
     --prompt /path/to/coding-prompt.txt --gpu GPU-UUID \
-    --slots 64 --cache-layers 4 --ctx 8192 --tokens 256 \
-    --cost-rounds 16 --output /path/to/new-tuning
+    --slots 64 --cache-layers 4 --ctx 8192 --tokens 512 --confirm-tokens 1024 \
+    --cost-rounds 48 --output /path/to/new-tuning
 ```
 
-This starts one server, loads the models once, and sends one completion request. After eight initial full verification rounds, the default budget samples verification sizes 1, 2, 4, and 8, first with CPU cap 0 and then cap 4. Each service cell has one warmup round and one measured round: 16 short rounds total, embedded in the same generation. Warmup excludes first-use graph/buffer/thread setup from fitted costs. Every round still produces ordinary output tokens. There is no separate bandwidth or CPU microbenchmark process and no configuration sweep.
+该命令只启动一个服务进程，模型只加载一次。首先执行 8 个完整长度的验证轮次，再对验证位置数 1、2、4、8 分别预热纯 GPU 路径和 CPU 专家上限为 4 的路径，每种组合调用 3 次。这 24 轮预热不用于成本学习。随后默认执行 48 轮成本采样，分两遍测量这些组合，分别记录执行形状切换和稳定复用时的成本。在普通采集中，每种执行形状与路径的前 3 次调用也不参与成本学习；即使新进程加载了已有成本文件，这一规则仍然生效。预热和成本采样轮次照常产生输出，但不计入仿真回放的工作负载。不另行执行带宽微基准。
 
-For MTP, select `--spec-type draft-mtp`. A target GGUF containing MTP heads does not need `--draft-model`; a separate MTP model can be supplied with that option. `--draft-max` is fixed for a tuning session and defaults to 7. Smaller MTP limits use only supported verification sizes, including the maximum batch size, with fewer calibration rounds.
+第一次数值搜索为 `{0,0.4,0.6,0.8}` 中的每个截断阈值保留一个代表配置，同时保留初始配置作为兜底。如果某个阈值缺少足够的前缀观测，仍会保留该分支的待测配置，但不会给出预测 TPOT，也不会补造缺失的接受标签。控制器在该 prompt 第一次 prefill 后保存专家到缓存槽位的映射、LFU 计数、槽位可用状态和 CPU 复用历史。每个候选预热前恢复这些状态；如果关闭单独预热，则在每次测量前恢复。恢复过程不计入测量的 Decode 耗时，单独记为 `cache_reset_ms`，但仍计入完整请求和调优的总耗时。选定配置后的推理，以及只采集不调优的推理，都不执行这种缓存恢复。
+
+每个候选首先生成 `--tokens` 个输出 token，MTP 默认 1024，DFlash 默认 512。如果该长度已达到 `--confirm-tokens`（默认 max(1024, --tokens)），则直接根据测量结果选择配置，不再重复测量。否则，使用 `--confirm-tokens` 个输出 token（默认 1024），按相反顺序复测初始配置，以及初筛 TPOT 不超过最快结果 3% 的候选。初筛和复测分数分开保存，最终选择只依据复测 TPOT。如果初始配置的复测 TPOT 不超过最佳结果 3%，则保留初始配置。这些比例是经验性的近优容差，不是置信区间，也不是性能保证。短输出与长输出的配置排名可能不同；未经目标工作负载验证就同时缩短两种测量长度，可能漏掉更好的配置。`--warmup-tokens` 控制每次初筛或复测之前单独执行的预热请求长度，MTP 默认 256，DFlash 默认 0；显式设为 0 可以关闭预热。预热输出不计入评分。`--trial-budget 24` 最多允许 12 个候选、合计 24 次测量请求，启用的预热请求另计。实际请求数量和各阶段耗时记录在 `session.json` 中。
+
+对于允许继续探索的初筛请求，控制器只回放该请求实际使用的截断阈值，改变预测宽度和 CPU 专家上限，并保留该分支真实的轮次边界与接受标签。当前执行配置的预测 TPOT 与实测 TPOT 之差的绝对值，用作经验误差尺度。在剩余候选预算内，可以新增一个尚未实测、且预测 TPOT 落在分支最小值加该误差尺度以内的配置。以已测配置为基准比较时，对两个配置的预测差值预留两倍误差尺度，再加上 3% 的近优容差。这样既保留预测结果接近的后续候选，又过滤明显更慢的候选。这是启发式余量，不是严格误差上界。每个新增候选都可以用于继续探索一次所在分支，复测阶段不再添加候选。因此无需对明显更慢的配置完整测量第二遍。请求过短，或同一测量阶段的输出长度不一致，都可能导致验证未完成。`validated` 只表示已完成保留候选集合内的比较，不表示找到了全局最优。
+
+使用 MTP 时，指定 `--spec-type draft-mtp`。如果目标 GGUF 已包含 MTP head，则不需要 `--draft-model`；也可以通过该参数指定独立的 MTP 模型。`--draft-max` 在一次调优过程中固定，默认值为 7。DFlash 或 MTP 使用更小的草稿上限时，只校准支持的验证大小，其中包括该上限对应的最大验证批次，校准轮数也会减少。
 
 ```sh
 python3 scripts/moe_adaptive.py tune \
     --server build/bin/llama-server --spec-type draft-mtp \
     --model /path/to/target-with-mtp.gguf --draft-max 7 \
     --prompt /path/to/coding-prompt.txt --gpu GPU-UUID \
-    --slots 64 --cache-layers 4 --ctx 8192 --tokens 256 \
+    --slots 64 --cache-layers 4 --ctx 8192 --tokens 1024 \
     --output /path/to/new-mtp-tuning
 ```
 
-MTP records `draft_prefix_us`, the cumulative elapsed time at each sampled candidate. A threshold that retains K tokens normally executes K+1 draft steps because the rejected candidate must first be generated. At the draft limit it executes only K steps. The TPOT model uses this observed prefix cost plus the measured draft setup/finish residual; DFlash retains its measured whole-block draft cost. Online MTP stops at the configured threshold on sampled and unsampled rounds alike. It does not generate extra candidates for observation. Candidates requiring unseen routes, acceptance, or draft steps remain unsupported. MTP catch-up performed during verification stays in the measured verification residual. Profiles include the draft type and maximum length, so MTP and DFlash profiles cannot be mixed.
+MTP 通过 `draft_prefix_us` 记录生成到各候选 token 时的累计耗时。阈值保留 K 个 token 时，通常已经执行了 K+1 个草稿步骤，因为必须先生成下一个候选才能判断是否拒绝；达到草稿长度上限时，只执行 K 步。TPOT 模型使用这一实测前缀耗时，再加上实测的草稿准备与结束残余耗时；DFlash 则使用实测的整个草稿块耗时。在线 MTP 在采样轮和非采样轮都按配置的阈值停止，不会为了采集额外生成候选。需要未观测路由、接受结果或草稿步骤的配置仍然不受支持。验证期间执行的 MTP 状态补齐（catch-up）保留在实测验证残余耗时中。成本文件包含草稿类型和最大长度，因此 MTP 与 DFlash 的成本文件不能混用。
 
-After collection, the tool closes its server and automatically searches the saved measurements using the CPU. It writes `search.json`, includes the recommendation in `summary.json` and `session.json`, and reports collection time, search time, and total time. The default backend is `llama-moe-autotune` beside the supplied server executable; `--tool` overrides its path. The executable is checked before loading models. `calibrate` remains an alias for the same complete workflow.
+启动脚本把服务端控制器根据实测得到的推荐配置保存到 `session.json`。停止服务后，工具将服务端初始校准阶段的预测排名复制到 `search.json`，不会再重复回放一次搜索。预测排名第一的配置可能与实测选出的配置不同。`calibrate` 仍然是这一完整流程的别名。
 
-`--cost-rounds 0` disables directed cost samples. A compatible `--profile` also skips them. Missing measurements remain missing; the collector does not fabricate service costs. The profile identity covers model/executable/shared-library file identities, device, CPU affinity and threads, context size, prompt-length bucket, expert shapes, and slots. Use one writer per profile.
+`--cost-rounds 0` 关闭定向成本采样。提供兼容的 `--profile` 也会跳过这些采样。缺失的测量值仍然视为缺失，采集器不会编造执行成本。成本文件的兼容性标识涵盖模型、可执行文件和共享库的文件标识、设备、CPU 亲和性与线程数、上下文大小、prompt 长度分桶、专家形状和槽位数。同一个成本文件只能由一个进程写入。
 
-The command prints the observed confidence vectors, accepted/retained lengths, copies, CPU assignments, GPU and CPU/GPU service cells, sample counts, wall times, and recommendation. EOS is respected unless `--ignore-eos` is explicitly used for a fixed-length experiment. If the response supplies too few observations for search, tuning fails with a data-coverage error and retains the collected files.
+命令会打印观测到的置信度向量、接受长度与保留长度、拷贝次数、CPU 分配情况、GPU 与 CPU/GPU 联合执行成本表、样本数、实际耗时和推荐配置。默认尊重 EOS；只有固定输出长度的实验才需要显式指定 `--ignore-eos`。如果输出提供的观测不足以支持搜索，调优会报数据覆盖不足的错误，并保留已采集的文件。
 
-## Collect during requests, tune between requests
+## 请求中采集，请求结束后调优
 
-The native `llama-server` collector samples every 20 committed output tokens. After a complete response has been queued for delivery, it searches once and retains the chosen configuration for the next request. The current request never changes configuration. Python is optional; it only supplies native environment settings. Use `--spec-type draft-mtp` and the same model options as above to serve MTP with this lifecycle.
+`llama-server` 内置采集器默认每隔 20 个已提交的输出 token 采集一次执行耗时。完整响应进入发送队列后，控制器才初始化候选分支、记录一次初筛或复测结果，或继续探索已初筛的分支。配置变化只对下一次请求生效。比较完成后，后续请求复用实测选出的配置。Python 不是在线采集的必需组件；它负责配置服务端参数，并在独立调优模式下驱动初筛、复测和可选预热请求。MTP 使用 `--spec-type draft-mtp`，模型参数与前文相同。
 
 ```sh
 python3 scripts/moe_adaptive.py serve \
@@ -55,21 +67,23 @@ python3 scripts/moe_adaptive.py serve \
     --sample-tokens 20
 ```
 
-The first drafted Decode is a bootstrap sample. The collector then samples the first drafted iteration beginning at or beyond 20, 40, 60, ... committed Decode output tokens. It counts `accepted + 1`, excludes prefill and discarded draft tokens, and never splits an iteration to hit a boundary. If one iteration advances the counter from 18 to 24, the next iteration is sampled. Ordinary Decode steps at the output tail advance the counter but have no invented draft record. `--sample-tokens 1` samples every drafted iteration. Standalone `tune` still samples every iteration.
+第一次带草稿的 Decode 会采集详细样本。此后，当已提交的 Decode 输出 token 数达到或跨过 20、40、60 等边界时，采集下一次开始的带草稿轮次。计数使用 `accepted + 1`，不包含 prefill 和被丢弃的草稿 token，也不会为精确对齐采样边界而拆分轮次。例如一轮把计数从 18 推进到 24，则下一轮采样。输出尾部的普通 Decode 步骤会推进计数，但不会生成不存在的草稿记录。`--sample-tokens 1` 表示每个带草稿的轮次都采集详细样本。独立校准阶段采集定向成本样本及周期性的完整样本，之后的候选实测阶段使用在线模式的 token 采样间隔。
 
-A sampled iteration records confidences, acceptance, layer routes, cache state, copies, and GPU/CPU service times. Other iterations skip these observations. No search or configuration application happens during generation. At request end the controller searches the rolling window, by default the last 32 collected samples. It considers at most 64 combinations of prediction width, truncation threshold, and CPU cap. GPU cache capacity stays fixed. The selected values become active together at the first Decode of the next request. A queued request may wait for the preceding request's search; search time is reported separately from Decode TPOT.
+每一轮都会记录精简的草稿和专家路由信息，以便回放缓存状态演化。默认每隔 20 个已提交输出 token，再额外记录一轮完整缓存快照和 GPU/CPU 执行耗时。中间轮次只读取已完成的主机侧路由状态，不额外添加设备同步、GPU 计时事件或逐层主机计时。整数路由数组和缓存数组直接序列化到复用的缓冲区，逐层快照也复用主机缓冲区，JSONL 格式和连续路由覆盖保持一致。生成过程中不搜索，也不应用新配置。需要生成新的候选列表时，请求结束后的搜索使用本次请求所有可用的已记录轮次，最多考虑预测宽度、截断阈值和 CPU 专家上限的 64 种组合。GPU 缓存容量保持固定。选出的参数在下一次请求第一次 Decode 时一起生效。排队中的请求可能需要等待前一个请求完成搜索，因此搜索耗时与 Decode TPOT 分开报告。
 
-The search requires at least eight usable samples and sufficient measured service costs. Both full and threshold-truncated observations are retained; final batches shortened only by the output budget are excluded from search. A candidate is supported only if its entire requested prefix was verified in every sample in the window. Missing acceptance labels or routes are never invented, and threshold-selected full samples are not used alone. Less aggressive truncation may therefore be unsupported after truncated observations. Without enough coverage, the existing configuration is retained and the reason is logged. Canceled requests do not trigger search.
+搜索至少需要 8 个可用样本，以及足够的实测执行成本。完整草稿和按阈值截断的草稿观测都会保留；仅因输出预算而缩短的最后一个批次不参与搜索。只有某个候选所需的完整前缀在每个保留样本中都已验证，该候选才受支持。不会补造缺失的接受标签或路由，也不会只挑选经过阈值筛选后恰好保留完整草稿的样本。因此，采集截断后的轨迹后，更宽松的截断配置可能缺少足够数据支持。数据覆盖不足时保留现有配置，并记录原因。取消的请求不会触发搜索。
 
-`npred`, `threshold`, and `cpu-cap` are starting values. `--observe-only`, or `LLAMA_MOE_AUTOTUNE_ADAPT=0`, disables request-end tuning while retaining collection. A compatible standalone profile can supply CPU and short-batch service costs that the current online configuration does not execute. Online mode never inserts calibration probes or forces longer verification. Cost profiles are checked against model/runtime/hardware identity, context, and CPU affinity.
+`npred`、`threshold` 和 `cpu-cap` 是初始配置。使用 `--observe-only` 或设置 `LLAMA_MOE_AUTOTUNE_ADAPT=0` 可以关闭请求结束后的调优，同时保留精简路由采集和周期性执行计时。兼容的独立校准成本文件可以补充当前在线配置不会执行的 CPU 路径和短验证批次成本。在线模式不会插入校准探测，也不会强制使用更长的验证批次。加载成本文件时会检查模型、运行时、硬件标识、上下文和 CPU 亲和性。
 
-Each new request resets the token counter and workload window. Service costs may be reused. Requests with nonzero temperature are rejected; the server remains available. Reports and profiles are saved every `--window` collected samples and at request completion.
+每个新请求都会重置 token 计数和工作负载历史。MTP 还会在 prefill 从位置零开始时清空上次保留的 hidden-state 行，避免新序列继承上一个请求的 MTP 输入。执行成本可以复用。温度不为零的请求会被拒绝，但服务仍可继续处理其他请求。每采集 `--window` 个样本，以及请求结束时，都会保存报告和成本文件。该参数只控制报告频率，不改变搜索使用的工作负载范围。
 
-`telemetry.jsonl` contains at most one `recommendation` per completed online request, with `previous_config`, `next_config`, `applies_to=next_request`, and search time. `request` records show the configuration used by each request. `request_end` reports include `output_tokens`, `sampled_rounds`, `sample_tokens`, `search_ms`, and `controller_ms`. `output_tokens_before` and `next_sample_tokens` make the collection schedule auditable. Expert frequencies count sampled steps only. `sampled_round_tpot_ms` describes sampled steps, not end-to-end TPOT; use the server's total Decode time divided by committed Decode output tokens for that.
+每个完成的在线请求在 `telemetry.jsonl` 中最多产生一条 `recommendation`，包含 `previous_config`、`next_config`、`applies_to=next_request` 和搜索耗时。`request` 记录本次请求实际使用的配置。`request_end` 报告包含 `output_tokens`、`sampled_rounds`、`traced_rounds`、`sample_tokens`、`search_ms` 和 `controller_ms`。其中 `sampled_rounds` 统计完整计时样本，`traced_rounds` 还包括只记录路由的轮次。通过 `output_tokens_before` 和 `next_sample_tokens` 可以核对采样时机。专家频次按已记录轨迹的轮次统计。`sampled_round_tpot_ms` 只反映被详细采样的步骤，不是端到端 TPOT；后者应使用服务端总 Decode 耗时除以已提交的 Decode 输出 token 数。
 
-## Reuse saved observations without collecting again
+已保留的候选不会因为后续轨迹无法回放其较长前缀而被直接丢弃。评分使用请求结束后搜索之前的 Decode 实际耗时，除以 Decode 输出 token 数。实测要求至少 64 个 Decode 输出 token（加上 prefill 产生的第一个 token，共至少生成 65 个 token）、完全相同的 prompt token 序列，以及同一阶段相同的输出长度。复测长度可以不同于初筛长度，但二者的分数不会混合平均。prompt 变化会清空候选列表；同一阶段的输出长度变化会清空全部分数和分支误差估计。预热长度变化不会重置评分。取消的请求不计入比较。在线模式不会额外发起请求，也不会改变用户的输出上限，因此 prompt 持续变化时，可能始终无法完成候选比较。`trial_role` 和 `next_trial_role` 用于区分 `measurement`（初筛）、`confirmation`（复测）和可选的 `warmup`（预热）；`completed_trials`、`trial_budget`、`branch_errors` 和 `candidate_frontier` 展示比较进度。每个候选报告 `screening_tpot_ms`，完成复测或单阶段直接选优后还会报告 `measured_tpot_ms`。
 
-Standalone `tune` already performs search. To explicitly tune from data previously collected online, use the same tool's `search` entry:
+## 使用已有数据搜索，无需重新采集
+
+独立模式 `tune` 已包含搜索。如果需要显式利用之前在线采集的数据调优，可以使用同一个工具的 `search` 子命令：
 
 ```sh
 python3 scripts/moe_adaptive.py search \
@@ -78,28 +92,38 @@ python3 scripts/moe_adaptive.py search \
     --output /path/to/new-search.json
 ```
 
-This reuses the same search backend without loading models or controlling an inference server. `--request N` selects one request; the default is the last request. Search needs at least eight untruncated rounds with per-layer records plus a completed cost snapshot. It uses up to the most recent observation window, by default 32 samples. This offline trace reader still requires full-draft references. Request-end online search can also use partial records, but only evaluates prefixes with observed routes and acceptance in every window sample.
+该模式复用相同的搜索后端，不加载模型，也不控制推理服务。`--request N` 指定使用哪次请求的数据，默认使用最后一次请求。搜索至少需要 8 个包含逐层记录的可用轮次，以及完整的成本快照，并使用该请求全部可用的工作负载。读取历史轨迹的搜索和请求结束后的搜索都接受截断草稿，但只评估在每个保留轮次中都具有路由和接受结果的前缀。被 EOS 或停止字符串截短的最后一个批次不参与搜索。
 
-Search evaluates `{0,8,16,24} x {0,0.4,0.6,0.8} x {0,2,4,8}` for prediction width, truncation threshold, and CPU cap. It ranks only candidates supported by the recorded data, prints the recommendation and search time, and writes the full ranking to the result JSON. The recommendation is not applied to any process. An explicit inference launch is required to use it.
+保留的工作负载最多为 2048 轮，样本占用最多 128 MiB。达到任一限制时，在线采集保留当前配置并报告 `workload_limit_exceeded`，不会悄悄截断历史后继续调优。读取历史轨迹时，过大的请求会直接报错。请求结束后的搜索完成后，保留的样本会被释放。生成结束后，四种预测宽度最多使用四个 CPU 线程并行评估，结果顺序保持确定。
 
-For candidate prefix K, the estimated committed tokens are `1 + min(observed_full_acceptance, K)`. Each layer simulation uses observed cache owners, LFU scores, prefetch eligibility, predicted votes, and actual IDs to estimate CPU assignments and deduplicated copies. Recent observations receive exponentially decaying weight. Predicted times combine measured GPU/joint service, a verification residual, effective copy service, and observed draft time. Missing interior batch sizes can be interpolated between measured endpoints; unobserved endpoints are not extrapolated. CPU assignment cells without sufficient measurements use measured per-assignment cost and a measured protocol residual, and estimated lookups are reported.
+搜索空间为 `{0,8,16,24} x {0,0.4,0.6,0.8} x {0,2,4,8}`，依次对应预测宽度、截断阈值和 CPU 专家上限。只对已记录数据能够支持的候选进行排名，打印推荐配置与搜索耗时，并将完整排名写入结果 JSON。此处的显式搜索不会把推荐配置应用到任何进程，需要在启动推理时自行指定。
 
-This is a fast one-round counterfactual from the observed cache, not a separate long-term cache trajectory for every candidate. Overlap is approximated from preceding-layer service and the verification residual. Changed round boundaries can change future routes and acceptance. Therefore a recommendation is an estimate to validate, not a guarantee of the optimal configuration.
+对于候选保留前缀长度 K，预计提交的 token 数为 `1 + min(observed_acceptance, K)`。每个候选维护独立的缓存槽位状态和 LFU 计数。回放会保护预测专家、筛出交给 CPU 的专家、按路由顺序补齐按需 miss，并只对分配给 GPU 的专家更新频次，与支持的运行时 LFU 策略一致。当前支持的策略不做频次衰减，尚不支持带衰减的 LFU 运行模式。TPOT 使用整个请求的预测总耗时除以预测提交 token 总数，每轮按实际贡献累加，不额外加权。不能只用接受率较高的尾部数据替代前面的工作负载。
 
-The runner builds a common width-24 predictor graph. `npred` selects the per-position prefix used by the cache manager; zero disables predicted copies but retains predictor computation. CPU cap zero similarly retains the hybrid graph. These settings are not an all-optimizations-disabled baseline.
+只有上一轮候选保留了实测接受前缀，且下一轮记录的位置匹配时，缓存状态才会在相邻记录之间延续。遇到缺失轮次、请求边界或语义起始位置变化时，回放重新以之后的实测快照为起点。`cache_blocks` 和 `cache_transitions` 分别报告各候选的连续回放片段数和状态延续次数。旧的稀疏轨迹在缺失轮次处仍然需要重新锚定；新的在线轨迹保留了中间轮次的路由，因此周期性计时不会再导致访问轨迹出现空洞。历史轨迹读取器会重建缓存状态，并与后续完整快照核对槽位中的专家、频次和预取可用状态；还会逐层核对预测的按需拷贝数、预取拷贝数和 CPU 分配，不一致时直接报错。预测仍然假设改变 CPU 放置不会改变已记录的路由和接受结果；如果数值结果改变，就需要重新观测。
 
-## Files and timing units
+预测耗时由实测 GPU 或 CPU/GPU 联合执行耗时、有效拷贝耗时、观测到的草稿耗时，以及剩余验证耗时组成。剩余验证耗时定义为 `R = verify_us - sum(gate_us + service_us)`。样本按验证批次大小 B 和相同形状连续执行的阶段 S 分组，阶段分别为第一次、第二次、第三次及后续调用。纯 GPU 样本提供 `R_GPU[B,S]`，包含 CPU 工作的样本提供 `R_CPU[B,S]`。候选没有 CPU 分配时使用 `R_GPU[B,S]`，存在 CPU 分配时使用 `R_CPU[B,S]`；两个值都对应整次验证。参与 CPU 计算的层数作为校准诊断数据输出，不用于乘算残余耗时，因为逐层 CPU 工作量已包含在联合执行估计中。如果再按活跃层数比例缩放整次验证的残余差值，可能把负调整量放大到实测范围之外，错误地抵消残余成本。报告的调整量为 `R_CPU[B,S] - R_GPU[B,S]`；CPU 执行会改变实测耗时的划分，因此该差值可能为负。
 
-- `telemetry.jsonl`: observed values, sampled layer snapshots, cost snapshots, and expert frequencies. Online adaptation also writes a request-end recommendation.
-- `costs.json`: reusable measured service profile with sample counts, excluding workload acceptance/frequency history.
-- `session.json`: standalone startup/load, request, prefill, decode including collection, shutdown, collection total, search, and overall elapsed seconds, plus the recommended parameters. Search wall time includes backend startup and file loading; search compute is also reported separately.
-- `manifest.json`, `response.json`, `summary.json`: launch configuration, generated output, and collection summary.
-- `search.json` (or the explicit search output path): candidate estimates, recommendation, search time, and file-loading-plus-search time.
+候选的执行阶段根据其自身验证长度推演，不直接沿用实测配置的阶段。`execution_phase` 用 0、1、2 记录观测阶段，打印的 `shape_run=3` 包含第三次及之后所有连续调用。这是经过校准的形状相关成本近似，不是对每个 CUDA graph 状态的直接观测。其他图属性变化和上下文增长仍会带来估计误差。残余成本学习包含预取轮次，因为这些轮次的 gate 计时已包含暴露的传输等待。估计预取重叠时使用稳定阶段的 GPU 残余成本，不使用形状切换开销。
 
-`cost_probe_ms` is the execution time of directed calibration rounds, not their incremental slowdown. In online mode it is always zero. `controller_ms` accounts for observation and previous reporting work; current report serialization appears in the next report. Server wall time is the end-to-end authority. Draft/verify observations are per round; obtain ms/token by dividing total time by total committed tokens, not by averaging per-round ratios.
+缺失的中间验证批次大小，可以在同一阶段的已测端点之间插值；不会对未测端点做外推。缺少足够测量的 CPU 分配组合，使用实测的单次分配成本和协议残余开销估算，并报告使用估计值的查询次数。含 CPU 工作的候选还必须具有残余成本校准数据，缺失 CPU 成本不会按零处理。新的预热成本文件使用版本 4。在线采集拒绝旧版成本文件，需要重新执行独立调优以补齐阶段覆盖。历史轨迹搜索仍可按旧版未区分阶段的成本表读取旧文件，但无法从中恢复缺失的阶段校准数据。
+
+计算与传输的重叠仍根据前一层执行耗时和纯 GPU 稳定阶段的验证残余成本近似估计。旧轨迹中的缺失轮次，以及候选导致的轮次边界变化，仍然使部分候选无法精确恢复长期状态演化。跨阈值回放只用于提出各分支的初始候选；继续探索某个分支时，只使用该分支自身的阈值，最终选择依据条件受控的实测结果。不重建未观测到的轨迹，也不保证推荐配置一定最优。输出单独报告 `cpu_residual_adjustment_ms_per_token`，便于检查该项对排名的影响。
+
+启动脚本统一构建宽度为 24 的预测图。`npred` 选择缓存管理器实际使用的每个位置的预测前缀宽度；设为零会关闭预测拷贝，但保留预测计算。CPU 专家上限为零也仍然保留混合执行图。因此，三个参数都设为零的配置，不等于关闭全部优化路径的基线。
+
+## 输出文件与计时口径
+
+- `telemetry.jsonl`：完整计时与快照记录（`round`）、中间轮次的精简记录（`route`）、成本快照和专家频次。在线调优还会写入请求结束后的推荐配置。
+- `costs.json`：可复用的实测执行成本及样本数，不包含工作负载的接受率或频次历史。
+- `session.json`：启动与加载、校准请求、候选比较、退出和总耗时，单位为秒，同时保存实测推荐配置。`native_search_total` 汇总所有服务端内置搜索耗时；`search_compute` 只对应初次搜索。服务端搜索耗时已包含在请求或候选比较的实际耗时中。兼容保留的 `search` 字段记录已有预测排名的导出耗时，不表示又搜索了一次。`total` 从启动服务开始计时，到排名导出结束，不包含命令行前期准备和最后报告的生成；完整命令耗时应使用外部计时。
+- `manifest.json`、`response.json`、`summary.json`：分别保存启动配置、生成输出和采集摘要。
+- `search.json`：`tune` 导出的服务端初始候选预测排名和预测推荐配置。显式执行 `search` 时，则把历史轨迹搜索结果写入指定路径，并报告纯计算耗时和文件加载加搜索的耗时。
+
+`cost_warmup_ms` 和 `cost_probe_ms` 分别记录不参与成本学习的预热轮次、参与成本学习的校准轮次的实际执行耗时，不表示它们相对于普通推理额外增加了多少耗时。在线模式下这两项始终为零。`controller_ms` 统计采集和此前报告处理的耗时，当前报告的序列化耗时在下一份报告中体现。服务端 Decode 计时包含生成期间的采集和控制器开销，但不包含请求结束后的搜索。服务端先发送完成响应，再执行搜索，因此搜索可能延迟下一次请求。报告在线吞吐时，应覆盖直到搜索结束的完整请求周期；不要把 `controller_ms` 再次加到 Decode 耗时上。草稿与验证观测按轮次记录，换算 ms/token 时，应使用总耗时除以总提交 token 数，不能直接平均各轮的耗时/token 比值。
 
 ```sh
 python3 scripts/moe_adaptive.py report /path/to/new-observation --summary-only
 ```
 
-Native controls use the `LLAMA_MOE_AUTOTUNE_` prefix: required `OUTPUT`; optional `PROFILE`, `PROFILE_KEY`, `WINDOW`, `SAMPLE_TOKENS`, `ADAPT`, `COST_ROUNDS`, `MAX_PRED`, `DETAIL`, and the initial online configuration `NPRED`, `THRESHOLD`, `CPU_CAP`. The runner forces online `COST_ROUNDS=0`, and the native collector independently disables online probes. Do not combine this initial path with an acceptance predictor, expert substitution, a different CPU/cache policy, or checkpoint replay. Recurrent models require at least one rollback snapshot per possible draft token.
+原生环境变量统一使用 `LLAMA_MOE_AUTOTUNE_` 前缀。其中 `OUTPUT` 必填；可选项包括 `PROFILE`、`PROFILE_KEY`、`WINDOW`、`SAMPLE_TOKENS`、`ADAPT`、`COST_ROUNDS`、`TRIAL_BUDGET`、`WARMUP_REQUESTS`、`CONFIRM_REQUESTS`、`MAX_PRED`、`DETAIL`，以及在线初始配置 `NPRED`、`THRESHOLD`、`CPU_CAP`。启动脚本在在线模式下强制设置 `COST_ROUNDS=0`，原生采集器也会独立禁止在线校准探测。当前实现不能与接受率预测器、专家替代、其他 CPU 或缓存策略、checkpoint 回放混用。循环结构模型至少需要为每个可能的草稿 token 配备一个回滚快照。

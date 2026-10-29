@@ -3208,14 +3208,14 @@ bool ggml_backend_sched_add_moe_slot_cache(ggml_backend_sched_t sched, const ggm
     return ggml_moe_runtime_add_moe_slot_cache(sched->moe, cache, n_expert_used);
 }
 
-bool ggml_backend_sched_moe_tune_begin(ggml_backend_sched_t sched, int width, int cpu_cap, bool profile, bool fixed) {
-    ggml_backend_sched_synchronize(sched);
-    return ggml_moe_runtime_tune_begin(sched->moe, width, cpu_cap, profile, fixed);
+bool ggml_backend_sched_moe_tune_begin(ggml_backend_sched_t sched, int width, int cpu_cap, bool profile, bool fixed, bool trace_only) {
+    if (!trace_only) ggml_backend_sched_synchronize(sched);
+    return ggml_moe_runtime_tune_begin(sched->moe, width, cpu_cap, profile, fixed, trace_only);
 }
 
-int ggml_backend_sched_moe_tune_end(ggml_backend_sched_t sched, ggml_moe_tune_layer * layers, int capacity) {
-    ggml_backend_sched_synchronize(sched);
-    return ggml_moe_runtime_tune_end(sched->moe, layers, capacity);
+int ggml_backend_sched_moe_tune_end(ggml_backend_sched_t sched, ggml_moe_tune_layer * layers, int capacity, bool trace_only) {
+    if (!trace_only) ggml_backend_sched_synchronize(sched);
+    return ggml_moe_runtime_tune_end(sched->moe, layers, capacity, trace_only);
 }
 void ggml_backend_sched_set_moe_gate_seq(ggml_backend_sched_t sched, ggml_tensor * seq) {
     ggml_moe_runtime_set_moe_gate_seq(sched->moe, seq);
@@ -3229,4 +3229,8 @@ const ggml_moe_slot_cache * ggml_backend_sched_find_moe_slot_cache(ggml_backend_
 }
 const ggml_moe_slot_cache * ggml_backend_sched_find_moe_head_predictor(ggml_backend_sched_t sched, int source_layer) {
     return sched ? ggml_moe_runtime_find_moe_head_predictor(sched->moe, source_layer) : nullptr;
+}
+
+bool ggml_backend_sched_moe_tune_cache(ggml_backend_sched_t sched, bool capture) {
+    return ggml_moe_runtime_tune_cache(sched->moe, capture);
 }

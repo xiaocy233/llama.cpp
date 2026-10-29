@@ -26,14 +26,19 @@
 // llama_context
 //
 
-bool llama_moe_tune_begin(llama_context * ctx, int width, int cpu_cap, bool profile, bool fixed) {
+bool llama_moe_tune_cache(llama_context * ctx, bool capture) {
     ctx->synchronize();
-    return ggml_backend_sched_moe_tune_begin(ctx->get_sched(), width, cpu_cap, profile, fixed);
+    return ggml_backend_sched_moe_tune_cache(ctx->get_sched(), capture);
 }
 
-int llama_moe_tune_end(llama_context * ctx, ggml_moe_tune_layer * layers, int capacity) {
-    ctx->synchronize();
-    return ggml_backend_sched_moe_tune_end(ctx->get_sched(), layers, capacity);
+bool llama_moe_tune_begin(llama_context * ctx, int width, int cpu_cap, bool profile, bool fixed, bool trace_only) {
+    if (!trace_only) ctx->synchronize();
+    return ggml_backend_sched_moe_tune_begin(ctx->get_sched(), width, cpu_cap, profile, fixed, trace_only);
+}
+
+int llama_moe_tune_end(llama_context * ctx, ggml_moe_tune_layer * layers, int capacity, bool trace_only) {
+    if (!trace_only) ctx->synchronize();
+    return ggml_backend_sched_moe_tune_end(ctx->get_sched(), layers, capacity, trace_only);
 }
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {

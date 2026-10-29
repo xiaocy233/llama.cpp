@@ -17,8 +17,9 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
-LLAMA_API bool llama_moe_tune_begin(llama_context * ctx, int width, int cpu_cap, bool profile, bool fixed);
-LLAMA_API int llama_moe_tune_end(llama_context * ctx, ggml_moe_tune_layer * layers, int capacity);
+LLAMA_API bool llama_moe_tune_cache(llama_context * ctx, bool capture);
+LLAMA_API bool llama_moe_tune_begin(llama_context * ctx, int width, int cpu_cap, bool profile, bool fixed, bool trace_only);
+LLAMA_API int llama_moe_tune_end(llama_context * ctx, ggml_moe_tune_layer * layers, int capacity, bool trace_only);
 
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);

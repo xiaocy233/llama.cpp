@@ -1374,7 +1374,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // models may route a different number of experts per layer, so validate the maximum
     uint32_t n_expert_used_max = hparams.n_expert_used_max();
 
-    GGML_ASSERT(hparams.n_expert <= LLAMA_MAX_EXPERTS);
+    if (hparams.n_expert > INT32_MAX) {
+        throw std::runtime_error("expert count exceeds the int32 expert ID range");
+    }
     GGML_ASSERT(n_expert_used_max <= hparams.n_expert);
     if (hparams.n_expert > 0) {
         GGML_ASSERT(n_expert_used_max > 0);

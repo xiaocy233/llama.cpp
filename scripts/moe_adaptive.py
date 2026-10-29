@@ -92,9 +92,12 @@ def launch(args, port):
                 "LLAMA_MOE_AUTOTUNE_PROFILE": str(profile),
                 "LLAMA_MOE_AUTOTUNE_PROFILE_KEY": digest(key),
                 "LLAMA_MOE_AUTOTUNE_WINDOW": str(args.window),
-                "LLAMA_MOE_AUTOTUNE_SAMPLE_TOKENS": str(getattr(args, "sample_tokens", 20) if args.action == "serve" else 1),
-                "LLAMA_MOE_AUTOTUNE_ADAPT": str(int(args.action == "serve" and not getattr(args, "observe_only", False))),
+                "LLAMA_MOE_AUTOTUNE_SAMPLE_TOKENS": str(getattr(args, "sample_tokens", 20)),
+                "LLAMA_MOE_AUTOTUNE_ADAPT": str(int((args.action == "serve" and not getattr(args, "observe_only", False)) or getattr(args, "validate_candidates", False))),
                 "LLAMA_MOE_AUTOTUNE_COST_ROUNDS": str(0 if args.action == "serve" else args.cost_rounds),
+                "LLAMA_MOE_AUTOTUNE_TRIAL_BUDGET": str(getattr(args, "trial_budget", 24)),
+                "LLAMA_MOE_AUTOTUNE_WARMUP_REQUESTS": str(int(getattr(args, "warmup_tokens", 0) > 0)),
+                "LLAMA_MOE_AUTOTUNE_CONFIRM_REQUESTS": str(int(getattr(args, "confirm_tokens", 1024) > getattr(args, "tokens", 1024))),
                 "LLAMA_MOE_AUTOTUNE_NPRED": str(args.npred),
                 "LLAMA_MOE_AUTOTUNE_THRESHOLD": str(args.threshold),
                 "LLAMA_MOE_AUTOTUNE_CPU_CAP": str(args.cpu_cap),
@@ -114,10 +117,14 @@ def launch(args, port):
     return command, environment(env), {"identity": key, "command": command, "environment": env}
 
 
-def read_events(path):
+def read_events(path, summaries_only=False):
     events = []
     with path.open() as file:
         for line in file:
+            if not line.endswith("\n"):
+                break
+            if summaries_only and line.startswith(('{"event":"round",', '{"event":"route",')):
+                continue
             if line.strip():
                 events.append(json.loads(line))
     return events
@@ -129,7 +136,7 @@ def search(tool, trace, output, request=None):
         command.append(str(request))
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
     result = json.loads(output.read_text())
-    print("Recommended:", json.dumps(result["selected"]),
+    print("Predicted recommendation:", json.dumps(result["selected"]),
           f"supported candidates={result['supported_candidates']}")
     print(f"Search compute={result['search_ms']:.3f} ms; load and search={result['load_and_search_ms']:.3f} ms")
     print(f"Full ranking: {output}")
@@ -139,22 +146,25 @@ def search(tool, trace, output, request=None):
 def report(root, print_rounds=True):
     events = read_events(root / "telemetry.jsonl")
     rounds = [r for r in events if r["event"] == "round"]
+    routes = [r for r in events if r["event"] == "route"]
     final = next((r for r in reversed(events) if r["event"] in ("final", "request_end", "window")), None)
     result_path = root / "search.json"
-    recommendation = json.loads(result_path.read_text()) if result_path.exists() else None
+    numerical_search = json.loads(result_path.read_text()) if result_path.exists() else None
+    recommendation = next((r for r in reversed(events) if r["event"] == "recommendation"), numerical_search)
     if not final:
         raise ValueError("No completed calibration report; inspect server.log")
     requests = {r["request"]: r for r in events if r["event"] in ("final", "request_end", "window")}
-    summary = {"round_count": sum(r["rounds"] for r in requests.values()), "sampled_round_count": len(rounds),
-               "full_rounds": sum(r["full"] for r in rounds),
+    summary = {"round_count": sum(r["rounds"] for r in requests.values()), "sampled_round_count": len(rounds), "traced_round_count": len(rounds) + len(routes),
+               "full_rounds": sum(r["full"] for r in rounds + routes),
                "cost_probe_rounds": sum(r["cost_probe"] for r in rounds),
-               "right_censored_rounds": sum(r["right_censored"] for r in rounds),
-               "final": final, "recommendation": recommendation,
+               "right_censored_rounds": sum(r["right_censored"] for r in rounds + routes),
+               "final": final, "recommendation": recommendation, "numerical_search": numerical_search,
                "online_recommendations": [e for e in events if e["event"] == "recommendation"]}
     if (root / "session.json").exists():
         summary["session"] = json.loads((root / "session.json").read_text())
     write_json(root / "summary.json", summary)
     print(f"\nObserved {summary['sampled_round_count']} of {summary['round_count']} decode rounds (times in ms):")
+    print(f"Cache replay records={summary['traced_round_count']}; service samples={summary['sampled_round_count']}")
     if print_rounds:
         for r in rounds:
             confidence = ",".join(f"{p:.5f}" for p in r["confidence"])
@@ -166,6 +176,15 @@ def report(root, print_rounds=True):
     for b, value in enumerate(final["costs"]["base"], 1):
         if value["samples"]:
             print(f"verify residual B={b}: {value['us']:.3f} us, samples={value['samples']}")
+    for b, value in enumerate(final["costs"].get("cpu_residual", []), 1):
+        if value["samples"]:
+            active = final["costs"]["cpu_layers"][b - 1]["us"]
+            print(f"CPU verify residual B={b}: {value['us']:.3f} us, samples={value['samples']}, active layers={active:.2f}")
+    for phase, table in enumerate(final["costs"].get("phases", []), 1):
+        for b, value in enumerate(table["base"], 1):
+            cpu = table["cpu_residual"][b - 1]
+            if value["samples"] or cpu["samples"]:
+                print(f"Residual B={b} shape_run={phase}: GPU={value['us']:.3f} us n={value['samples']}, CPU={cpu['us']:.3f} us n={cpu['samples']}")
     for shape, costs in final["costs"]["shapes"].items():
         print(f"shape={shape}")
         for name in ("transfer", "issue", "cpu_per_assignment", "protocol"):
@@ -177,14 +196,15 @@ def report(root, print_rounds=True):
         for item in costs["joint"]:
             value = item["time"]
             print(f"  joint B={item['batch']} assignments={item['assignments']}: {value['us']:.3f} us, samples={value['samples']}")
-    print(f"\nCost probe rounds={summary['cost_probe_rounds']}, probe execution={final['cost_probe_ms']:.3f} ms")
+    print(f"\nCost probe rounds={summary['cost_probe_rounds']}, probe execution={sum(r['cost_probe_ms'] for r in requests.values()):.3f} ms")
+    print(f"Cost warmup rounds={sum(r.get('cost_warmup_rounds', 0) for r in requests.values())}, warmup execution={sum(r.get('cost_warmup_ms', 0) for r in requests.values()):.3f} ms")
     print(f"Controller={final['controller_ms']:.3f} ms; native collection elapsed={final['elapsed_ms']:.3f} ms")
     if "session" in summary:
         for name, value in summary["session"].get("elapsed_seconds", {}).items():
             print(f"{name}={value:.3f} s")
     if recommendation:
         print("Recommended:", json.dumps(recommendation["selected"]),
-              f"supported candidates={recommendation['supported_candidates']}")
+              "status=" + recommendation.get("status", "predicted"))
     print(f"Full values: {root / 'telemetry.jsonl'}")
     return summary
 
@@ -195,21 +215,26 @@ def run(args):
         setattr(args, name, getattr(args, name).resolve(strict=True))
     if args.draft_model:
         args.draft_model = args.draft_model.resolve(strict=True)
-    if args.spec_type == "draft-dflash" and (not args.draft_model or args.draft_max != 7):
-        raise ValueError("DFlash requires --draft-model and --draft-max 7")
+    if args.spec_type == "draft-dflash" and not args.draft_model:
+        raise ValueError("DFlash requires --draft-model")
     if not 1 <= args.draft_max <= 7:
         raise ValueError("Draft maximum must be between 1 and 7")
     if args.action != "serve":
         if not args.prompt:
             raise ValueError("tune requires --prompt")
-        args.tool = (args.tool or args.server.with_name("llama-moe-autotune")).resolve(strict=True)
-        if not args.tool.is_file() or not os.access(args.tool, os.X_OK):
-            raise ValueError("Search executable is not runnable; build llama-moe-autotune or supply --tool")
+    if args.tokens is None:
+        args.tokens = 1024 if args.spec_type == "draft-mtp" else 512
+    if args.warmup_tokens is None:
+        args.warmup_tokens = 256 if args.spec_type == "draft-mtp" else 0
+    if args.confirm_tokens is None:
+        args.confirm_tokens = max(1024, args.tokens)
     if not 0 <= args.npred <= 24 or not 0 <= args.threshold <= 1 or not 0 <= args.cpu_cap <= 8:
         raise ValueError("Invalid fixed inference configuration")
-    if args.tokens < 64 or args.tokens > 32768 or args.ctx < 512 or args.threads < 1:
+    if not 10 <= args.trial_budget <= 24 or (args.warmup_tokens != 0 and not 65 <= args.warmup_tokens <= 32768):
+        raise ValueError("Invalid candidate trial budget or warmup length")
+    if not args.tokens <= args.confirm_tokens <= 32768 or args.tokens < 65 or args.tokens > 32768 or args.ctx < 512 or args.threads < 1:
         raise ValueError("Invalid token/context/thread count")
-    if not 16 <= args.window <= 128 or not 0 <= args.cost_rounds <= 32 or not 64 <= args.slots <= 256:
+    if not 16 <= args.window <= 128 or not 0 <= args.cost_rounds <= 96 or args.slots < 1:
         raise ValueError("Invalid window, probe budget, or fixed slots")
     if args.action == "serve" and not 1 <= args.sample_tokens <= 10000:
         raise ValueError("Sample interval must be between 1 and 10000 output tokens")
@@ -224,14 +249,15 @@ def run(args):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
+    args.validate_candidates = args.action == "tune"
     command, env, manifest = launch(args, port)
     write_json(args.output / "manifest.json", manifest)
     if args.action == "serve":
-        print(f"Online {args.spec_type} (collect during generation; tune after each request): http://127.0.0.1:{port}", flush=True)
+        print(f"Online {args.spec_type} (collect during generation; compare candidates after requests): http://127.0.0.1:{port}", flush=True)
         print(f"Telemetry: {args.output / 'telemetry.jsonl'}", flush=True)
         os.execve(str(args.server), command, env)
     started = time.perf_counter()
-    session = {"status": "running", "elapsed_seconds": {}}
+    session = {"status": "running", "elapsed_seconds": {}, "candidate_trials": []}
     process = None
     try:
         with (args.output / "server.log").open("w") as log:
@@ -253,7 +279,7 @@ def run(args):
             if not args.raw_prompt:
                 prompt = http(port, "/apply-template", {"messages": [{"role": "user", "content": prompt}]})["prompt"]
             tokens = http(port, "/tokenize", {"content": prompt, "add_special": True})["tokens"]
-            if len(tokens) + args.tokens + 8 > args.ctx:
+            if len(tokens) + max(args.confirm_tokens, args.warmup_tokens) + args.draft_max + 1 > args.ctx:
                 raise ValueError("Prompt plus output exceeds context")
             session["input_tokens"] = len(tokens)
             session["requested_output_tokens"] = args.tokens
@@ -269,6 +295,32 @@ def run(args):
             session["elapsed_seconds"]["prefill"] = session["timings"].get("prompt_ms", 0) / 1000
             session["elapsed_seconds"]["decode_including_collection"] = session["timings"].get("predicted_ms", 0) / 1000
             session["actual_output_tokens"] = len(response.get("tokens", []))
+            comparison_start = time.perf_counter()
+            recommendation = None
+            for request_id in range(1, 2 * args.trial_budget + 2):
+                deadline = time.monotonic() + args.timeout
+                while True:
+                    events = read_events(args.output / "telemetry.jsonl", summaries_only=True)
+                    if any(e["event"] == "request_end" and e["request"] == request_id for e in events):
+                        break
+                    if process.poll() is not None or time.monotonic() > deadline:
+                        raise RuntimeError("Candidate comparison did not complete; inspect server.log")
+                    time.sleep(0.02)
+                recommendation = next((e for e in reversed(events) if e["event"] == "recommendation"), None)
+                if not recommendation or recommendation["status"] != "candidate_trials" or request_id == 2 * args.trial_budget + 1:
+                    break
+                trial_started = time.perf_counter()
+                trial_role = recommendation.get("next_trial_role", "measurement")
+                trial_request = dict(request, n_predict=args.warmup_tokens if trial_role == "warmup" else args.confirm_tokens if trial_role == "confirmation" else args.tokens)
+                trial_response = http(port, "/completion", trial_request, timeout=args.timeout)
+                write_json(args.output / f"candidate-response-{request_id}.json", trial_response)
+                session["candidate_trials"].append({"config": recommendation["next_config"], "role": trial_role,
+                    "requested_tokens": trial_request["n_predict"],
+                    "elapsed_seconds": time.perf_counter() - trial_started, "timings": trial_response.get("timings", {})})
+            session["elapsed_seconds"]["candidate_comparison"] = time.perf_counter() - comparison_start
+            session["native_recommendation"] = recommendation
+            session["recommended"] = recommendation["selected"] if recommendation and recommendation["status"] == "validated" else None
+            session["selection_status"] = recommendation["status"] if recommendation else "no_recommendation"
             session["status"] = "collected"
     except BaseException as error:
         session.update(status="failed", error=str(error))
@@ -293,10 +345,15 @@ def run(args):
         raise RuntimeError("Server shutdown failed; inspect server.log")
     search_started = time.perf_counter()
     try:
-        result = search(args.tool, args.output / "telemetry.jsonl", args.output / "search.json")
-        session["recommended"] = result["selected"]
+        result = next((dict(e) for e in events if e["event"] == "recommendation" and e["request"] == 1 and "ranking" in e), None)
+        if result is None:
+            raise ValueError("Insufficient observations for initial numerical search")
+        result["selected"] = result.get("predicted_selected")
+        write_json(args.output / "search.json", result)
+        session["elapsed_seconds"]["native_search_total"] = sum(e["search_ms"] for e in events if e["event"] == "recommendation") / 1000
+        print("Native recommendation:", json.dumps(session["recommended"]), session["selection_status"])
         session["elapsed_seconds"]["search_compute"] = result["search_ms"] / 1000
-        session["status"] = "complete"
+        session["status"] = "complete" if session["selection_status"] == "validated" else "incomplete"
     except BaseException as error:
         session.update(status="failed", error=str(error))
         raise
@@ -305,7 +362,7 @@ def run(args):
         session["elapsed_seconds"]["total"] = time.perf_counter() - started
         write_json(args.output / "session.json", session)
     report(args.output)
-    print("Standalone tuning complete. Observations and recommendation are saved in", args.output)
+    print(f"Standalone tuning {session['status']}. Observations and selection status are saved in", args.output)
 
 
 def main():
@@ -313,23 +370,26 @@ def main():
     sub = parser.add_subparsers(dest="action", required=True)
     for action in ("tune", "serve"):
         p = sub.add_parser(action, aliases=["calibrate"] if action == "tune" else [],
-                           help="Collect calibration data and search in one call" if action == "tune" else "Collect real requests and tune once after each completed response")
+                           help="Collect calibration data and search in one call" if action == "tune" else "Collect real requests and compare retained configurations after responses")
         p.set_defaults(action=action)
         p.add_argument("--server", type=Path, required=True)
         if action == "tune":
-            p.add_argument("--tool", type=Path, help="Search executable; defaults to llama-moe-autotune beside --server")
+            p.add_argument("--tool", type=Path, help="Compatibility option; tune uses the native server search")
         else:
             p.add_argument("--sample-tokens", type=int, default=20, help="Collect after each N output tokens; default 20, plus the first decode step")
             p.add_argument("--observe-only", action="store_true", help="Collect without selecting a configuration for the next request")
         p.add_argument("--model", type=Path, required=True)
         p.add_argument("--spec-type", choices=("draft-dflash", "draft-mtp"), default="draft-dflash")
-        p.add_argument("--draft-max", type=int, default=7, help="Fixed draft limit: 7 for DFlash, 1..7 for MTP")
+        p.add_argument("--draft-max", type=int, default=7, help="Draft limit per session: 1..7, also bounded by the draft model's capacity")
         p.add_argument("--draft-model", type=Path, help="Required for DFlash; MTP defaults to the heads embedded in --model")
         p.add_argument("--gpu", required=True)
         p.add_argument("--output", type=Path, required=True)
         p.add_argument("--profile", type=Path, help="Read/update a compatible cost profile; default OUTPUT/costs.json")
         p.add_argument("--prompt", type=Path)
-        p.add_argument("--tokens", type=int, default=256)
+        p.add_argument("--tokens", type=int, help="Initial collection and candidate output: default 1024 for MTP, 512 for DFlash")
+        p.add_argument("--confirm-tokens", type=int, help="Confirmation output length; defaults to max(1024, --tokens)")
+        p.add_argument("--warmup-tokens", type=int, help="Candidate warmup output; defaults to 256 for MTP, zero for DFlash")
+        p.add_argument("--trial-budget", type=int, default=24, help="Maximum screening and confirmation requests combined")
         p.add_argument("--ctx", type=int, default=8192)
         p.add_argument("--slots", type=int, default=64)
         p.add_argument("--cache-layers", type=int, default=4)
@@ -337,8 +397,8 @@ def main():
         p.add_argument("--npred", type=int, default=0, help="Initial online prediction prefix width")
         p.add_argument("--threshold", type=float, default=0, help="Initial online draft threshold")
         p.add_argument("--cpu-cap", type=int, default=0, help="Initial online CPU expert cap")
-        p.add_argument("--window", type=int, default=32, help="Collected samples per report and search window")
-        p.add_argument("--cost-rounds", type=int, default=16, help="Maximum short cost probes within generation; zero disables them")
+        p.add_argument("--window", type=int, default=32, help="Collected timing samples per report; search uses the whole request")
+        p.add_argument("--cost-rounds", type=int, default=48, help="Measured cost probes after one unmeasured warmup pass; zero disables both")
         p.add_argument("--timeout", type=int, default=600)
         p.add_argument("--port", type=int, default=8080 if action == "serve" else 0)
         p.add_argument("--raw-prompt", action="store_true")
