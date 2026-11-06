@@ -1242,59 +1242,6 @@ inline std::string llm_ffn_block_regex(int idx, const char * ffn_regex) {
     return string_format("blk\\.%d%s", idx, ffn_regex);
 }
 
-// upper bound on block indices when generating per-layer patterns before the model is loaded
-constexpr int LLAMA_MAX_BLOCK_INDEX = 512;
-
-// One pattern matching every block index from `first` upwards.
-//
-// The loader rebuilds a std::regex for each (tensor, override) pair, so both the number of overrides
-// and the size of each pattern cost load time. Enumerating every index either way is expensive -
-// measured 4.0 s as one override per block and 7.7 s as a single 496-branch alternation, against
-// 1.8 s for the ~24 overrides that --n-cpu-moe emits.
-//
-// So decompose ">= first" into digit ranges instead: a handful of branches, no upper bound needed.
-// For first = 16 this yields (16|1[7-9]|[2-9][0-9]|[0-9]{3,}).
-inline std::string llm_ffn_exps_blocks_from_regex(int first) {
-    if (first <= 0) {
-        return string_format("blk\\.[0-9]+%s", LLM_FFN_EXPS_REGEX);
-    }
-
-    const std::string n = std::to_string(first);
-    const size_t      d = n.size();
-
-    std::vector<std::string> alts;
-    alts.push_back(n);   // first itself
-
-    // same digit count, strictly greater: fix a prefix, raise one digit, wildcard the rest
-    for (size_t i = d; i-- > 0; ) {
-        if (n[i] == '9') {
-            continue;
-        }
-        std::string alt = n.substr(0, i);
-        // a leading digit cannot be 0, and n[0] != '0' already holds for a value >= 1
-        alt += string_format("[%c-9]", n[i] + 1);
-        alt += std::string(d - i - 1, 'x');
-        // replace the placeholders with digit classes
-        std::string expanded;
-        for (char c : alt) {
-            expanded += (c == 'x') ? std::string("[0-9]") : std::string(1, c);
-        }
-        alts.push_back(expanded);
-    }
-
-    // anything with more digits is necessarily larger
-    alts.push_back(string_format("[0-9]{%zu,}", d + 1));
-
-    std::string joined;
-    for (const auto & a : alts) {
-        if (!joined.empty()) {
-            joined += "|";
-        }
-        joined += a;
-    }
-    return string_format("blk\\.(%s)%s", joined.c_str(), LLM_FFN_EXPS_REGEX);
-}
-
 inline std::string llm_ffn_exps_block_regex(int idx) {
     return string_format("blk\\.%d%s", idx, LLM_FFN_EXPS_REGEX);
 }

@@ -2790,18 +2790,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-nclayers", "--n-cache-layers"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in VRAM, and the rest in the CPU\n"
+        "(MTP/NextN layers keep their normal device placement)\n"
         "(the mirror image of --n-cpu-moe, which keeps the *last* layers in VRAM)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            // the layer count is not known until the model is loaded, so match every plausible index
-            // above N. one alternation rather than one override per block: the loader rebuilds a
-            // regex per (tensor, override) pair, so the override count is what costs load time.
-            // keep strings alive and avoid leaking memory by storing them in a static vector
-            static std::list<std::string> buft_overrides;
-            buft_overrides.push_back(llm_ffn_exps_blocks_from_regex(value));
-            params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), ggml_backend_cpu_buffer_type()});
             params.n_cache_layers = value;
         }
     ).set_env("LLAMA_ARG_N_CACHE_LAYERS"));

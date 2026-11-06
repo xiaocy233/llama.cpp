@@ -2085,6 +2085,22 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
     }
+    // Apply the cache policy only to trunk experts. Explicit tensor overrides still take priority.
+    if (params.n_cache_layers >= 0 && tn.bid >= params.n_cache_layers && tn.bid < (int) hparams.n_layer()) {
+        switch (tn.tensor) {
+            case LLM_TENSOR_FFN_GATE_EXPS:
+            case LLM_TENSOR_FFN_UP_EXPS:
+            case LLM_TENSOR_FFN_DOWN_EXPS:
+            case LLM_TENSOR_FFN_GATE_UP_EXPS:
+            case LLM_TENSOR_FFN_GATE_CHEXPS:
+            case LLM_TENSOR_FFN_UP_CHEXPS:
+            case LLM_TENSOR_FFN_DOWN_CHEXPS:
+                flags |= llama_model_loader::TENSOR_MOE_CACHE;
+                break;
+            default:
+                break;
+        }
+    }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);

@@ -262,7 +262,9 @@ ggml_moe_runtime * ggml_moe_runtime_new(ggml_backend_t * backends, int n_backend
 }
 
 bool ggml_moe_runtime_active(const ggml_moe_runtime * sched) { return sched->n_moe_caches > 0; }
-bool ggml_moe_runtime_drain(const ggml_moe_runtime * sched) { return sched->moe_stats && sched->n_moe_caches > 0; }
+bool ggml_moe_runtime_drain(const ggml_moe_runtime * sched) {
+    return sched->n_moe_caches > 0 && (sched->moe_stats || !sched->moe_host_gate);
+}
 void ggml_moe_runtime_set_decode(ggml_moe_runtime * sched, bool decode) { sched->has_moe_gate = decode; }
 
 static const char * ggml_moe_runtime_host_ptr(

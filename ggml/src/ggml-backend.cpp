@@ -1976,6 +1976,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     };
     std::vector<moe_batch_plan> moe_batches;
 
+    ggml_moe_runtime_set_decode(sched->moe, sched->has_moe_gate);
+    // Finish cache updates before selecting ranges for bulk prefetch.
+    if (ggml_moe_runtime_active(sched->moe) && (!sched->has_moe_gate || !sched->prefetch_plan->entries.empty())) {
+        ggml_moe_runtime_quiesce(sched->moe);
+    }
+
     // ---- weight prefetch (ggml_backend_sched_set_weight_prefetch) ----
     // Use the allocation plan so that each copy starts within its allocated lifetime.
     //
@@ -2053,11 +2059,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prefetch_issue(n_issued);
     }
 
-    ggml_moe_runtime_set_decode(sched->moe, sched->has_moe_gate);
     if (ggml_moe_runtime_active(sched->moe)) {
-        if (!sched->has_moe_gate) {
-            ggml_moe_runtime_quiesce(sched->moe);
-        }
         ggml_moe_runtime_new_token(sched->moe);
     }
 
@@ -2429,7 +2431,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (drain_moe) {
-        // Preserve the synchronization controlled by GGML_SCHED_MOE_SLOT_STATS.
+        // Finish device gates before the caller queues output downloads.
+        // A pending download can block the uploads that release a gate.
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }

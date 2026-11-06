@@ -34,8 +34,7 @@ bool ggml_weight_prefetch_eligible(
     // classic Prefill: weight is src[0]; dual Prefill: compact host weight is src[3]
     const bool classic = (node->src[0] == input_cpy);
     const bool dual    = (node->src[3] == input_cpy && node->src[3] != NULL && node->src[4] != NULL);
-    // Cached banks need the actual routing IDs before any bulk copy.
-    if (!classic || dual) {
+    if (!classic && !dual) {
         return false;
     }
 

@@ -686,7 +686,8 @@ void llama_context::sched_reserve() {
 
     // Register the MoE expert slot caches. Has to happen before the first reserve: the remap node is
     // only emitted for tensors that have a registered cache, so the graph shape depends on this.
-    if (!model.moe_slot_layers.empty()) {
+    // MTP uses NextN layers, which are excluded from the trunk slot caches.
+    if (!model.moe_slot_layers.empty() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
         init_moe_slot_caches();
         for (const auto & c : moe_slot_caches) {
             if (!ggml_backend_sched_add_moe_slot_cache(sched.get(), &c, (int) model.hparams.n_expert_used(c.layer)) && c.n_initial > 0) {

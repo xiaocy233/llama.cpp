@@ -1273,6 +1273,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        if (!buft && (flags & TENSOR_MOE_CACHE)) {
+            buft = cache_disk ? llama_moe_cache_disk_buft() : select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+        }
+
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
