@@ -2725,6 +2725,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
+        {"--freetoken"},
+        "enable the FreeToken paper execution path (requires --cpu-moe and --moe-cache-mib)",
+        [](common_params & params) { params.freetoken = true; }
+    ));
+    add_opt(common_arg(
+        {"--freetoken-bandwidth"}, "PCIE,HOST",
+        "measured expert bandwidths in decimal GB/s; omitted values are profiled at startup",
+        [](common_params & params, const std::string & value) {
+            const auto fields = string_split<std::string>(value, ',');
+            if (fields.size() != 2) { throw std::invalid_argument("expected PCIE,HOST bandwidths"); }
+            size_t n0 = 0, n1 = 0;
+            const float bp = std::stof(fields[0], &n0);
+            const float bh = std::stof(fields[1], &n1);
+            if (n0 != fields[0].size() || n1 != fields[1].size() ||
+                !std::isfinite(bp) || !std::isfinite(bh) || bp <= 0 || bh <= 0) {
+                throw std::invalid_argument("bandwidths must be positive finite GB/s");
+            }
+            params.freetoken_pcie_gbps = bp;
+            params.freetoken_host_gbps = bh;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
         "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
         [](common_params & params, int value) {

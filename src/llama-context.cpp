@@ -391,6 +391,9 @@ llama_context::llama_context(
 
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
+    cparams.freetoken = params.freetoken;
+    cparams.freetoken_pcie_gbps = params.freetoken_pcie_gbps;
+    cparams.freetoken_host_gbps = params.freetoken_host_gbps;
     cparams.moe_cache_size = params.moe_cache_size;
 
     // resolved after flash attention, see resolve_fused_ops()
@@ -611,8 +614,12 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (cparams.freetoken && cparams.moe_cache_size == 0) {
+            throw std::invalid_argument("FreeToken requires --moe-cache-mib");
+        }
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size,
+                    cparams.freetoken, cparams.n_threads, cparams.freetoken_pcie_gbps, cparams.freetoken_host_gbps);
         }
 
         sched_reserve();
@@ -786,6 +793,50 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+}
+
+bool llama_context::freetoken_resize_cache(size_t size) {
+    if (!cparams.freetoken || model.no_alloc()) { return false; }
+    synchronize();
+    double bp = cparams.freetoken_pcie_gbps, bh = cparams.freetoken_host_gbps;
+    if (moe_cache) { moe_cache->freetoken_bandwidths(bp, bh); }
+    const size_t previous = cparams.moe_cache_size;
+    for (auto & res : gf_res_prev) { res.reset(); }
+    gf_res_prev_active = nullptr;
+    gf_res_reserve.reset();
+    sched.reset();
+    moe_cache.reset();
+    auto rebuild = [&](size_t bytes) {
+        if (bytes) {
+            moe_cache = std::make_unique<llama_moe_cache>(model, false, backend_ptrs, backend_buft, bytes,
+                    true, cparams.n_threads, bp, bh);
+        }
+        cparams.moe_cache_size = bytes;
+        sched_need_reserve = true;
+        sched_reserve();
+    };
+    try {
+        rebuild(size);
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("FreeToken cache resize failed: %s; restoring previous cache\n", e.what());
+        for (auto & res : gf_res_prev) { res.reset(); }
+        gf_res_prev_active = nullptr;
+        gf_res_reserve.reset();
+        sched.reset();
+        moe_cache.reset();
+        rebuild(previous);
+        return false;
+    }
+}
+
+bool llama_freetoken_resize_cache(llama_context * ctx, size_t bytes) {
+    if (!ctx) { return false; }
+    try { return ctx->freetoken_resize_cache(bytes); }
+    catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("FreeToken cache recovery failed: %s\n", e.what());
+        return false;
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -4272,6 +4323,9 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.freetoken                   =*/ false,
+        /*.freetoken_pcie_gbps         =*/ 0.0f,
+        /*.freetoken_host_gbps         =*/ 0.0f,
         /*.moe_cache_size              =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,

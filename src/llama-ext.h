@@ -205,3 +205,8 @@ LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
 
 // each sequence is paired with an unconditional one at n_seq_max / 2 + seq_id, in a unified KV cache
 LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * model);
+
+// Call only at an idle scheduler safe point, never concurrently with decode or encode.
+// This rebuilds the expert cache and compute graphs without changing model weights or KV state.
+// Zero releases the cache; a failed resize restores the previous size when possible.
+LLAMA_API bool llama_freetoken_resize_cache(llama_context * ctx, size_t bytes);

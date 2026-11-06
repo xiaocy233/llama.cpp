@@ -397,6 +397,9 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+        bool freetoken; // experimental FreeToken execution for host-resident SwiGLU experts
+        float freetoken_pcie_gbps; // 0 = profile the deployed transfer path
+        float freetoken_host_gbps; // 0 = profile the deployed CPU expert kernels
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
 
         // Abort callback

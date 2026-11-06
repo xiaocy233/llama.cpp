@@ -1030,6 +1030,7 @@ public:
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
+    std::set<llama_token> freetoken_anchors;
 
     // prompt of the "asr" chat template, for live ASR
     llama_tokens asr_prompt;
@@ -1321,6 +1322,17 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+        freetoken_anchors.clear();
+        if (params_base.freetoken) {
+            for (const char * marker : {"<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
+                                       "<|im_start|>", "<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<|start_header_id|>", "<|end_header_id|>"}) {
+                const auto ids = common_tokenize(vocab, marker, false, true);
+                if (ids.size() == 1 && (llama_vocab_get_attr(vocab, ids[0]) & LLAMA_TOKEN_ATTR_CONTROL)) {
+                    freetoken_anchors.insert(ids[0]);
+                }
+            }
+            SRV_INF("FreeToken: %zu special-token semantic anchors, checkpoint budget = %d\n", freetoken_anchors.size(), params_base.n_ctx_checkpoints);
+        }
 
         try {
             decision.init(model_tgt);
@@ -2723,16 +2735,29 @@ private:
         return true;
     }
 
+    bool freetoken_boundary(const server_tokens & tokens, size_t pos) const {
+        if (pos == 0 || pos > tokens.size()) { return false; }
+        return freetoken_anchors.count(tokens[pos - 1]) || (pos < tokens.size() && freetoken_anchors.count(tokens[pos]));
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+        if (params_base.freetoken) {
+            for (auto & cur : slot.prompt.checkpoints) {
+                if (cur->n_tokens == slot.prompt.n_tokens() - n_tokens_cur) {
+                    cur->last_used_us = ggml_time_us();
+                    return;
+                }
+            }
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin();
-                slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
+                !params_base.freetoken && slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             const auto & cur = **it;
             if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
@@ -2749,12 +2774,17 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = *slot.prompt.checkpoints.front();
+            auto victim = slot.prompt.checkpoints.begin();
+            if (params_base.freetoken) {
+                victim = std::min_element(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                    [](const auto & a, const auto & b) { return a->last_used_us < b->last_used_us; });
+            }
+            const auto & cur = **victim;
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(victim);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2774,6 +2804,7 @@ private:
         auto & cur = *ckpt;
 
         cur.id_task = id_task;
+        cur.last_used_us = ggml_time_us();
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -3864,6 +3895,16 @@ private:
                 return;
             }
 
+            if (params_base.freetoken && params_base.n_ctx_checkpoints > 0 && !slot.can_speculate() &&
+                slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.prompt.tokens.has_mtmd &&
+                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) &&
+                (freetoken_boundary(slot.prompt.tokens, slot.prompt.n_tokens()) || freetoken_anchors.count(slot.sampled))) {
+                const auto mem = llama_get_memory(ctx_tgt);
+                const auto pos_min = llama_memory_seq_pos_min(mem, slot.id);
+                const auto pos_max = llama_memory_seq_pos_max(mem, slot.id);
+                if (pos_min >= 0) { create_checkpoint(slot, 0, pos_min, pos_max); }
+            }
+
             generating.push_back(&slot);
 
             if (spec) {
@@ -4297,6 +4338,8 @@ private:
                                     if (!do_reset) {
                                         const auto & cur = **it;
 
+                                        cur.last_used_us = ggml_time_us();
+
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
 
@@ -4515,8 +4558,12 @@ private:
                         }
                         slot.prompt.tokens.push_back(cur_tok);
 
+                        if (do_checkpoint && params_base.freetoken && freetoken_boundary(input_tokens, slot.prompt.n_tokens())) {
+                            break;
+                        }
+
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        if (do_checkpoint && !params_base.freetoken && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
@@ -4530,7 +4577,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        if (do_checkpoint && !params_base.freetoken) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -4573,7 +4620,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!params_base.freetoken && !is_user_start && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
@@ -4591,10 +4638,13 @@ private:
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
+                    if (params_base.freetoken) {
+                        do_checkpoint = do_checkpoint && freetoken_boundary(input_tokens, n_tokens_start);
+                    } else {
+                        do_checkpoint = do_checkpoint && (
+                                slot.prompt.checkpoints.empty() || is_last_user_message || near_prompt_end ||
+                                n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

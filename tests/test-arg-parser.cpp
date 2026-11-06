@@ -111,6 +111,26 @@ static void test(void) {
         }
     }
 
+    {
+        common_params base;
+        base.freetoken = true;
+        base.moe_cache_size = size_t(16384)*1024*1024;
+        base.freetoken_pcie_gbps = 6.0f;
+        base.freetoken_host_gbps = 24.0f;
+        base.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        base.speculative.draft.mparams.path = "draft.gguf";
+        base.speculative.draft.n_max = 7;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(!draft.freetoken);
+        assert(draft.moe_cache_size == 0);
+        assert(draft.freetoken_pcie_gbps == 0.0f);
+        assert(draft.freetoken_host_gbps == 0.0f);
+        assert(draft.model.path == "draft.gguf");
+        assert(draft.speculative.draft.n_max == 7);
+        assert(base.freetoken && base.moe_cache_size > 0);
+    }
+
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
     for (int ex = 0; ex < LLAMA_EXAMPLE_COUNT; ex++) {
         try {

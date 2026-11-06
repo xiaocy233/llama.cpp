@@ -1504,7 +1504,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
-    if (params.warmup) {
+    if (params.warmup && !params.freetoken) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
         std::vector<llama_token> tmp;
@@ -1758,6 +1758,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    cparams.freetoken = params.freetoken;
+    cparams.freetoken_pcie_gbps = params.freetoken_pcie_gbps;
+    cparams.freetoken_host_gbps = params.freetoken_host_gbps;
     cparams.moe_cache_size = params.moe_cache_size;
 
     return cparams;

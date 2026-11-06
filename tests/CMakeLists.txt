@@ -422,3 +422,10 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+llama_build_and_test(test-freetoken.cpp ../src/llama-freetoken.cpp LABEL "backend")
+target_include_directories(test-freetoken PRIVATE ../src ../ggml/src)
+set_tests_properties(test-freetoken PROPERTIES SKIP_RETURN_CODE 77)
+
+llama_build(test-freetoken-model.cpp)
+target_include_directories(test-freetoken-model PRIVATE ../src)

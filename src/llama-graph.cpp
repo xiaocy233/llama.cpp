@@ -2411,7 +2411,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    ggml_tensor * ft_plan = nullptr;
+    if (moe_cache && moe_cache->is_freetoken()) {
+        if (type_op != LLM_FFN_SILU || weight_before_ffn || post_exp_norm ||
+            (loras && !loras->empty()) || (hdmd && !hdmd->weight_blocks.empty())) {
+            throw std::invalid_argument("FreeToken requires plain SwiGLU experts without adapters or Hadamard transforms");
+        }
+        ggml_tensor * ids = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+        ft_plan = moe_cache->plan(ctx0, il, ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur), ids, weights);
+        if (ft_plan) {
+            ggml_backend_sched_set_tensor_backend(sched, ft_plan, moe_cache->backend(il));
+            cb(ft_plan, "ffn_freetoken_plan", il);
+            ggml_build_forward_expand(gf, ft_plan);
+        }
+    }
+    ggml_tensor * slots = ft_plan ? ft_plan : build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2633,6 +2647,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_out = ggml_cont(ctx0, moe_out);
     }
 
+    if (ft_plan) {
+        moe_out = moe_cache->merge(ctx0, il, moe_out, ft_plan);
+        ggml_backend_sched_set_tensor_backend(sched, moe_out, moe_cache->backend(il));
+    }
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;

@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include "freetoken.cuh"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -2702,6 +2703,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
+        case GGML_OP_CUSTOM:
+            if (!ggml_cuda_freetoken_is_op(dst)) { return false; }
+            ggml_cuda_freetoken_compute(ctx, dst);
+            break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
@@ -4894,7 +4899,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
-    const int         chunk_size = ggml_cuda_graph_chunk_size();
+    // A FreeToken CPU branch must join before capture ends.
+    const bool has_freetoken = std::any_of(cgraph->nodes, cgraph->nodes + cgraph->n_nodes, ggml_cuda_freetoken_is_op);
+    const int         chunk_size = has_freetoken ? 0 : ggml_cuda_graph_chunk_size();
     int               chunk_end  = chunk_size;
     size_t            n_chunks   = 0;
 #endif // USE_CUDA_GRAPH
@@ -5389,7 +5396,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();
 
-    if (!use_cuda_graph) {
+    if (!use_cuda_graph || std::any_of(cgraph->nodes, cgraph->nodes + cgraph->n_nodes, ggml_cuda_freetoken_is_op)) {
         return;
     }
 
@@ -5916,6 +5923,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     switch (op->op) {
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_freetoken_is_op(op);
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
                 case GGML_UNARY_OP_ABS:
@@ -6533,6 +6542,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_freetoken_get_api") == 0) {
+        return (void *) ggml_cuda_freetoken_get_api;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

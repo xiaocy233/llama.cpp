@@ -597,6 +597,9 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    bool freetoken = false;
+    float freetoken_pcie_gbps = 0.0f;
+    float freetoken_host_gbps = 0.0f;
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
@@ -1304,6 +1307,7 @@ struct common_no_init_allocator : std::allocator<T> {
 using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
 
 struct common_prompt_checkpoint {
+    mutable int64_t last_used_us = 0;
     int64_t n_tokens;
 
     // (optional) id of the task that created the checkpoint

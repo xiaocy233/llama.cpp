@@ -1,4 +1,6 @@
 #include "llama-moe-cache.h"
+#include "llama-freetoken.h"
+#include <cinttypes>
 
 #include "llama-impl.h"
 #include "llama-memory.h"
@@ -7,6 +9,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <numeric>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -207,6 +210,8 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
         size_t host_bytes = 0;
         int32_t n_slots = 0;
+        std::vector<size_t> strides;
+        std::vector<size_t> alignments;
         moe_cache_slru slru;
     };
 
@@ -231,6 +236,10 @@ struct llama_moe_cache::impl {
     static constexpr int64_t max_batch = 32;
 
     int32_t n_expert_used;
+    bool freetoken = false;
+    const ggml_freetoken_api * ft_api = nullptr;
+    void * ft_handle = nullptr;
+    std::unique_ptr<llama_freetoken_cpu> ft_cpu;
 
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
@@ -253,8 +262,8 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool freetoken, int32_t n_threads, double pcie_gbps, double host_gbps) :
+            n_expert_used(model.hparams.n_expert_used_max()), freetoken(freetoken), layers(model.layers.size()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -284,12 +293,21 @@ struct llama_moe_cache::impl {
                 continue;
             }
             const int32_t id = (int32_t) (it_dev - devices.begin());
-            auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return g.id == id && llama_moe_cache_same_layout(g.ref, experts); });
+            auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return g.id == id && (freetoken ?
+                (g.ref.size() == experts.size() && std::equal(g.ref.begin(), g.ref.end(), experts.begin(),
+                    [](const ggml_tensor * a, const ggml_tensor * b) { return ggml_are_same_shape(a, b); })) :
+                llama_moe_cache_same_layout(g.ref, experts)); });
             if (it == groups.end()) {
                 groups.emplace_back();
                 it = groups.end() - 1;
                 it->id  = id;
                 it->ref = experts;
+                it->strides.resize(experts.size(), 0);
+                it->alignments.resize(experts.size(), 16);
+            }
+            for (size_t b = 0; b < experts.size(); ++b) {
+                it->alignments[b] = std::lcm(it->alignments[b], ggml_type_size(experts[b]->type));
+                it->strides[b] = std::max(it->strides[b], experts[b]->nb[2]);
             }
             it->layers.push_back(il);
             for (const ggml_tensor * t : experts) {
@@ -297,17 +315,36 @@ struct llama_moe_cache::impl {
                 devices[id].host_bytes += ggml_nbytes(t);
             }
         }
+        if (freetoken) {
+            size_t expected = 0, cached = 0;
+            for (const auto & l : model.layers) { expected += !llama_moe_cache_layer_experts(l).empty(); }
+            for (const auto & g : groups) { cached += g.layers.size(); }
+            if (!expected || cached != expected) {
+                throw std::invalid_argument("FreeToken requires all experts in host memory and all MoE layers assigned to CUDA; use --cpu-moe -ngl 999");
+            }
+        }
         if (groups.empty()) {
             LLAMA_LOG_WARN("%s: no layer has all of its experts in host memory, MoE cache is disabled\n", __func__);
             return;
+        }
+
+        if (freetoken && groups.size() != 1) {
+            throw std::invalid_argument("FreeToken currently requires uniform expert geometry across layers");
+        }
+        for (group & g : groups) {
+            for (size_t b = 0; b < g.strides.size(); ++b) {
+                const size_t a = g.alignments[b];
+                g.strides[b] = (g.strides[b] + a - 1)/a*a;
+            }
         }
 
         // one extra slot at the end, CUDA MMQ can read past the last expert
         auto alloc_size = [&](const group & g, int32_t n_slots) {
             const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
             size_t res = 0;
-            for (const ggml_tensor * t : g.ref) {
-                res += GGML_PAD(t->nb[2]*(n_slots + 1), alignment);
+            for (size_t b = 0; b < g.ref.size(); ++b) {
+                const size_t stride = freetoken ? g.strides[b] : g.ref[b]->nb[2];
+                res += GGML_PAD(stride*(n_slots + (freetoken ? n_expert_used + 1 : 1)), alignment);
             }
             return res;
         };
@@ -395,9 +432,11 @@ struct llama_moe_cache::impl {
                 continue;
             }
             ggml_context * ctx = devices[g.id].ctx.get();
-            for (const ggml_tensor * t : g.ref) {
-                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + 1);
-                GGML_ASSERT(bank->nb[2] == t->nb[2]);
+            for (size_t b = 0; b < g.ref.size(); ++b) {
+                const ggml_tensor * t = g.ref[b];
+                ggml_tensor * bank = freetoken ?
+                    ggml_new_tensor_1d(ctx, GGML_TYPE_I8, g.strides[b]*(g.n_slots + n_expert_used + 1)) :
+                    ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + 1);
                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
             }
@@ -407,7 +446,10 @@ struct llama_moe_cache::impl {
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
-                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
+                    ggml_tensor * w = l.experts[ip];
+                    ggml_tensor * cached = ggml_view_3d(ctx, bank, w->ne[0], w->ne[1], g.n_slots + (freetoken ? n_expert_used : 0), w->nb[1], freetoken ? g.strides[ip] : w->nb[2], 0);
+                    cached->type = w->type;
+                    cached->nb[0] = w->nb[0];
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
                 }
@@ -444,6 +486,48 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (freetoken && !no_alloc) {
+            if (devices.size() != 1) {
+                throw std::invalid_argument("FreeToken currently requires one GPU");
+            }
+            auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(devices[0].backend));
+            auto get_api = (ggml_freetoken_get_api_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_freetoken_get_api");
+            ft_api = get_api ? get_api() : nullptr;
+            if (!ft_api) { throw std::invalid_argument("FreeToken requires the NVIDIA CUDA backend"); }
+            std::vector<ggml_freetoken_group> gs;
+            std::vector<ggml_freetoken_layer> ls(layers.size());
+            for (auto & l : ls) { l.group = -1; }
+            for (const group & g : groups) {
+                ggml_freetoken_group cfg{};
+                cfg.n_expert = g.ref[0]->ne[2];
+                cfg.n_slots = g.n_slots;
+                cfg.n_banks = g.banks.size();
+                cfg.n_dummy = n_expert_used;
+                for (size_t b = 0; b < g.banks.size(); ++b) { cfg.banks[b] = g.banks[b]; cfg.strides[b] = g.strides[b]; }
+                gs.push_back(cfg);
+            }
+            for (size_t il = 0; il < layers.size(); ++il) {
+                const auto & l = layers[il];
+                if (l.ig < 0) { continue; }
+                const auto & ml = model.layers[il];
+                if (ml.ffn_up_exps_b || ml.ffn_gate_exps_b || ml.ffn_down_exps_b || ml.ffn_gate_up_exps_b ||
+                    ml.ffn_up_exps_s || ml.ffn_gate_exps_s || ml.ffn_down_exps_s ||
+                    (!ml.ffn_gate_exps && !ml.ffn_gate_up_exps) || model.hparams.swiglu_clamp_exp[il] != 0.0f) {
+                    throw std::invalid_argument("FreeToken currently requires unscaled, unbiased SwiGLU experts");
+                }
+                ls[il].group = l.ig;
+                for (size_t b = 0; b < l.experts.size(); ++b) {
+                    const auto * w = l.experts[b];
+                    if (!ggml_is_contiguous(w) || w->ne[3] != 1) {
+                        throw std::invalid_argument("FreeToken requires contiguous expert matrices");
+                    }
+                    ls[il].weights[b] = l.experts[b];
+                }
+            }
+            ft_cpu.reset(new llama_freetoken_cpu(ls, n_threads));
+            ft_handle = ft_api->create(devices[0].backend, gs.data(), gs.size(), ls.data(), ls.size(), ft_cpu->callbacks(), pcie_gbps, host_gbps);
+        }
+
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
         for (device & d : devices) {
             if (d.buf) {
@@ -474,10 +558,11 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         log_stats();
+        if (ft_handle) { ft_api->destroy(ft_handle); }
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
-        if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (ft_handle || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
         }
         const layer & l = layers[il];
@@ -496,7 +581,7 @@ struct llama_moe_cache::impl {
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
         const auto it = bindings.find(w);
-        if (it == bindings.end()) {
+        if (ft_handle || it == bindings.end()) {
             return 0;
         }
         const binding & b = it->second;
@@ -600,6 +685,12 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        if (ft_handle) {
+            const auto s = ft_api->stats(ft_handle);
+            LLAMA_LOG_INFO("FreeToken: hits=%" PRIu64 " misses=%" PRIu64 " fills=%" PRIu64 " cpu=%" PRIu64
+                           " prefill=%" PRIu64 " prefetch=%" PRIu64 " invalid=%" PRIu64 "\n",
+                           s.hits, s.misses, s.fills, s.cpu, s.prefill_layers, s.prefetch_layers, s.invalid_ids);
+        }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {
@@ -616,8 +707,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool freetoken, int32_t n_threads, double pcie_gbps, double host_gbps) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size, freetoken, n_threads, pcie_gbps, host_gbps)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
@@ -653,4 +744,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
         res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size;
     }
     return res;
+}
+
+bool llama_moe_cache::is_freetoken() const { return pimpl->freetoken; }
+
+ggml_tensor * llama_moe_cache::plan(ggml_context * ctx, int32_t il, ggml_tensor * input, ggml_tensor * ids, ggml_tensor * gates) const {
+    return pimpl->ft_handle ? pimpl->ft_api->plan(pimpl->ft_handle, ctx, il, input, ids, gates) : nullptr;
+}
+
+ggml_tensor * llama_moe_cache::merge(ggml_context * ctx, int32_t il, ggml_tensor * gpu, ggml_tensor * plan) const {
+    return pimpl->ft_api->merge(pimpl->ft_handle, ctx, il, gpu, plan);
+}
+
+void llama_moe_cache::freetoken_bandwidths(double & pcie, double & host) const {
+    if (pimpl->ft_handle) { pimpl->ft_api->bandwidths(pimpl->ft_handle, &pcie, &host); }
 }
