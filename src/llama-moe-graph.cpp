@@ -185,7 +185,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
-    // Expert prediction for the next cached layer, decode only.
+    // Expert prediction for batches that fit in the slot cache.
     //
     // cur is the router's input: past the attention residual and this layer's ffn norm. Feeding it
     // to the *next* layer's router is the cheapest possible guess at what that layer will select -
@@ -196,16 +196,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Runs on the device next to the real router. build_lora_mm_id appends it to the ids the gate
     // reads, so it reaches the host inside the entry the gate publishes anyway. Nothing downstream
     // reads it, so a bad guess cannot change the output.
-    if (n_tokens == 1) {
+    if (n_tokens > 0 && n_expert_used > 0 && n_tokens <= GGML_MOE_GATE_MAX_IDS / n_expert_used) {
         const ggml_moe_slot_cache * head = ggml_backend_sched_find_moe_head_predictor(sched, il);
-        if (head && head->head_pred_w && head->head_n_pred > 0 && head->head_gate_slot >= 0) {
+        if (head && head->head_pred_w && head->head_n_pred > 0 && head->head_gate_slot >= 0 &&
+                ggml_moe_batch_fits_slots(n_tokens, n_expert_used, head->n_slots)) {
             ggml_tensor * pl = ggml_mul_mat(ctx0, head->head_pred_w, cur);
-            ggml_tensor * pi = ggml_argsort_top_k(ctx0, pl, head->head_n_pred);
+            ggml_tensor * pi = ggml_argsort_top_k(ctx0, pl, std::min<int64_t>(head->head_n_pred, GGML_MOE_GATE_MAX_IDS / n_tokens));
             cb(pl, "ffn_moe_head_pred_logits", il);
             if (router_logits != nullptr) {
                 ggml_build_forward_expand(gf, router_logits);
             }
             ggml_build_forward_expand(gf, pl);
+            selected_experts = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+            pi = ggml_is_contiguous(pi) ? pi : ggml_cont(ctx0, pi);
             selected_experts = ggml_moe_head(
                     ctx0, selected_experts, pi, head->gate_seq, head->head_gate_slot);
             cb(selected_experts, "ffn_moe_head_join", il);
@@ -216,10 +219,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             sc = ggml_backend_sched_find_moe_slot_cache(sched, gate_exps);
         }
         if (sc && sc->pred_w && sc->n_pred > 0) {
-            ggml_tensor * pl = ggml_mul_mat(ctx0, sc->pred_w, cur);      // [n_expert, 1]
-            ggml_tensor * pi = ggml_argsort_top_k(ctx0, pl, sc->n_pred);         // [n_pred, 1] I32
-            cb(pl, "ffn_moe_pred_logits", il);
-            moe_slot_preds.push_back({ sc->loc_map, pi });
+            const int64_t max_pred = GGML_MOE_GATE_MAX_IDS / n_tokens - n_expert_used;
+            if (max_pred > 0) {
+                ggml_tensor * pl = ggml_mul_mat(ctx0, sc->pred_w, cur);      // [n_expert, n_tokens]
+                ggml_tensor * pi = ggml_argsort_top_k(ctx0, pl, std::min<int64_t>(sc->n_pred, max_pred));
+                cb(pl, "ffn_moe_pred_logits", il);
+                moe_slot_preds.push_back({ sc->loc_map, pi });
+            }
         }
     }
 

@@ -2812,6 +2812,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CACHE_SLOTS"));
     add_opt(common_arg(
+        {"--cache-profile"}, "FILE",
+        "preload the top --n-cache-slots experts per streamed layer from an activation profile JSON (default: disabled)\n"
+        "with a profile, default to prediction protection, LFU decay every 8 batches, and a 16-token frequency prior; GGML_MOE_* overrides apply",
+        [](common_params & params, const std::string & value) {
+            params.cache_profile = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PROFILE"));
+    add_opt(common_arg(
+        {"-ncpred", "--n-cache-predict"}, "N",
+        string_format("predict N experts one layer ahead and prefetch them into the slot cache\n"
+                      "(the next cached layer's router is applied to this layer's hidden state)\n"
+                      "0 = no prediction, every miss is fetched when the layer needs it (default: %d)",
+                      params.n_cache_predict),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_cache_predict = value;
+        }
+    ).set_env("LLAMA_ARG_N_CACHE_PREDICT"));
+    add_opt(common_arg(
         {"-ncpin", "--n-cache-pin"}, "N",
         string_format("page-lock at most N MiB of the host expert weights, the rest stays pageable\n"
                       "(page-locked reaches the full H2D rate and overlaps compute, pageable goes\n"

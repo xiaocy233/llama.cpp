@@ -771,6 +771,8 @@ struct llama_model {
         struct ggml_tensor * src[3]   = { nullptr, nullptr, nullptr };
         int n_expert = 0;
         int n_slots  = 0;
+        std::vector<int32_t> initial_experts;
+        std::vector<uint32_t> initial_freq;
         int layer = -1;
         bool pinned = false;   // whole host bank is page-locked, so a copy needs no staging
 
@@ -798,7 +800,7 @@ struct llama_model {
     std::vector<int> moe_disk_fds;
 
     // ml supplies the file source for disk-resident banks.
-    void init_moe_slot_caches(int n_slots, int n_pred, const struct llama_model_loader & ml);
+    void init_moe_slot_caches(int n_slots, int n_pred, const char * profile_path, const struct llama_model_loader & ml);
 
     // number of leading layers whose MoE experts stay in VRAM; -1 when unset
     int32_t n_cache_layers() const;

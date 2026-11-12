@@ -55,7 +55,7 @@ static __global__ void moe_gate_kernel(
         __syncthreads();
         for (int i = t; i < n_ids; i += blockDim.x) {
             if (moe_gate_loc(loc_map, ids_in[i]) >= n_slots) {
-                atomicOr(&s_miss, 1u << i);
+                atomicOr(&s_miss, n_ids <= 32 ? (1u << i) : 1u);
             }
         }
         for (int i = t; i < n_ids + n_pred; i += blockDim.x) {
@@ -134,6 +134,30 @@ static __global__ void moe_gate_kernel(
         if (probs) {
             out[n_ids + i] = e;
         }
+    }
+}
+
+static __global__ void moe_head_kernel(
+        const int32_t * ids, const int32_t * pred_ids, const int32_t * seq,
+        ggml_moe_gate_entry * ring, int32_t * out, int layer, int n_ids, int n_pred) {
+    ggml_moe_gate_entry * box = ring + layer;
+    for (int i = threadIdx.x; i < n_pred; i += blockDim.x) {
+        box->ids[i] = pred_ids[i];
+    }
+    for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+        out[i] = ids[i];
+    }
+    if (threadIdx.x == 0) {
+        box->layer = layer;
+        box->miss_mask = 0;
+        box->n_ids = 0;
+        box->n_pred = n_pred;
+        box->mode = GGML_MOE_GATE_MODE_HEAD;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        box->seq = (uint32_t) *seq;
     }
 }
 

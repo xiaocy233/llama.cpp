@@ -5759,6 +5759,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MOE_CPU:
             return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
         case GGML_OP_MOE_GATE:
+            if (ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_HEAD) {
+                return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                       ggml_get_op_params_i32(op, 0) >= 0 && ggml_get_op_params_i32(op, 0) < GGML_MOE_GATE_MAX_LAYERS &&
+                       ggml_get_op_params_i32(op, 1) > 0 && ggml_get_op_params_i32(op, 1) <= GGML_MOE_GATE_MAX_IDS &&
+                       ggml_get_op_params_i32(op, 2) >= 0 && ggml_get_op_params_i32(op, 2) <= GGML_MOE_GATE_MAX_IDS;
+            }
             return ggml_is_contiguous(op->src[1]) &&
                    (ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_NORMAL ||
                     ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_HYBRID ||
