@@ -18,6 +18,12 @@ import urllib.error
 import urllib.request
 
 
+RANKING_METRICS = (
+    ("confirmation", "measured_tpot_ms", "Confirmation measurements"),
+    ("screening", "screening_tpot_ms", "Screening measurements"),
+    ("predicted", "predicted_tpot_ms", "Initial model predictions (not measurements)"),
+    ("production", "tpot_ms", "Ordinary production server measurements (final selection)"),
+)
 
 
 def write_json(path, value):
@@ -204,6 +210,55 @@ def read_events(path, summaries_only=False):
     return events
 
 
+def rank_candidates(rows, metric):
+    valid = [row for row in rows if isinstance(row.get(metric), (int, float))
+             and math.isfinite(row[metric]) and row[metric] > 0]
+    return [dict(row, rank=rank, tokens_per_second=1000 / row[metric])
+            for rank, row in enumerate(sorted(valid, key=lambda row: row[metric]), 1)]
+
+
+def print_ranking(title, rows, metric, top, selected=None):
+    shown = rows[:top] if top else rows
+    print(f"\n{title}: top {len(shown)} of {len(rows)} (TPOT lower is better; tok/s higher is better)")
+    if not shown:
+        return
+    print("rank  copies  threshold  cpu_cap    TPOT ms      tok/s  selected")
+    for row in shown:
+        cfg = row["config"]
+        marker = "*" if cfg == selected else ""
+        print(f"{row['rank']:4}  {cfg['prefetch_budget']:5}  {cfg['threshold']:9.6g}  {cfg['cpu_cap']:7}  "
+              f"{row[metric]:9.3f}  {row['tokens_per_second']:9.2f}  {marker}")
+
+
+def export_rankings(root, recommendation, numerical_search, top):
+    recommendation = recommendation or {}
+    frontier = recommendation.get("candidate_frontier", [])
+    session_path = root / "session.json"
+    session = json.loads(session_path.read_text(encoding="utf-8")) if session_path.exists() else {}
+    validation = session.get("production_validation", {})
+    selected = validation.get("selected") if validation.get("status") == "validated" else None
+    result = {
+        "status": validation.get("status", "screened"), "selected": selected, "native_selected": recommendation.get("selected"),
+        "definitions": "Each stage is ranked separately by ascending TPOT in ms/token. tok/s = 1000 / TPOT. Screening and confirmation can use different output lengths. Predictions are not measurements. Missing scores are excluded. Final selection uses ordinary production measurements with a 3 percent incumbent tolerance.",
+    }
+    sources = (frontier, frontier, (numerical_search or {}).get("ranking", []), validation.get("ranking", []))
+    for (stage, metric, title), rows in zip(RANKING_METRICS, sources):
+        result[stage] = rank_candidates(rows, metric)
+        print_ranking(title, result[stage], metric, top, selected)
+    write_json(root / "ranked-configs.json", result)
+    with (root / "ranked-configs.csv").open("w", newline="", encoding="utf-8") as output:
+        writer = csv.writer(output)
+        writer.writerow(("stage", "rank", "prefetch_budget", "threshold", "cpu_cap", "tpot_ms", "tokens_per_second", "selected"))
+        for stage, metric, _ in RANKING_METRICS:
+            for row in result[stage]:
+                cfg = row["config"]
+                writer.writerow((stage, row["rank"], cfg["prefetch_budget"], cfg["threshold"], cfg["cpu_cap"],
+                                 row[metric], row["tokens_per_second"], cfg == selected))
+    print("* = ordinary production server selection; stage rankings remain separate.")
+    print(f"All ranked configurations: {root / 'ranked-configs.json'}")
+    print(f"CSV: {root / 'ranked-configs.csv'}")
+
+
 def search(tool, trace, output, request=None, top=5):
     command = [str(tool.resolve(strict=True)), str(trace.resolve(strict=True)), str(output.resolve())]
     if request is not None:
@@ -213,6 +268,9 @@ def search(tool, trace, output, request=None, top=5):
     print("Predicted recommendation:", json.dumps(result["selected"]),
           f"supported candidates={result['supported_candidates']}")
     print(f"Search compute={result['search_ms']:.3f} ms; load and search={result['load_and_search_ms']:.3f} ms")
+    print_ranking("Model predictions (not measurements)", rank_candidates(result.get("ranking", []), "predicted_tpot_ms"),
+                  "predicted_tpot_ms", top)
+    print(f"Full ranking: {output}")
     return result
 
 
@@ -278,6 +336,7 @@ def report(root, print_rounds=True, top=5):
     if recommendation:
         print("Recommended:", json.dumps(recommendation["selected"]),
               "status=" + recommendation.get("status", "predicted"))
+    export_rankings(root, recommendation, numerical_search, top)
     print(f"Full values: {root / 'telemetry.jsonl'}")
     return summary
 
