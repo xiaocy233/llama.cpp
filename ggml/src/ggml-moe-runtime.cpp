@@ -508,7 +508,9 @@ void ggml_moe_runtime_seed_prefill(
 }
 
 static void ggml_moe_runtime_sync(ggml_moe_runtime * sched, ggml_backend_t bk) {
+    const int64_t begin = sched->online_timing ? ggml_time_us() : 0;
     bk->iface.synchronize_stream(bk, sched->transfer_stream);
+    if (sched->online_timing) sched->tune_sync_us += ggml_time_us() - begin;
     sched->moe_pass++;
 }
 
@@ -2220,26 +2222,40 @@ const struct ggml_moe_slot_cache * ggml_moe_runtime_find_moe_head_predictor(
 
 static void ggml_moe_runtime_stats_report(ggml_moe_runtime * sched) {
     GGML_LOG_DEBUG("\n");
-    GGML_LOG_DEBUG("MoE slot cache, decode only: %d layers, one load = one expert (up+gate+down)\n",
+    GGML_LOG_DEBUG("MoE slot cache, single-token decode and small batches: %d layers, one load = one expert (up+gate+down)\n",
             sched->n_moe_caches);
-    GGML_LOG_DEBUG("  %-5s %6s %8s %8s %11s %11s %8s %11s %11s\n",
-            "layer", "slots", "tokens", "hit", "load_sync", "load_pf", "pf_prec", "MiB_sync", "MiB_pf");
+    GGML_LOG_DEBUG("  hit: resident token-expert assignments before fill; load_sync/load_pf: unique expert copies per batch; MiB: totals\n");
+    GGML_LOG_DEBUG("  pf_prec: unique predicted experts used / unique predicted experts in each batch; tokens include verification inputs and warmup\n");
+    GGML_LOG_DEBUG("  %-5s %6s %8s %8s %8s %11s %11s %8s %11s %11s\n",
+            "layer", "slots", "batches", "tokens", "hit", "load_sync", "load_pf", "pf_prec", "MiB_sync", "MiB_pf");
 
-    uint64_t t_hit = 0, t_use = 0, t_ls = 0, t_lp = 0, t_bs = 0, t_bp = 0, t_pp = 0, t_pu = 0, max_tokens = 0;
+    uint64_t t_hit = 0, t_use = 0, t_ls = 0, t_lp = 0, t_bs = 0, t_bp = 0, t_pp = 0, t_pu = 0, max_tokens = 0, max_batches = 0;
 
     for (int i = 0; i < sched->n_moe_caches; i++) {
         const struct ggml_moe_slot_state * st = sched->moe_caches[i];
-        if (st->n_tokens == 0) {
-            continue;
+        if (st->cpu) {
+            const auto & c = *st->cpu;
+            GGML_LOG_INFO("MoE hybrid layer=%d batches=%llu cpu_assign=%llu gpu_assign=%llu cold_experts=%llu cold_weight_MiB=%.3f cpu_ms=%.3f cpu_join_ms=%.3f cpu_a_us=%.3f cpu_b_us=%.3f h2d_gbs=%.3f\n",
+                    st->cache.layer, (unsigned long long) c.step, (unsigned long long) c.cpu_assignments,
+                    (unsigned long long) c.gpu_assignments, (unsigned long long) c.cold_experts,
+                    c.avoided_bytes / 1048576.0, c.cpu_us / 1000.0, c.join_us / 1000.0, c.cost.a_us, c.cost.b_us, c.h2d_gbs);
         }
-        const double   tok = (double) st->n_tokens;
+        GGML_LOG_INFO("MoE pilot layer=%d slots=%d batches=%llu tokens=%llu sync_bytes=%llu pf_bytes=%llu cpu_experts=%llu cpu_peak=%llu cpu_assign=%llu gpu_assign=%llu\n",
+                st->cache.layer, st->n_slots, (unsigned long long) st->n_batches, (unsigned long long) st->n_tokens,
+                (unsigned long long) st->n_bytes_sync, (unsigned long long) st->n_bytes_pf,
+                (unsigned long long) (st->cpu ? st->cpu->cold_experts : 0), (unsigned long long) (st->cpu ? st->cpu->peak_experts : 0),
+                (unsigned long long) (st->cpu ? st->cpu->cpu_assignments : 0), (unsigned long long) (st->cpu ? st->cpu->gpu_assignments : 0));
+        const double batch = (double) std::max<uint64_t>(1, st->n_batches);
         const uint64_t use = st->n_hit + st->n_miss;
+        char precision[32] = "N/A";
+        if (st->n_pf_pred > 0) {
+            snprintf(precision, sizeof(precision), "%.4f", (double) st->n_pf_useful / (double) st->n_pf_pred);
+        }
 
-        GGML_LOG_DEBUG("  %-5d %6d %8llu %8.4f %11.3f %11.3f %8.4f %11.1f %11.1f\n",
-                st->cache.layer, st->n_slots, (unsigned long long) st->n_tokens,
+        GGML_LOG_DEBUG("  %-5d %6d %8llu %8llu %8.4f %11.3f %11.3f %8s %11.1f %11.1f\n",
+                st->cache.layer, st->n_slots, (unsigned long long) st->n_batches, (unsigned long long) st->n_tokens,
                 use ? (double) st->n_hit / (double) use : 0.0,
-                (double) st->n_load_sync / tok, (double) st->n_load_pf / tok,
-                st->n_pf_pred ? (double) st->n_pf_useful / (double) st->n_pf_pred : 0.0,
+                (double) st->n_load_sync / batch, (double) st->n_load_pf / batch, precision,
                 (double) st->n_bytes_sync / 1024.0 / 1024.0,
                 (double) st->n_bytes_pf   / 1024.0 / 1024.0);
 
@@ -2248,15 +2264,19 @@ static void ggml_moe_runtime_stats_report(ggml_moe_runtime * sched) {
         t_bs  += st->n_bytes_sync; t_bp  += st->n_bytes_pf;
         t_pp  += st->n_pf_pred;    t_pu  += st->n_pf_useful;
         max_tokens = std::max(max_tokens, st->n_tokens);
+        max_batches = std::max(max_batches, st->n_batches);
     }
 
     if (max_tokens > 0) {
-        const double tok = (double) max_tokens;
-        GGML_LOG_DEBUG("  %-5s %6s %8llu %8.4f %11.3f %11.3f %8.4f %11.1f %11.1f\n",
-                "TOTAL", "", (unsigned long long) max_tokens,
+        const double batch = (double) max_batches;
+        char precision[32] = "N/A";
+        if (t_pp > 0) {
+            snprintf(precision, sizeof(precision), "%.4f", (double) t_pu / (double) t_pp);
+        }
+        GGML_LOG_DEBUG("  %-5s %6s %8llu %8llu %8.4f %11.3f %11.3f %8s %11.1f %11.1f\n",
+                "TOTAL", "", (unsigned long long) max_batches, (unsigned long long) max_tokens,
                 t_use ? (double) t_hit / (double) t_use : 0.0,
-                (double) t_ls / tok, (double) t_lp / tok,
-                t_pp ? (double) t_pu / (double) t_pp : 0.0,
+                (double) t_ls / batch, (double) t_lp / batch, precision,
                 (double) t_bs / 1024.0 / 1024.0, (double) t_bp / 1024.0 / 1024.0);
     }
 

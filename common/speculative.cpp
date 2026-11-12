@@ -1,6 +1,7 @@
 #include "speculative.h"
 
 #include "common.h"
+#include "draft-acceptance-profile.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "llama.h"
@@ -1241,6 +1242,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        common_dflash_profile_window();
+        DFLASH_PROFILE("dflash.draft");
 
         batch.clear();
 

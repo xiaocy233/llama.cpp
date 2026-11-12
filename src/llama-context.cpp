@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "../common/draft-acceptance-profile.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -24,6 +25,21 @@
 //
 // llama_context
 //
+
+bool llama_moe_tune_cache(llama_context * ctx, bool capture) {
+    ctx->synchronize();
+    return ggml_backend_sched_moe_tune_cache(ctx->get_sched(), capture);
+}
+
+bool llama_moe_tune_begin(llama_context * ctx, int width, int cpu_cap, bool profile, bool fixed, bool trace_only) {
+    if (!trace_only) ctx->synchronize();
+    return ggml_backend_sched_moe_tune_begin(ctx->get_sched(), width, cpu_cap, profile, fixed, trace_only);
+}
+
+int llama_moe_tune_end(llama_context * ctx, ggml_moe_tune_layer * layers, int capacity, bool trace_only) {
+    if (!trace_only) ctx->synchronize();
+    return ggml_backend_sched_moe_tune_end(ctx->get_sched(), layers, capacity, trace_only);
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -1509,6 +1525,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = nullptr;
         res->reset();
 
+        DFLASH_PROFILE(model.hparams.n_expert > 0 ? "target.graph_build_alloc" : "draft.graph_build_alloc", ubatch.n_tokens);
+
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
@@ -1566,6 +1584,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    DFLASH_PROFILE("llama.encode", batch_inp.tokens.size());
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1805,6 +1824,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    DFLASH_PROFILE(model.hparams.n_expert > 0 ? "llama.decode.target" : "llama.decode.draft", batch_inp.tokens.size());
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
