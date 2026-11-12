@@ -81,6 +81,11 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// Ring depth for the MoE weight prefetch. 3 is the measured knee on an RTX 5060 over an 8188-token
+// prefill: 1574 t/s at depth 2, 1810 at depth 3, for 18 MiB more compute buffer. Deeper was not
+// measured, and the transfer is already almost fully hidden at 3.
+static constexpr int LLAMA_MOE_PREFETCH_RING_DEPTH = 3;
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -624,6 +629,8 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+
+    sched.reset();
 
     const int64_t t_start_us = ggml_time_us();
 

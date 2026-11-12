@@ -6142,7 +6142,40 @@ static ggml_moe_backend_caps ggml_backend_cuda_moe_get_caps(ggml_backend_dev_t) 
     return { 3, false, true };
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDA_VERSION >= 12080
+static void ggml_backend_cuda_moe_batch_copy(
+        ggml_backend_t backend, int stream, const ggml_moe_copy * copies, size_t count) {
+    GGML_ASSERT(count > 0 && count <= 3 * GGML_MOE_GATE_MAX_IDS);
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    CUdeviceptr dst[3 * GGML_MOE_GATE_MAX_IDS];
+    CUdeviceptr src[3 * GGML_MOE_GATE_MAX_IDS];
+    size_t sizes[3 * GGML_MOE_GATE_MAX_IDS];
+    for (size_t i = 0; i < count; ++i) {
+        dst[i] = (CUdeviceptr) copies[i].dst;
+        src[i] = (CUdeviceptr) copies[i].src;
+        sizes[i] = copies[i].bytes;
+    }
+    CUmemcpyAttributes attrs = {};
+    attrs.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
+    size_t first = 0;
+#if CUDA_VERSION >= 13000
+    CU_CHECK(cuMemcpyBatchAsync(dst, src, sizes, count, &attrs, &first, 1,
+                              (CUstream) ctx->stream(ctx->device, stream)));
+#else
+    size_t failed = SIZE_MAX;
+    CU_CHECK(cuMemcpyBatchAsync(dst, src, sizes, count, &attrs, &first, 1, &failed,
+                              (CUstream) ctx->stream(ctx->device, stream)));
+#endif
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDA_VERSION >= 12080
+    if (strcmp(name, "ggml_backend_moe_batch_copy") == 0) {
+        return (void *) ggml_backend_cuda_moe_batch_copy;
+    }
+#endif
     if (strcmp(name, "ggml_backend_moe_cpu_max_tokens") == 0) {
         return (void *) ggml_backend_cuda_moe_cpu_max_tokens;
     }
