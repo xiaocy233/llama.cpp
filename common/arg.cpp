@@ -2788,6 +2788,45 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
     add_opt(common_arg(
+        {"-nclayers", "--n-cache-layers"}, "N",
+        "keep the Mixture of Experts (MoE) weights of the first N layers in VRAM, and the rest in the CPU\n"
+        "(MTP/NextN layers keep their normal device placement)\n"
+        "(the mirror image of --n-cpu-moe, which keeps the *last* layers in VRAM)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_cache_layers = value;
+        }
+    ).set_env("LLAMA_ARG_N_CACHE_LAYERS"));
+    add_opt(common_arg(
+        {"-ncslots", "--n-cache-slots"}, "N",
+        string_format("number of expert slots to keep in VRAM for each layer that is not fully cached\n"
+                      "(0 = no slot cache, every used expert is copied per token) (default: %d)",
+                      params.n_cache_slots),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_N_CACHE_SLOTS"));
+    add_opt(common_arg(
+        {"-ncpin", "--n-cache-pin"}, "N",
+        string_format("page-lock at most N MiB of the host expert weights, the rest stays pageable\n"
+                      "(page-locked reaches the full H2D rate and overlaps compute, pageable goes\n"
+                      "through a driver staging copy at about half the rate and overlaps nothing)\n"
+                      "-1 = auto (min(host-offload, cudaMallocHost max) - 200 MiB),\n"
+                      "0 = none (default: %d)",
+                      params.n_cache_pin),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_cache_pin = value;
+        }
+    ).set_env("LLAMA_ARG_N_CACHE_PIN"));
+    add_opt(common_arg(
         {"--cache-disk"},
         "streaming layers' expert banks stay in the GGUF file instead of host memory, read on\n"
         "demand with pread. Halves the RAM footprint on unified-memory machines (Metal).\n"

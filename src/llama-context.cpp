@@ -649,6 +649,58 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
+    // --n-cache-layers pins the leading layers' experts in VRAM and streams the rest, so those
+    // streamed copies are worth overlapping with the compute. Has to happen before the first
+    // reserve: the prefetch ring changes the graph and therefore the compute buffer size.
+    // On Metal with disk-resident banks the scheduler matrix ring is not used: prefill streams
+    // whole layers through the layer-ring offloader (llama-moe-prefill.cpp) instead, and decode
+    // fills go through the host pool. Keeping the ring on would just grow the compute buffer.
+    const bool moe_disk_prefill =
+        model.n_cache_layers() >= 0 && !model.moe_slot_layers.empty() &&
+        model.moe_slot_layers.front().src_fd >= 0;
+    if (model.n_cache_layers() >= 0 && !moe_disk_prefill) {
+        ggml_backend_sched_set_weight_prefetch(sched.get(), LLAMA_MOE_PREFETCH_RING_DEPTH);
+    }
+
+    // Register the MoE expert slot caches. Has to happen before the first reserve: the remap node is
+    // only emitted for tensors that have a registered cache, so the graph shape depends on this.
+    // MTP uses NextN layers, which are excluded from the trunk slot caches.
+    if (!model.moe_slot_layers.empty() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        init_moe_slot_caches();
+        for (const auto & c : moe_slot_caches) {
+            if (!ggml_backend_sched_add_moe_slot_cache(sched.get(), &c, (int) model.hparams.n_expert_used(c.layer)) && c.n_initial > 0) {
+                throw std::runtime_error("failed to register MoE slot cache for layer " + std::to_string(c.layer));
+            }
+        }
+        ggml_backend_sched_set_moe_gate_seq(sched.get(), moe_slot_caches.front().gate_seq);
+    }
+
+    // Backend prefill layer ring: stream whole layers from disk while the GPU computes on the
+    // previous ones (--cache-disk). Registered as the backend's MoE interceptor handler; only
+    // prefill graphs bind to it, decode keeps the slot-cache path above.
+    {
+        const bool prefill_supported = !backends.empty() && llama_moe_prefill_offload::supported(backends.front().get());
+        if (model.moe_disk_fds.empty() == false && prefill_supported) {
+            const int n_ring = model.n_cache_prefill_buffers() > 0 ? model.n_cache_prefill_buffers() : 2;
+            moe_prefill = std::make_unique<llama_moe_prefill_offload>(backends.front().get(), n_ring);
+            for (const auto & L : model.moe_slot_layers) {
+                if (L.src_fd < 0) {
+                    continue;
+                }
+                for (int m = 0; m < 3; m++) {
+                    if (L.src[m] == nullptr) {
+                        continue;
+                    }
+                    // pools have to exist before the first graph build: the scheduler sizes its
+                    // compute buffers against the graph, and a buffer-less pool tensor would be
+                    // carved out of the compute buffer at full-bank size per matrix
+                    moe_prefill->add_pool(L.src[m], L.layer, L.src_fd, L.src_off[m]);
+                }
+            }
+            moe_prefill->finalize_buffers();
+        }
+    }
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -3510,6 +3562,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     for (const auto & [buft, size] : model.memory_breakdown()) {
         ret[buft].model += size;
     }
+    if (buf_moe) {
+        ret[ggml_backend_buffer_get_type(buf_moe.get())].context += ggml_backend_buffer_get_size(buf_moe.get());
+    }
     if (memory) {
         for (const auto & [buft, size] : memory->memory_breakdown()) {
             ret[buft].context += size;
@@ -3799,6 +3854,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.moe_substitute_threshold    =*/ 0.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

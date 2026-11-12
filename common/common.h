@@ -531,6 +531,18 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
+    // MoE expert placement. --n-cpu-moe keeps the *last* layers fully in VRAM; --n-cache-layers is
+    // its mirror image and keeps the *first* N there instead. Layers that are in neither set stream
+    // their experts from the host, and --n-cache-slots sizes the per-layer VRAM cache for those.
+    int32_t n_cache_layers = -1;   // shallow layers kept fully in VRAM, -1 = unset
+    float moe_substitute_threshold = 0.0f; // normalized routing weight cutoff; 0 disables substitution
+    int32_t n_cache_slots  = 0;    // expert slots per streaming layer, 0 = no slot cache
+    std::string cache_profile;     // activation profile for initial slot contents
+    int32_t n_cache_predict = 0;   // experts predicted one layer ahead and prefetched, 0 = off
+    int32_t n_cache_pin    = -1;   // MiB of host weights to page-lock, -1 = auto (min(host-offload, cudaMallocHost max) - 200 MiB), 0 = none
+    bool    cache_disk     = false; // streaming layers' experts stay in the GGUF file (pread on demand), Metal only
+    int32_t n_cache_prefill_buffers = 0; // full-layer ring buffers for prefill streaming, 0 = 2, Metal + cache_disk only
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
@@ -1227,6 +1239,10 @@ const char * const LLM_FFN_DENSE_REGEX = "\\.ffn_(up|down|gate)\\.";
 
 inline std::string llm_ffn_block_regex(int idx, const char * ffn_regex) {
     return string_format("blk\\.%d%s", idx, ffn_regex);
+}
+
+inline std::string llm_ffn_exps_block_regex(int idx) {
+    return string_format("blk\\.%d%s", idx, LLM_FFN_EXPS_REGEX);
 }
 
 inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {

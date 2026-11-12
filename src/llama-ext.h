@@ -5,6 +5,7 @@
 // try as much as possible to not include this header in the rest of the codebase
 
 #include "llama.h"
+#include "ggml-moe-tune.h"
 
 #include <cstdint>
 #include <map>
@@ -15,6 +16,10 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_tokens,
         uint32_t n_seqs,
         uint32_t n_outputs);
+
+LLAMA_API bool llama_moe_tune_cache(llama_context * ctx, bool capture);
+LLAMA_API bool llama_moe_tune_begin(llama_context * ctx, int width, int cpu_cap, bool profile, bool fixed, bool trace_only);
+LLAMA_API int llama_moe_tune_end(llama_context * ctx, ggml_moe_tune_layer * layers, int capacity, bool trace_only);
 
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
@@ -129,6 +134,9 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+
+// Borrow the last single-ubatch outputs. They remain valid until the next encode/decode/reserve.
+LLAMA_API bool llama_get_draft_acceptance_inputs(struct llama_context * ctx, struct ggml_tensor ** logits, struct ggml_tensor ** hidden, ggml_backend_t * backend);
 
 //
 // model/context data extraction
