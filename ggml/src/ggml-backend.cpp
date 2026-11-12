@@ -2043,8 +2043,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int    ie  = 0;
         size_t off = 0;
         size_t len = 0;
-        while (ggml_moe_runtime_bank_range(st, in, &ie, &off, &len)) {
-            ggml_backend_tensor_set_async(bk, in_cpy, (const char *) in->data + off, off, len);
+        if (!ggml_moe_runtime_bank_copy_async(st, bk, in, in_cpy, GGML_SCHED_PREFETCH_STREAM_INDEX)) {
+            while (ggml_moe_runtime_bank_range(st, in, &ie, &off, &len)) {
+                ggml_backend_tensor_set_async(bk, in_cpy, (const char *) in->data + off, off, len);
+            }
         }
 
         ggml_backend_event_record(sched->prefetch_ev_copy[bid][slot], bk);
@@ -2364,6 +2366,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             n_issued++;
         }
 
+        if (!sched->has_moe_gate && !pf.empty() && pf_of_split[split_id] >= 0) {
+            const auto & entry = pf[pf_of_split[split_id]];
+            auto * source = split->inputs[entry.input];
+            auto * bank = tensor_copy(source, split_backend_id, sched->cur_copy);
+            auto * node = split->graph.nodes[0];
+            if (node->op == GGML_OP_MUL_MAT_ID && node->src[3] == bank && node->src[4]) {
+                // The bank is live here; later nodes in this split can reuse its memory.
+                ggml_moe_runtime_seed_prefill(sched->moe, ggml_moe_runtime_bank_of(sched->moe, source), source, bank, node->src[2]);
+            }
+        }
+
         // A Prefill dual-base node reads the location table straight from the graph, so it needs the
         // table caught up here. Decode does not come through this: its gate publishes to the worker
         // and the worker writes the table, both without the main thread.
@@ -2373,7 +2386,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         const bool has_cpu_experts = std::any_of(split->graph.nodes, split->graph.nodes + split->graph.n_nodes,
                 [](const ggml_tensor * node) { return node->op == GGML_OP_MOE_CPU; });
-        if (!sched->callback_eval && !has_cpu_experts) {
+        const bool cpu_graph = has_cpu_experts && ggml_moe_runtime_prepare_cpu_graph(sched->moe, split_backend, &split->graph, !sched->callback_eval);
+        if (!sched->callback_eval && (!has_cpu_experts || cpu_graph)) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -2438,6 +2452,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    ggml_moe_runtime_finish_prefill(sched->moe);
     return GGML_STATUS_SUCCESS;
 }
 

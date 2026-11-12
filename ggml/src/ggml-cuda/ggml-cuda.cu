@@ -361,9 +361,20 @@ static ggml_cuda_device_info ggml_cuda_init() {
         // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
         // TODO: Check for future drivers the default scheduling strategy and
         // remove this call again when cudaDeviceScheduleSpin is default.
-        if (prop.major == 12 && prop.minor == 1) {
+        const char * schedule = getenv("GGML_CUDA_SCHEDULE");
+        if (schedule || (prop.major == 12 && prop.minor == 1)) {
+            unsigned int mode = cudaDeviceScheduleSpin;
+            if (schedule) {
+                if (strcmp(schedule, "auto") == 0) mode = cudaDeviceScheduleAuto;
+                else if (strcmp(schedule, "spin") == 0) mode = cudaDeviceScheduleSpin;
+                else if (strcmp(schedule, "yield") == 0) mode = cudaDeviceScheduleYield;
+                else if (strcmp(schedule, "blocking") == 0) mode = cudaDeviceScheduleBlockingSync;
+                else GGML_ABORT("GGML_CUDA_SCHEDULE must be auto, spin, yield, or blocking");
+            }
             CUDA_CHECK(cudaSetDevice(physical_id));
-            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+            unsigned int before = 0;
+            CUDA_CHECK(cudaGetDeviceFlags(&before));
+            CUDA_CHECK(cudaSetDeviceFlags((before & ~cudaDeviceScheduleMask) | mode));
         }
 
 #endif  // defined(GGML_USE_HIP)
@@ -2424,6 +2435,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MOE_GATE:
             ggml_cuda_op_moe_gate(ctx, dst, capturing);
+            break;
+        case GGML_OP_MOE_CPU:
+            ggml_cuda_op_moe_cpu(ctx, dst, capturing);
             break;
         case GGML_OP_UPSCALE:
             ggml_cuda_op_upscale(ctx, dst);
@@ -6127,6 +6141,17 @@ static int ggml_backend_cuda_moe_cpu_max_tokens(ggml_backend_t backend, ggml_typ
     return ggml_is_quantized(type) ? get_mmvq_mmid_max_batch(type, ggml_cuda_info().devices[ctx->device].cc) : 0;
 }
 
+static void * ggml_backend_cuda_moe_cpu_graph_map(ggml_backend_t backend, ggml_moe_cpu_graph * host) {
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    void * device = nullptr;
+    if (cudaHostGetDevicePointer(&device, host, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return device;
+}
+
 static bool ggml_backend_cuda_moe_cpu_merge_begin(ggml_backend_t backend, ggml_tensor * dst, const float * values, const int32_t * rows, int count, const uint32_t * complete) {
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(ctx->device);
@@ -6178,7 +6203,40 @@ static double ggml_backend_cuda_moe_tune_timer(ggml_backend_t backend, void ** h
     return ms * 1000.0;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDA_VERSION >= 12080
+static void ggml_backend_cuda_moe_batch_copy(
+        ggml_backend_t backend, int stream, const ggml_moe_copy * copies, size_t count) {
+    GGML_ASSERT(count > 0 && count <= 3 * GGML_MOE_GATE_MAX_IDS);
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    CUdeviceptr dst[3 * GGML_MOE_GATE_MAX_IDS];
+    CUdeviceptr src[3 * GGML_MOE_GATE_MAX_IDS];
+    size_t sizes[3 * GGML_MOE_GATE_MAX_IDS];
+    for (size_t i = 0; i < count; ++i) {
+        dst[i] = (CUdeviceptr) copies[i].dst;
+        src[i] = (CUdeviceptr) copies[i].src;
+        sizes[i] = copies[i].bytes;
+    }
+    CUmemcpyAttributes attrs = {};
+    attrs.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
+    size_t first = 0;
+#if CUDA_VERSION >= 13000
+    CU_CHECK(cuMemcpyBatchAsync(dst, src, sizes, count, &attrs, &first, 1,
+                              (CUstream) ctx->stream(ctx->device, stream)));
+#else
+    size_t failed = SIZE_MAX;
+    CU_CHECK(cuMemcpyBatchAsync(dst, src, sizes, count, &attrs, &first, 1, &failed,
+                              (CUstream) ctx->stream(ctx->device, stream)));
+#endif
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDA_VERSION >= 12080
+    if (strcmp(name, "ggml_backend_moe_batch_copy") == 0) {
+        return (void *) ggml_backend_cuda_moe_batch_copy;
+    }
+#endif
     if (strcmp(name, "ggml_backend_moe_tune_timer") == 0) {
         return (void *) ggml_backend_cuda_moe_tune_timer;
     }
@@ -6187,6 +6245,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_moe_cpu_merge_begin") == 0) {
         return (void *) ggml_backend_cuda_moe_cpu_merge_begin;
+    }
+    if (strcmp(name, "ggml_backend_moe_cpu_graph_map") == 0) {
+        return (void *) ggml_backend_cuda_moe_cpu_graph_map;
     }
     if (strcmp(name, "ggml_backend_moe_cpu_merge") == 0) {
         return (void *) ggml_backend_cuda_moe_cpu_merge;

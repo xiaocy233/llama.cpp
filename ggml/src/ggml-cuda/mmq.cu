@@ -5,6 +5,40 @@
 
 #include <cstdint>
 
+// Prefix-sum per-expert tile counts without copying routing metadata to the host.
+static __global__ void mmq_build_tile_map(const int32_t * bounds, int2 * map,
+        int n_experts, int tile_width, int n_tiles, int empty_tile) {
+    __shared__ int prefix[1024];
+    const int tid = threadIdx.x;
+    const int count = tid < n_experts ? (bounds[tid + 1] - bounds[tid] + tile_width - 1) / tile_width : 0;
+    prefix[tid] = count;
+    for (int i = tid; i < n_tiles; i += blockDim.x) {
+        map[i] = make_int2(0, empty_tile);
+    }
+    __syncthreads();
+    for (int offset = 1; offset < blockDim.x; offset *= 2) {
+        const int add = tid >= offset ? prefix[tid - offset] : 0;
+        __syncthreads();
+        prefix[tid] += add;
+        __syncthreads();
+    }
+    if (tid < n_experts) {
+        const int first = prefix[tid] - count;
+        for (int j = 0; j < count; ++j) {
+            map[first + j] = make_int2(tid, j);
+        }
+    }
+}
+
+void ggml_cuda_mmq_build_tile_map(const int32_t * bounds, int2 * map,
+        int n_experts, int tile_width, int n_tiles, int empty_tile, cudaStream_t stream) {
+    GGML_ASSERT(n_experts > 0 && n_experts <= 1024);
+    int threads = 32;
+    while (threads < n_experts) { threads *= 2; }
+    mmq_build_tile_map<<<1, threads, 0, stream>>>(bounds, map, n_experts, tile_width, n_tiles, empty_tile);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -238,7 +272,7 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(ne1 == n_expert_used);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + 127); // Padding for the widest MMQ tile.
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
@@ -298,9 +332,10 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-    // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+    // Flat sparse grids also size tiles for per-expert work, not the whole prompt.
     int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+        ggml_cuda_mmq_flat_prefill(cc, ne12, ne02)) {
         ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
     }
 
@@ -389,7 +424,7 @@ void ggml_cuda_mul_mat_q_dual(
     GGML_ASSERT(ne1 == n_expert_used);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + 127); // Padding for the widest MMQ tile.
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), n_expert + 1);
 
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
@@ -447,7 +482,8 @@ void ggml_cuda_mul_mat_q_dual(
     const int64_t s13 = ne12*s12;
 
     int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+        ggml_cuda_mmq_flat_prefill(cc, ne12, n_expert)) {
         ncols_opt = (ne12*n_expert_used + n_expert - 1) / n_expert;
     }
 

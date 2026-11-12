@@ -2,8 +2,10 @@
 """MoE standalone tuning and request-level adaptation for DFlash and MTP."""
 
 import argparse
+import csv
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -13,6 +15,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+
+RANKING_METRICS = (
+    ("confirmation", "measured_tpot_ms", "Confirmation measurements"),
+    ("screening", "screening_tpot_ms", "Screening measurements"),
+    ("predicted", "predicted_tpot_ms", "Initial model predictions (not measurements)"),
+)
 
 
 def write_json(path, value):
@@ -28,6 +37,19 @@ def digest(value):
 def file_identity(path):
     stat = path.stat()
     return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def cpu_affinity():
+    if hasattr(os, "sched_getaffinity"):
+        return sorted(os.sched_getaffinity(0))
+    if os.name == "nt":
+        import ctypes
+        mask, system = ctypes.c_size_t(), ctypes.c_size_t()
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        if not kernel.GetProcessAffinityMask(ctypes.c_void_p(-1), ctypes.byref(mask), ctypes.byref(system)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return [cpu for cpu in range(ctypes.sizeof(mask) * 8) if mask.value & (1 << cpu)]
+    return None
 
 
 def controls(cpu_cap, gpu):
@@ -83,11 +105,12 @@ def launch(args, port):
     key = {"target": file_identity(args.model), "draft": file_identity(args.draft_model or args.model),
            "spec_type": spec_type, "draft_max": draft_max,
            "binary": file_identity(args.server),
-           "runtime_libraries": {p.name: file_identity(p.resolve()) for p in sorted(args.server.parent.glob("*.so*")) if p.is_file()},
+           "runtime_libraries": {p.name: file_identity(p.resolve()) for p in sorted(args.server.parent.glob("*.dll" if os.name == "nt" else "*.so*")) if p.is_file()},
            "gpu": args.gpu, "threads": args.threads,
-           "cpu_affinity": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None}
+           "expert_threads": args.expert_threads, "cpu_affinity": cpu_affinity()}
     env = controls(args.cpu_cap if args.action == "serve" else 0, args.gpu)
     env.update({"LLAMA_MOE_AUTOTUNE": "online" if args.action == "serve" else "offline",
+                "GGML_MOE_HYBRID_THREADS": str(args.expert_threads),
                 "LLAMA_MOE_AUTOTUNE_OUTPUT": str(args.output / "telemetry.jsonl"),
                 "LLAMA_MOE_AUTOTUNE_PROFILE": str(profile),
                 "LLAMA_MOE_AUTOTUNE_PROFILE_KEY": digest(key),
@@ -107,7 +130,7 @@ def launch(args, port):
                "--spec-type", spec_type, "-ngl", "99", "-ngld", "99", "-c", str(args.ctx),
                "-b", "512", "-ub", "512", "-np", "1", "-t", str(args.threads), "-tb", str(args.threads),
                "--host", "127.0.0.1", "--port", str(port), "--fit", "off", "--load-mode", "none",
-               "--no-warmup", "--temp", "0", "--ctx-checkpoints", "0", "--reasoning", "off", "--moe-substitute-threshold", "0",
+               "--no-warmup", "--temp", "0", "--ctx-checkpoints", "0", "--reasoning", args.thinking, "--moe-substitute-threshold", "0",
                "--n-cache-layers", str(args.cache_layers), "--n-cache-slots", str(args.slots),
                "--n-cache-predict", "24", "--n-cache-pin", "32768",
                "--spec-draft-n-max", str(draft_max), "--spec-draft-n-min", "0", "--spec-draft-p-min", "0",
@@ -130,7 +153,53 @@ def read_events(path, summaries_only=False):
     return events
 
 
-def search(tool, trace, output, request=None):
+def rank_candidates(rows, metric):
+    valid = [row for row in rows if isinstance(row.get(metric), (int, float))
+             and math.isfinite(row[metric]) and row[metric] > 0]
+    return [dict(row, rank=rank, tokens_per_second=1000 / row[metric])
+            for rank, row in enumerate(sorted(valid, key=lambda row: row[metric]), 1)]
+
+
+def print_ranking(title, rows, metric, top, selected=None):
+    shown = rows[:top] if top else rows
+    print(f"\n{title}: top {len(shown)} of {len(rows)} (TPOT lower is better; tok/s higher is better)")
+    if not shown:
+        return
+    print("rank  npred  threshold  cpu_cap    TPOT ms      tok/s  selected")
+    for row in shown:
+        cfg = row["config"]
+        marker = "*" if cfg == selected else ""
+        print(f"{row['rank']:4}  {cfg['npred']:5}  {cfg['threshold']:9.6g}  {cfg['cpu_cap']:7}  "
+              f"{row[metric]:9.3f}  {row['tokens_per_second']:9.2f}  {marker}")
+
+
+def export_rankings(root, recommendation, numerical_search, top):
+    recommendation = recommendation or {}
+    frontier = recommendation.get("candidate_frontier", [])
+    selected = recommendation.get("selected") if recommendation.get("status") == "validated" else None
+    result = {
+        "status": recommendation.get("status", "predicted"), "selected": selected,
+        "definitions": "Each stage is ranked separately by ascending TPOT in ms/token. tok/s = 1000 / TPOT. Screening and confirmation can use different output lengths. Predictions are not measurements. Missing scores are excluded. The native selection retains its tolerance policy and need not rank first.",
+    }
+    sources = (frontier, frontier, (numerical_search or {}).get("ranking", []))
+    for (stage, metric, title), rows in zip(RANKING_METRICS, sources):
+        result[stage] = rank_candidates(rows, metric)
+        print_ranking(title, result[stage], metric, top, selected)
+    write_json(root / "ranked-configs.json", result)
+    with (root / "ranked-configs.csv").open("w", newline="", encoding="utf-8") as output:
+        writer = csv.writer(output)
+        writer.writerow(("stage", "rank", "npred", "threshold", "cpu_cap", "tpot_ms", "tokens_per_second", "selected"))
+        for stage, metric, _ in RANKING_METRICS:
+            for row in result[stage]:
+                cfg = row["config"]
+                writer.writerow((stage, row["rank"], cfg["npred"], cfg["threshold"], cfg["cpu_cap"],
+                                 row[metric], row["tokens_per_second"], cfg == selected))
+    print("* = native validated selection; stage rankings remain separate.")
+    print(f"All ranked configurations: {root / 'ranked-configs.json'}")
+    print(f"CSV: {root / 'ranked-configs.csv'}")
+
+
+def search(tool, trace, output, request=None, top=5):
     command = [str(tool.resolve(strict=True)), str(trace.resolve(strict=True)), str(output.resolve())]
     if request is not None:
         command.append(str(request))
@@ -139,11 +208,13 @@ def search(tool, trace, output, request=None):
     print("Predicted recommendation:", json.dumps(result["selected"]),
           f"supported candidates={result['supported_candidates']}")
     print(f"Search compute={result['search_ms']:.3f} ms; load and search={result['load_and_search_ms']:.3f} ms")
+    print_ranking("Model predictions (not measurements)", rank_candidates(result.get("ranking", []), "predicted_tpot_ms"),
+                  "predicted_tpot_ms", top)
     print(f"Full ranking: {output}")
     return result
 
 
-def report(root, print_rounds=True):
+def report(root, print_rounds=True, top=5):
     events = read_events(root / "telemetry.jsonl")
     rounds = [r for r in events if r["event"] == "round"]
     routes = [r for r in events if r["event"] == "route"]
@@ -205,6 +276,7 @@ def report(root, print_rounds=True):
     if recommendation:
         print("Recommended:", json.dumps(recommendation["selected"]),
               "status=" + recommendation.get("status", "predicted"))
+    export_rankings(root, recommendation, numerical_search, top)
     print(f"Full values: {root / 'telemetry.jsonl'}")
     return summary
 
@@ -236,6 +308,8 @@ def run(args):
         raise ValueError("Invalid token/context/thread count")
     if not 16 <= args.window <= 128 or not 0 <= args.cost_rounds <= 96 or args.slots < 1:
         raise ValueError("Invalid window, probe budget, or fixed slots")
+    if not 1 <= args.expert_threads <= 512:
+        raise ValueError("Expert threads must be between 1 and 512")
     if args.action == "serve" and not 1 <= args.sample_tokens <= 10000:
         raise ValueError("Sample interval must be between 1 and 10000 output tokens")
     args.output.mkdir(parents=True, exist_ok=False)
@@ -243,7 +317,8 @@ def run(args):
         args.profile = args.profile.resolve()
         if not args.profile.parent.is_dir():
             raise ValueError("Profile parent directory must exist")
-    require_idle_gpu(args.gpu)
+    if args.check_gpu_idle:
+        require_idle_gpu(args.gpu)
     port = args.port
     if not port:
         with socket.socket() as sock:
@@ -261,7 +336,8 @@ def run(args):
     process = None
     try:
         with (args.output / "server.log").open("w") as log:
-            process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
             deadline = time.monotonic() + args.timeout
             while True:
                 if process.poll() is not None:
@@ -328,10 +404,10 @@ def run(args):
     finally:
         if process is not None and process.poll() is None:
             stop_start = time.perf_counter()
-            process.send_signal(signal.SIGINT)
             try:
+                process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
                 process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
+            except (OSError, subprocess.TimeoutExpired):
                 process.kill()
                 process.wait()
             session["elapsed_seconds"]["shutdown"] = time.perf_counter() - stop_start
@@ -361,7 +437,7 @@ def run(args):
         session["elapsed_seconds"]["search"] = time.perf_counter() - search_started
         session["elapsed_seconds"]["total"] = time.perf_counter() - started
         write_json(args.output / "session.json", session)
-    report(args.output)
+    report(args.output, top=args.top)
     print(f"Standalone tuning {session['status']}. Observations and selection status are saved in", args.output)
 
 
@@ -373,8 +449,10 @@ def main():
                            help="Collect calibration data and search in one call" if action == "tune" else "Collect real requests and compare retained configurations after responses")
         p.set_defaults(action=action)
         p.add_argument("--server", type=Path, required=True)
+        p.add_argument("--check-gpu-idle", action="store_true", help="Require an idle GPU before starting")
         if action == "tune":
             p.add_argument("--tool", type=Path, help="Compatibility option; tune uses the native server search")
+            p.add_argument("--top", type=int, default=5, help="Show the top N configurations per ranking; 0 shows all. Exports always contain all candidates")
         else:
             p.add_argument("--sample-tokens", type=int, default=20, help="Collect after each N output tokens; default 20, plus the first decode step")
             p.add_argument("--observe-only", action="store_true", help="Collect without selecting a configuration for the next request")
@@ -394,6 +472,8 @@ def main():
         p.add_argument("--slots", type=int, default=64)
         p.add_argument("--cache-layers", type=int, default=4)
         p.add_argument("--threads", type=int, default=4)
+        p.add_argument("--expert-threads", type=int, default=8, help="Hybrid CPU expert pool size")
+        p.add_argument("--thinking", choices=("on", "off"), default="off", help="Enable thinking in chat templates")
         p.add_argument("--npred", type=int, default=0, help="Initial online prediction prefix width")
         p.add_argument("--threshold", type=float, default=0, help="Initial online draft threshold")
         p.add_argument("--cpu-cap", type=int, default=0, help="Initial online CPU expert cap")
@@ -409,15 +489,19 @@ def main():
     p.add_argument("--trace", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--request", type=int, help="Request ID; defaults to the last request")
+    p.add_argument("--top", type=int, default=5, help="Show the top N predictions; 0 shows all")
     p = sub.add_parser("report")
     p.add_argument("output", type=Path)
     p.add_argument("--summary-only", action="store_true")
+    p.add_argument("--top", type=int, default=5, help="Show the top N configurations per ranking; 0 shows all. Exports always contain all candidates")
     args = parser.parse_args()
+    if getattr(args, "top", 5) < 0:
+        parser.error("--top must be non-negative")
     try:
         if args.action == "search":
-            search(args.tool, args.trace, args.output, args.request)
+            search(args.tool, args.trace, args.output, args.request, args.top)
         elif args.action == "report":
-            report(args.output, not args.summary_only)
+            report(args.output, not args.summary_only, args.top)
         else:
             run(args)
     except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:

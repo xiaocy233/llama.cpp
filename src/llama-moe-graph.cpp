@@ -339,15 +339,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 break;
             }
         }
-        ggml_tensor * cpu_start = nullptr;
-        if (hybrid->cpu_expert_early) {
-            cpu_start = ggml_moe_cpu_stage(ctx0, ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur), input_ids, hybrid->gate_slot);
-        }
+        ggml_tensor * cpu_start = ggml_moe_cpu_stage(ctx0, ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur), input_ids, hybrid->gate_slot);
         ggml_tensor * resolved = ggml_moe_gate_hybrid(ctx0, hybrid->loc_map, input_ids, hybrid->gate_seq,
                 hybrid->gate_slot, n_tokens * n_expert_used, hybrid->n_slots);
-        if (cpu_start) resolved->src[3] = cpu_start;
+        resolved->src[3] = cpu_start;
         resolved = ggml_reshape_2d(ctx0, resolved, n_expert_used, n_tokens);
-        if (!cpu_start) cpu_start = ggml_moe_cpu_start(ctx0, ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur), resolved, hybrid->gate_slot);
+        if (!hybrid->cpu_expert_early) cpu_start = ggml_moe_cpu_start(ctx0, cpu_start, resolved, hybrid->gate_slot);
         up = ggml_mul_mat_id(ctx0, hybrid->slots[1], cpu_start, resolved);
         cur = ggml_mul_mat_id(ctx0, hybrid->slots[0], cpu_start, resolved);
         cur = ggml_swiglu_split(ctx0, cur, up);

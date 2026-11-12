@@ -963,7 +963,7 @@ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const char * __restrict__ x_ring, const int32_t * __restrict__ loc_map, const int n_phys,
         const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
-        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const int32_t * __restrict__ expert_bounds, const int2 * __restrict__ tile_map, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
@@ -1002,9 +1002,14 @@ static __global__ void mul_mat_q(
     if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback, prec_src1)) {
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
-        const int zt = tmp2.y;
-        const int jt = blockIdx.y;
+        int zt = tmp2.y;
+        int jt = blockIdx.y;
         const int it = blockIdx.x;
+        if (tile_map) {
+            const int2 tile = tile_map[jt];
+            zt = tile.x;
+            jt = tile.y;
+        }
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1089,14 +1094,19 @@ static __global__ void mul_mat_q(
     while (kbc < kbc_stop && kb0_stop == int(blocks_per_ne00.z)) {
         int tmp = fastdiv(kbc, blocks_per_ne00);
         uint2 tmp2 = fast_div_modulo(tmp, ntx);
-        const int jt = tmp2.y;
+        int jt = tmp2.y;
         tmp = tmp2.x;
         tmp2 = fast_div_modulo(tmp, nchannels_y);
-        const int zt = tmp2.y;
+        int zt = tmp2.y;
         tmp = tmp2.x;
         tmp2 = fast_div_modulo(tmp, nsamples_y);
         const int wt = tmp2.y;
         const int it = tmp2.x;
+        if (tile_map) {
+            const int2 tile = tile_map[jt];
+            zt = tile.x;
+            jt = tile.y;
+        }
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1182,14 +1192,19 @@ static __global__ void mul_mat_q(
 
     int tmp = fastdiv(kbc, blocks_per_ne00);
     uint2 tmp2 = fast_div_modulo(tmp, ntx);
-    const int jt = tmp2.y;
+    int jt = tmp2.y;
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nchannels_y);
-    const int zt = tmp2.y;
+    int zt = tmp2.y;
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nsamples_y);
     const int wt = tmp2.y;
     const int it = tmp2.x;
+    if (tile_map) {
+        const int2 tile = tile_map[jt];
+        zt = tile.x;
+        jt = tile.y;
+    }
 
     // Defaults for regular matrix multiplication:
     int col_low    = 0;
@@ -1417,6 +1432,20 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// Validated for long sparse MoE prefill on Blackwell. Keep a rollback switch.
+static inline bool ggml_cuda_mmq_flat_prefill(int cc, int64_t n_tokens, int64_t n_experts) {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_CUDA_MOE_FLAT_GRID");
+        return value == nullptr || strcmp(value, "0") != 0;
+    }();
+    return enabled && cc == GGML_CUDA_CC_BLACKWELL && n_tokens >= 256 &&
+        n_experts > 0 && n_experts <= 1024;
+}
+
+// Build a compact expert/column-tile map entirely on the device.
+void ggml_cuda_mmq_build_tile_map(const int32_t * bounds, int2 * map,
+        int n_experts, int tile_width, int n_tiles, int empty_tile, cudaStream_t stream);
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1434,9 +1463,20 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, prec_src1>), nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, prec_src1>), nbytes_shared);
 
-    const int nty  = (args.nrows_x   + config.I - 1) / config.I;
-    const int ntx  = (args.ncols_max + config.J - 1) / config.J;
-    const int ntzw = args.nchannels_y * args.nsamples_y;
+    const bool flat_moe = args.ids_dst && args.nsamples_y == 1 &&
+        ggml_cuda_mmq_flat_prefill(cc, args.ncols_max, args.nchannels_y);
+    ggml_cuda_pool_alloc<int2> tile_map(ctx.pool(id));
+    const int empty_tile = (args.ncols_y + config.J - 1) / config.J;
+    const int ntx_flat = empty_tile + std::min<int64_t>(args.nchannels_y, args.ncols_y);
+    if (flat_moe) {
+        tile_map.alloc(ntx_flat);
+        ggml_cuda_mmq_build_tile_map(args.expert_bounds, tile_map.get(), args.nchannels_y,
+            config.J, ntx_flat, empty_tile, stream);
+    }
+    const int nty  = (args.nrows_x + config.I - 1) / config.I;
+    const int ntx  = flat_moe ? ntx_flat : (args.ncols_max + config.J - 1) / config.J;
+    const int nchannels_grid = flat_moe ? 1 : args.nchannels_y;
+    const int ntzw = nchannels_grid * args.nsamples_y;
     const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
 
     GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
@@ -1446,14 +1486,14 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const uint3 blocks_per_ne00_fd = init_fastdiv_values(args.ncols_x / ggml_cuda_type_traits<type>::qk);
     const uint3 ntx_fd             = init_fastdiv_values(ntx);
-    const uint3 nchannels_y_fd     = init_fastdiv_values(args.nchannels_y);
+    const uint3 nchannels_y_fd     = init_fastdiv_values(nchannels_grid);
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
     if (!config.stream_k) {
         mul_mat_q<type, J, fallback, prec_src1><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-            (args.x, args.x_ring, args.loc_map, args.n_phys, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
+            (args.x, args.x_ring, args.loc_map, args.n_phys, args.y, args.ids_dst, args.expert_bounds, tile_map.get(), args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1466,7 +1506,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntiles_dst = ntx * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    // The fixup kernel has no expert map: flat grids use complete tiles only.
+    const dim3 block_nums_stream_k(flat_moe || (GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90) ? ntiles_dst : nsm, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
@@ -1482,7 +1523,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
     mul_mat_q<type, J, fallback, prec_src1><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-        (args.x, args.x_ring, args.loc_map, args.n_phys, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
+        (args.x, args.x_ring, args.loc_map, args.n_phys, args.y, args.ids_dst, args.expert_bounds, tile_map.get(), args.dst, tmp_fixup.ptr, args.y_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,

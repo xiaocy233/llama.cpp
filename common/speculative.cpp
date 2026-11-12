@@ -1986,7 +1986,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                // Keep full drafts for calibration and probabilistic sampler state.
+                int n_max = params.n_max;
+                if (!autotune && !dp.result_q && dp.n_max > 0) {
+                    n_max = std::min(n_max, std::max(params.n_min, dp.n_max));
+                }
+                if (n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

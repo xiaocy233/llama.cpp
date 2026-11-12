@@ -140,6 +140,20 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 }
 
 template <typename T>
+static __global__ void concat_narrow_2d(
+        const char * x, const char * y, char * dst,
+        int64_t nx, int64_t width, int64_t rows, unsigned shift,
+        uint64_t x0, uint64_t x1, uint64_t y0, uint64_t y1,
+        uint64_t d0, uint64_t d1) {
+    const int64_t index = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t row = index >> shift;
+    const int64_t col = index & ((1u << shift) - 1);
+    if (row >= rows || col >= width) return;
+    const char * src = col < nx ? x + row*x1 + col*x0 : y + row*y1 + (col-nx)*y0;
+    *(T *) (dst + row*d1 + col*d0) = *(const T *) src;
+}
+
+template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
@@ -162,6 +176,22 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        static const bool narrow = [] {
+            const char * value = getenv("GGML_CUDA_SMALL_CONCAT");
+            return value && strcmp(value, "1") == 0;
+        }();
+        if (narrow && sizeof(T) <= 4 && dim == 0 && dst->ne[0] > 0 && dst->ne[0] <= 32 && dst->ne[2] == 1 && dst->ne[3] == 1) {
+            unsigned shift = 0;
+            while ((1u << shift) < dst->ne[0]) ++shift;
+            const int64_t count = dst->ne[1] * (1u << shift);
+            const int64_t blocks = (count + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+            concat_narrow_2d<T><<<blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                src0->ne[0], dst->ne[0], dst->ne[1], shift,
+                src0->nb[0], src0->nb[1], src1->nb[0], src1->nb[1], dst->nb[0], dst->nb[1]);
+            return;
+        }
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {

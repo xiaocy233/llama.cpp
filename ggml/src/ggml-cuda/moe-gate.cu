@@ -1,4 +1,5 @@
 #include "moe-gate.cuh"
+#include "../ggml-moe-backend.h"
 
 #include "ggml-backend.h"
 
@@ -236,6 +237,90 @@ static __global__ void moe_cpu_merge_kernel(float * dst, const float * values, c
     if (col < width) {
         dst[(int64_t) rows[row] * width + col] = values[(int64_t) row * width + col];
     }
+}
+
+static __global__ void moe_cpu_stage_kernel(ggml_moe_cpu_graph * job, const float * input, int size, const int32_t * seq) {
+    float * source = (float *) (job + 1);
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        source[i] = input[i];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        ((volatile ggml_moe_cpu_graph *) job)->input_seq = (uint32_t) *seq;
+    }
+}
+
+struct moe_cpu_graph_result {
+    int count;
+    int rows[GGML_MOE_GATE_MAX_IDS];
+};
+
+static __global__ void moe_cpu_graph_wait_kernel(const volatile ggml_moe_cpu_graph * job, const int32_t * seq, moe_cpu_graph_result * result) {
+    __shared__ int count;
+    if (threadIdx.x == 0) {
+        const uint64_t begin = moe_gate_now_ns();
+        while (job->output_seq != (uint32_t) *seq) {
+            if (moe_gate_now_ns() - begin > MOE_GATE_TIMEOUT_NS) {
+                __trap();
+            }
+            moe_gate_relax();
+        }
+        if (job->status != GGML_STATUS_SUCCESS) {
+            __trap();
+        }
+        __threadfence_system();
+        count = job->count;
+        result->count = count;
+    }
+    __syncthreads();
+    __threadfence_system();
+    if (threadIdx.x < count) {
+        result->rows[threadIdx.x] = job->rows[threadIdx.x];
+    }
+}
+
+static __global__ void moe_cpu_graph_merge_kernel(float * dst, const volatile float * values, const moe_cpu_graph_result * result, int width) {
+    const int row = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < result->count && col < width) {
+        dst[(int64_t) result->rows[row] * width + col] = values[(int64_t) row * width + col];
+    }
+}
+
+void ggml_cuda_op_moe_cpu(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool capturing) {
+    if (ggml_get_op_params_i32(dst, 1) == 0 && dst->src[0]->op == GGML_OP_MOE_CPU) {
+        return;
+    }
+    ggml_moe_cpu_graph * device;
+    ggml_moe_cpu_graph * host;
+    const int32_t * seq;
+    memcpy(&device, dst->op_params + 2, sizeof(device));
+    memcpy(&seq, dst->op_params + 4, sizeof(seq));
+    memcpy(&host, dst->op_params + 6, sizeof(host));
+    GGML_ASSERT(device && host && seq);
+    if (ggml_get_op_params_i32(dst, 1) != 1) {
+        moe_cpu_stage_kernel<<<1, 256, 0, ctx.stream()>>>(device, (const float *) dst->src[0]->data, ggml_nelements(dst->src[0]), seq);
+    } else {
+        if (!capturing) {
+            // Flush the input publication before waiting on the host during graph warmup.
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            const uint32_t token = ((volatile ggml_moe_cpu_graph *) host)->input_seq;
+            const int64_t begin = ggml_time_us();
+            while (((volatile ggml_moe_cpu_graph *) host)->output_seq != token) {
+                GGML_ASSERT(ggml_time_us() - begin < 5000000);
+                std::this_thread::yield();
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+        }
+        ggml_cuda_pool_alloc<moe_cpu_graph_result> result(ctx.pool(), 1);
+        // Wait in one block, then read the mapped results in parallel.
+        moe_cpu_graph_wait_kernel<<<1, 256, 0, ctx.stream()>>>(device, seq, result.get());
+        const dim3 blocks((dst->ne[0] + 255) / 256, ggml_nelements(dst) / dst->ne[0]);
+        const float * values = (const float *) (device + 1) + host->input_size;
+        moe_cpu_graph_merge_kernel<<<blocks, 256, 0, ctx.stream()>>>((float *) dst->data, values, result.get(), dst->ne[0]);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void ggml_cuda_moe_cpu_merge(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float * values, const int32_t * rows, int count) {

@@ -1,5 +1,6 @@
 #include "moe-autotune.h"
 #include "moe-autotune-model.h"
+#include "common.h"
 #include "../src/llama-ext.h"
 #include "log.h"
 #include <nlohmann/json.hpp>
@@ -295,10 +296,7 @@ struct common_moe_autotune::impl {
               {"sample_tokens", sampling.interval}, {"frequency_scope", "traced_rounds"}, {"layers", observed}});
         output.flush();
         if (!profile_path.empty() && !signature.empty()) {
-            const std::string temporary = profile_path + "." + std::to_string(ggml_time_us()) + ".tmp";
-            std::ofstream file(temporary);
-            file << model.json(signature).dump(2) << '\n'; file.close();
-            if (!file || std::rename(temporary.c_str(), profile_path.c_str())) throw std::runtime_error("cannot save autotune cost profile");
+            fs_write_atomic(std::filesystem::u8path(profile_path), model.json(signature).dump(2) + "\n");
         }
         control_us += ggml_time_us() - started;
     }

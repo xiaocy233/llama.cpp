@@ -12,6 +12,7 @@ static layer_sample layer() {
 }
 
 int main() {
+    ggml_time_init();
     auto l = layer();
     cache_state cache(l);
     const auto first = cache.advance(l.view(), 1, {});

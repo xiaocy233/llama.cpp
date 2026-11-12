@@ -45,9 +45,26 @@ inline ggml_moe_backend_caps ggml_moe_backend_get_caps(ggml_backend_dev_t device
     return get ? get(device) : ggml_moe_backend_caps{0, false, false};
 }
 
+struct ggml_moe_copy {
+    void * dst;
+    const void * src;
+    size_t bytes;
+};
+using ggml_moe_batch_copy_fn = void (*)(ggml_backend_t, int, const ggml_moe_copy *, size_t);
+
 using ggml_moe_cpu_max_tokens_fn = int (*)(ggml_backend_t, ggml_type);
 using ggml_moe_cpu_merge_begin_fn = bool (*)(ggml_backend_t, ggml_tensor *, const float *, const int32_t *, int, const uint32_t *);
 using ggml_moe_cpu_merge_fn = void (*)(ggml_backend_t, ggml_tensor *, const float *, const int32_t *, int);
+// Input and output arrays follow this header and keep fixed addresses across graph replays.
+struct ggml_moe_cpu_graph {
+    uint32_t input_seq;
+    uint32_t output_seq;
+    int32_t status;
+    int32_t count;
+    int32_t input_size;
+    int32_t rows[GGML_MOE_GATE_MAX_IDS];
+};
+using ggml_moe_cpu_graph_map_fn = void * (*)(ggml_backend_t, ggml_moe_cpu_graph *);
 using ggml_moe_tune_timer_fn = double (*)(ggml_backend_t, void **, int);
 
 struct ggml_moe_prefill {

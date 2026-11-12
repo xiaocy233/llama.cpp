@@ -5,6 +5,8 @@
 #include "../ggml/src/ggml-impl.h"
 
 #include <cstdlib>
+#include <cstring>
+#include <sstream>
 
 #if defined(__APPLE__)
 #include <unistd.h>
@@ -189,17 +191,37 @@ void llama_model::init_moe_slot_caches(int n_slots, int n_pred, const char * pro
         return;
     }
 
+    std::vector<int> layer_slots(hparams.n_layer(), n_slots);
+    if (const char * value = getenv("GGML_MOE_LAYER_SLOTS")) {
+        std::istringstream input(value);
+        std::string field;
+        size_t layer = 0;
+        while (std::getline(input, field, ',')) {
+            size_t end = 0;
+            const int count = std::stoi(field, &end);
+            if (end != field.size() || layer >= layer_slots.size() ||
+                    count < (int) hparams.n_expert_used() + 2 || count > n_expert) {
+                throw std::runtime_error("invalid GGML_MOE_LAYER_SLOTS capacity");
+            }
+            layer_slots[layer++] = count;
+        }
+        if (layer != layer_slots.size() || !*value || value[std::strlen(value)-1] == ',') {
+            throw std::runtime_error("GGML_MOE_LAYER_SLOTS needs one capacity per trunk layer");
+        }
+    }
+
     std::vector<moe_slot_layer> built;
     for (const auto & c : cands) {
+        const int capacity = layer_slots[c.il];
         moe_slot_layer L;
         if (use_profile) {
             const auto & rank = ranks.at(c.il);
-            L.initial_experts.assign(rank.begin(), rank.begin() + n_slots);
+            L.initial_experts.assign(rank.begin(), rank.begin() + capacity);
             L.initial_freq = initial_freq.at(c.il);
         }
         L.layer    = c.il;
         L.n_expert = n_expert;
-        L.n_slots  = n_slots;
+        L.n_slots  = capacity;
         bool pinned = buft_pinned != nullptr;
 
 #if defined(__APPLE__)
