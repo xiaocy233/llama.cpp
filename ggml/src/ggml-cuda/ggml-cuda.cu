@@ -360,9 +360,20 @@ static ggml_cuda_device_info ggml_cuda_init() {
         // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
         // TODO: Check for future drivers the default scheduling strategy and
         // remove this call again when cudaDeviceScheduleSpin is default.
-        if (prop.major == 12 && prop.minor == 1) {
+        const char * schedule = getenv("GGML_CUDA_SCHEDULE");
+        if (schedule || (prop.major == 12 && prop.minor == 1)) {
+            unsigned int mode = cudaDeviceScheduleSpin;
+            if (schedule) {
+                if (strcmp(schedule, "auto") == 0) mode = cudaDeviceScheduleAuto;
+                else if (strcmp(schedule, "spin") == 0) mode = cudaDeviceScheduleSpin;
+                else if (strcmp(schedule, "yield") == 0) mode = cudaDeviceScheduleYield;
+                else if (strcmp(schedule, "blocking") == 0) mode = cudaDeviceScheduleBlockingSync;
+                else GGML_ABORT("GGML_CUDA_SCHEDULE must be auto, spin, yield, or blocking");
+            }
             CUDA_CHECK(cudaSetDevice(physical_id));
-            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+            unsigned int before = 0;
+            CUDA_CHECK(cudaGetDeviceFlags(&before));
+            CUDA_CHECK(cudaSetDeviceFlags((before & ~cudaDeviceScheduleMask) | mode));
         }
 
 #endif  // defined(GGML_USE_HIP)

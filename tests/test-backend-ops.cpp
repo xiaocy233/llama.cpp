@@ -6713,7 +6713,11 @@ struct test_concat : public test_case {
         auto ne_b = ne_a;
         ne_b[dim] = ne_b_d;
         ggml_tensor * a;
-        if (v & 1) {
+        if (v & 16) {
+            a = ggml_new_tensor_2d(ctx, type, ne_a[1], ne_a[0]);
+            a = ggml_transpose(ctx, a);
+            ggml_set_name(a, "transposed_a");
+        } else if (v & 1) {
             auto ne = ne_a; ne[0] *= 2; ne[1] *= 4; ne[2] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
             ggml_set_name(a, "a");
@@ -6732,7 +6736,11 @@ struct test_concat : public test_case {
             ggml_set_name(a, "a");
         }
         ggml_tensor * b;
-        if (v & 2) {
+        if (v & 32) {
+            b = ggml_new_tensor_2d(ctx, type, ne_b[1], ne_b[0]);
+            b = ggml_transpose(ctx, b);
+            ggml_set_name(b, "transposed_b");
+        } else if (v & 2) {
             auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
             b = ggml_new_tensor(ctx, type, 4, ne.data());
             ggml_set_name(b, "b");
@@ -11014,6 +11022,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // few long rows, which backends may split across workgroups
+    for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_I8, GGML_TYPE_I16, GGML_TYPE_I32}) {
+        for (int view : {16, 32, 48}) {
+            for (int64_t rows : {1, 33, 8192}) {
+                test_cases.emplace_back(new test_concat(type, {3, rows, 1, 1}, 4, 0, view));
+                test_cases.emplace_back(new test_concat(type, {15, rows, 1, 1}, 17, 0, view));
+            }
+        }
+    }
+
     for (int dim : { 0, 1 }) {
         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98304, 8, 1, 1}, dim == 0 ? 288 : 2, dim, 0));
         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {20000, 3, 2, 1}, dim == 0 ? 333 : 1, dim, 1));

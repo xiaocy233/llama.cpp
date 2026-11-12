@@ -234,12 +234,62 @@ static int next_power_of_2(int x) {
     return n;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template<ggml_sort_order order>
+static __global__ void k_argsort_512_register(const float * x, int * dst) {
+    const int col = threadIdx.x;
+    const int64_t offset = int64_t(blockIdx.x) * 512;
+    float value = x[offset + col];
+    int index = col;
+    __shared__ float values[512];
+    __shared__ int indices[512];
+
+    for (int k = 2; k <= 512; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            float peer_value;
+            int peer_index;
+            if (j < ggml_cuda_get_physical_warp_size()) {
+                peer_value = __shfl_xor_sync(0xffffffff, value, j);
+                peer_index = __shfl_xor_sync(0xffffffff, index, j);
+            } else {
+                values[col] = value;
+                indices[col] = index;
+                __syncthreads();
+                peer_value = values[col ^ j];
+                peer_index = indices[col ^ j];
+                __syncthreads();
+            }
+            const bool ascending = order == GGML_SORT_ORDER_ASC ? (col & k) == 0 : (col & k) != 0;
+            const bool take_min = ascending == ((col & j) == 0);
+            if (take_min ? value > peer_value : value < peer_value) {
+                value = peer_value;
+                index = peer_index;
+            }
+        }
+    }
+    dst[offset + col] = index;
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 void argsort_f32_i32_cuda_bitonic(const float *   x,
                                   int *           dst,
                                   const int       ncols,
                                   const int       nrows,
                                   ggml_sort_order order,
                                   cudaStream_t    stream) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ncols == 512) {
+        if (order == GGML_SORT_ORDER_ASC) {
+            k_argsort_512_register<GGML_SORT_ORDER_ASC><<<nrows, 512, 0, stream>>>(x, dst);
+        } else if (order == GGML_SORT_ORDER_DESC) {
+            k_argsort_512_register<GGML_SORT_ORDER_DESC><<<nrows, 512, 0, stream>>>(x, dst);
+        } else {
+            GGML_ABORT("fatal error");
+        }
+        return;
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     // bitonic sort requires ncols to be power of 2
     const int ncols_pad = next_power_of_2(ncols);
 
