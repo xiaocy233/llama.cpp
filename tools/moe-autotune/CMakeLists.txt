@@ -1,0 +1,7 @@
+set(TARGET llama-moe-autotune)
+add_executable(${TARGET} moe-autotune.cpp)
+target_link_libraries(${TARGET} PRIVATE llama-common)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+endif()
