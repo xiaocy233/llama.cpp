@@ -11475,6 +11475,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //    }
     //}
 
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_IQ2_S}) {
+        for (int64_t tokens : {1, 2, 4}) {
+            for (int64_t rows : {127, 128, 129}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, tokens, rows, 256,
+                    true, 8, 1, true, false, true, false, {1, 1}));
+            }
+        }
+    }
+
     // Both sides of the same row-count boundary as above, on the fused path.
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
