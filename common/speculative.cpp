@@ -1804,6 +1804,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
 
+                if (batch_in.tokens[k].pos[0] == 0) {
+                    // A new sequence has no hidden row from the preceding token.
+                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                }
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()
                     : h_tgt + (size_t) (k - 1) * n_embd;
@@ -1982,7 +1986,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                // Keep full drafts for calibration and probabilistic sampler state.
+                int n_max = params.n_max;
+                if (!autotune && !dp.result_q && dp.n_max > 0) {
+                    n_max = std::min(n_max, std::max(params.n_min, dp.n_max));
+                }
+                if (n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2763,6 +2772,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
+
+    if (std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                  COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end()) {
+        result.n_ubatch = params_spec.n_ubatch_mtp;
+    }
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
