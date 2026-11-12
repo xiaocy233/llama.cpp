@@ -1099,9 +1099,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_GATE",
+    "MOE_CPU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1217,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_gate(loc_map, ids)",
+    "moe_cpu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3420,6 +3426,177 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_id_dual(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * slots,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * ring,
+        struct ggml_tensor  * loc_map) {
+    GGML_ASSERT(!ggml_is_transposed(slots));
+    GGML_ASSERT(!ggml_is_transposed(ring));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(loc_map->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(slots->ne[3] == 1);
+    GGML_ASSERT(ring->ne[3] == 1);
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->ne[1] == b->ne[2]);
+    GGML_ASSERT(slots->ne[0] == b->ne[0]);
+    GGML_ASSERT(ring->ne[0] == b->ne[0]);
+    GGML_ASSERT(slots->ne[1] == ring->ne[1]);
+    GGML_ASSERT(slots->type  == ring->type);
+    GGML_ASSERT(ids->ne[0] % b->ne[1] == 0);
+    GGML_ASSERT(ggml_nelements(loc_map) > 0);
+
+    const int64_t ne[4] = { slots->ne[1], ids->ne[0], b->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ID;
+    result->src[0] = slots;
+    result->src[1] = b;
+    result->src[2] = ids;
+    result->src[3] = ring;
+    result->src[4] = loc_map;
+
+    return result;
+}
+
+static struct ggml_tensor * ggml_moe_gate_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * loc_map,
+        struct ggml_tensor  * ids_in,
+        struct ggml_tensor  * seq,
+        int                   layer,
+        int                   n_ids,
+        int                   n_slots,
+        int                   mode) {
+    GGML_ASSERT(loc_map->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids_in->type  == GGML_TYPE_I32);
+    GGML_ASSERT(seq->type     == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(seq) == 1);
+    GGML_ASSERT(ggml_is_contiguous(ids_in));
+    GGML_ASSERT(layer >= 0);
+    GGML_ASSERT(n_slots > 0);
+    GGML_ASSERT(n_ids > 0 && n_ids <= GGML_MOE_GATE_MAX_IDS && n_ids <= ggml_nelements(ids_in));
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_ids);
+
+    int64_t n_pred = ggml_nelements(ids_in) - n_ids;
+    if (n_ids + n_pred > GGML_MOE_GATE_MAX_IDS) {
+        n_pred = GGML_MOE_GATE_MAX_IDS - n_ids;
+    }
+
+    const int32_t params[] = { layer, n_ids, (int32_t) n_pred, n_slots, mode };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_GATE;
+    result->src[0] = loc_map;
+    result->src[1] = ids_in;
+    result->src[2] = seq;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_gate(struct ggml_context * ctx, struct ggml_tensor * loc_map, struct ggml_tensor * ids, struct ggml_tensor * seq, int layer, int n_ids, int n_slots) {
+    return ggml_moe_gate_impl(ctx, loc_map, ids, seq, layer, n_ids, n_slots, GGML_MOE_GATE_MODE_NORMAL);
+}
+
+struct ggml_tensor * ggml_moe_cpu_start(struct ggml_context * ctx, struct ggml_tensor * input, struct ggml_tensor * resolved_ids, int layer) {
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));
+    GGML_ASSERT(resolved_ids->type == GGML_TYPE_I32 && ggml_is_contiguous(resolved_ids));
+    struct ggml_tensor * result = ggml_view_tensor(ctx, input);
+    result->op = GGML_OP_MOE_CPU;
+    result->src[0] = input;
+    result->src[1] = resolved_ids;
+    const int32_t params[] = { layer, 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_cpu_stage(struct ggml_context * ctx, struct ggml_tensor * input, struct ggml_tensor * ids, int layer) {
+    struct ggml_tensor * result = ggml_moe_cpu_start(ctx, input, ids, layer);
+    ggml_set_op_params_i32(result, 1, 2);
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_cpu_finish(struct ggml_context * ctx, struct ggml_tensor * output, struct ggml_tensor * start) {
+    GGML_ASSERT(start->op == GGML_OP_MOE_CPU && (ggml_get_op_params_i32(start, 1) == 0 || ggml_get_op_params_i32(start, 1) == 2));
+    GGML_ASSERT(output->type == GGML_TYPE_F32 && ggml_is_contiguous(output));
+    struct ggml_tensor * result = ggml_view_tensor(ctx, output);
+    result->op = GGML_OP_MOE_CPU;
+    result->src[0] = output;
+    result->src[1] = start;
+    const int32_t params[] = { ggml_get_op_params_i32(start, 0), 1 };
+    ggml_set_op_params(result, params, sizeof(params));
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_gate_hybrid(struct ggml_context * ctx, struct ggml_tensor * loc_map, struct ggml_tensor * ids, struct ggml_tensor * seq, int layer, int n_ids, int n_slots) {
+    return ggml_moe_gate_impl(ctx, loc_map, ids, seq, layer, n_ids, n_slots, GGML_MOE_GATE_MODE_HYBRID);
+}
+
+struct ggml_tensor * ggml_moe_gate_substitute(
+        struct ggml_context * ctx, struct ggml_tensor * loc_map, struct ggml_tensor * ids_in,
+        struct ggml_tensor * seq, struct ggml_tensor * probs,
+        int layer, int n_ids, int n_slots, float threshold) {
+    GGML_ASSERT(loc_map->type == GGML_TYPE_I32 && ids_in->type == GGML_TYPE_I32 && seq->type == GGML_TYPE_I32);
+    GGML_ASSERT(probs->type == GGML_TYPE_F32 && ggml_nelements(probs) == ggml_nelements(loc_map));
+    GGML_ASSERT(ggml_is_contiguous(ids_in) && ggml_is_contiguous(probs));
+    GGML_ASSERT(n_ids > 0 && n_ids <= 32 && n_ids <= GGML_MOE_GATE_MAX_IDS && n_slots >= n_ids);
+    GGML_ASSERT(ggml_nelements(probs) > 0 && ggml_nelements(probs) <= GGML_MOE_GATE_MAX_EXPERTS);
+    GGML_ASSERT(ggml_nelements(seq) == 1 && layer >= 0 && layer < GGML_MOE_GATE_MAX_LAYERS);
+    GGML_ASSERT(isfinite(threshold) && threshold >= 0 && threshold <= 1);
+    int n_pred = (int) ggml_nelements(ids_in) - n_ids;
+    GGML_ASSERT(n_pred >= 0);
+    if (n_pred > GGML_MOE_GATE_MAX_IDS - n_ids) n_pred = GGML_MOE_GATE_MAX_IDS - n_ids;
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids, 2);
+    const int32_t params[] = {layer, n_ids, n_pred, n_slots, GGML_MOE_GATE_MODE_SUBSTITUTE};
+    ggml_set_op_params(result, params, sizeof(params));
+    memcpy((char *) result->op_params + 5 * sizeof(int32_t), &threshold, sizeof(threshold));
+    result->op = GGML_OP_MOE_GATE;
+    result->src[0] = loc_map;
+    result->src[1] = ids_in;
+    result->src[2] = seq;
+    result->src[3] = probs;
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_head(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * pred_ids,
+        struct ggml_tensor  * seq,
+        int                   layer) {
+    GGML_ASSERT(ids->type      == GGML_TYPE_I32);
+    GGML_ASSERT(pred_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(seq->type      == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(ids));
+    GGML_ASSERT(ggml_is_contiguous(pred_ids));
+    GGML_ASSERT(ggml_nelements(seq) == 1);
+    GGML_ASSERT(layer >= 0 && layer < GGML_MOE_GATE_MAX_LAYERS);
+    GGML_ASSERT(ggml_nelements(ids) <= GGML_MOE_GATE_MAX_IDS);
+    GGML_ASSERT(ggml_nelements(pred_ids) <= GGML_MOE_GATE_MAX_IDS);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, ids);
+    const int32_t params[] = {
+        layer,
+        (int32_t) ggml_nelements(ids),
+        (int32_t) ggml_nelements(pred_ids),
+        0,
+        GGML_MOE_GATE_MODE_HEAD,
+    };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_GATE;
+    result->src[0] = ids;
+    result->src[1] = pred_ids;
+    result->src[2] = seq;
 
     return result;
 }
