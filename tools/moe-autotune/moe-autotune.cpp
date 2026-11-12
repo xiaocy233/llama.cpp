@@ -28,7 +28,7 @@ static round_sample read_round(const tune_json & j, int max_draft, bool sequenti
     sample.kept = bounded(j.at("kept"), 0, max_draft);
     sample.position = bounded(j.at("position"), 0, 1000000000);
     const auto & cfg = j.at("config");
-    sample.executed.width = bounded(cfg.at("npred"), 0, 24);
+    sample.executed.prefetch = bounded(cfg.at("prefetch_budget"), 0, 24);
     sample.executed.cpu = bounded(cfg.at("cpu_cap"), 0, 8);
     sample.executed.threshold = duration(cfg.at("threshold"));
     if (sample.executed.threshold > 1) throw std::runtime_error("invalid threshold");
@@ -64,6 +64,17 @@ static round_sample read_round(const tune_json & j, int max_draft, bool sequenti
         l.slots = bounded(v.at("slots"), 1, l.experts);
         l.top_k = bounded(v.at("top_k"), 1, std::min(l.experts, GGML_MOE_TUNE_IDS / batch));
         l.width = bounded(v.at("width"), 1, 1000000);
+        l.cache_policy = bounded(v.at("cache_policy"), 0, 2);
+        if (l.cache_policy == 1) throw std::runtime_error("LRU replay is unsupported");
+        l.decay_interval = bounded(v.at("decay_interval"), 1, 1000000000);
+        l.batches = bounded(v.at("batches"), 0, 1000000000);
+        l.epoch = bounded(v.at("epoch"), 0, 1000000000);
+        l.cpu_step = bounded(v.at("cpu_step"), 0, 1000000000);
+        l.cpu_min_tokens = bounded(v.at("cpu_min_tokens"), 1, GGML_MOE_TUNE_IDS + 1);
+        l.cpu_reuse_window = bounded(v.at("cpu_reuse_window"), 0, 1024);
+        if (v.at("recent").size() != size_t(l.slots) || v.at("cpu_last_used").size() != size_t(l.experts)) throw std::runtime_error("invalid cache history dimensions");
+        for (const auto & value : v.at("recent")) layer.recent.push_back(bounded(value, 0, l.epoch));
+        for (const auto & value : v.at("cpu_last_used")) layer.cpu_last_used.push_back(bounded(value, 0, l.cpu_step));
         if (v.at("bytes").size() != 3 || v.at("types").size() != 3 || v.at("owners").size() != size_t(l.slots) ||
                 v.at("prefetchable").size() != size_t(l.slots) || v.at("lfu").size() != size_t(l.experts) ||
                 v.at("actual").size() != size_t(batch * l.top_k) || v.at("predicted").size() > GGML_MOE_TUNE_IDS || v.at("predicted").size() % batch) {
@@ -100,6 +111,7 @@ static round_sample read_round(const tune_json & j, int max_draft, bool sequenti
 }
 
 int main(int argc, char ** argv) {
+    ggml_time_init();
     if (argc < 3 || argc > 5) {
         std::fprintf(stderr, "usage: %s TELEMETRY.jsonl RESULT.json [REQUEST_ID] [--observed-threshold]\n", argv[0]);
         return argc == 2 && std::string(argv[1]) == "--help" ? 0 : 1;
@@ -131,7 +143,8 @@ int main(int argc, char ** argv) {
             auto j = tune_json::parse(line);
             const std::string event = j.at("event");
             if (event == "start") {
-                width = bounded(j.at("built_prediction_width"), 0, 24);
+                if (j.at("version") != 9) throw std::runtime_error("trace uses obsolete prediction-prefix semantics; recollect with this build");
+                width = bounded(j.at("max_prefetch_budget"), 0, 24);
                 max_draft = bounded(j.value("max_draft", tune_json(7)), 1, 7);
                 const std::string type = j.value("spec_type", "draft-dflash");
                 if (type != "draft-dflash" && type != "draft-mtp") throw std::runtime_error("unsupported draft type");
@@ -160,6 +173,10 @@ int main(int argc, char ** argv) {
                     v["bytes"] = std::vector<uint64_t>(l.bytes, l.bytes + 3);
                     v["types"] = std::vector<int>(l.types, l.types + 3);
                     v["owners"] = prior.owners; v["lfu"] = prior.freq;
+                    v["recent"] = prior.recent; v["cpu_last_used"] = prior.cpu_last_used;
+                    v["cache_policy"] = l.cache_policy; v["decay_interval"] = l.decay_interval;
+                    v["batches"] = l.batches; v["epoch"] = l.epoch; v["cpu_step"] = l.cpu_step;
+                    v["cpu_min_tokens"] = l.cpu_min_tokens; v["cpu_reuse_window"] = l.cpu_reuse_window;
                     v["prefetchable"] = tune_json::array();
                     for (auto eligible : prior.prefetchable) v["prefetchable"].push_back(bool(eligible));
                     v["loads"] = 0; v["prefetches"] = 0; v["cpu_assignments"] = 0;
@@ -188,6 +205,8 @@ int main(int argc, char ** argv) {
                         throw std::runtime_error("replayed expert work differs at round " + std::to_string(sample.round) + " layer " + std::to_string(layer.stats.layer));
                     }
                     auto next = layer;
+                    next.stats.batches = state.batches; next.stats.epoch = state.epoch; next.stats.cpu_step = state.cpu_step;
+                    next.recent = std::move(state.recent); next.cpu_last_used = std::move(state.cpu_last_used);
                     next.owners = std::move(state.owners); next.freq = std::move(state.freq); next.prefetchable = std::move(state.prefetchable);
                     observed_layers.emplace(layer.stats.layer, std::move(next));
                 }

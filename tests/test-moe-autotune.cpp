@@ -28,6 +28,34 @@ int main() {
     const auto pf = pf_cache.advance(predicted.view(), 1, {8, 0, 0});
     GGML_ASSERT(pf.prefetch == 1 && pf.miss == 0 && pf_cache.owners[0] == 0 && pf_cache.owners[1] == 2);
 
+    // A resident prediction must not consume the missing-expert copy budget.
+    auto capped = cache_state(predicted);
+    const auto capped_work = capped.advance(predicted.view(), 1, {1, 0, 0});
+    GGML_ASSERT(capped_work.prefetch == 1 && capped_work.miss == 0);
+    const auto no_copy = cache_state(predicted).advance(predicted.view(), 1, {});
+    GGML_ASSERT(no_copy.prefetch == 0 && no_copy.miss == 1);
+
+    auto decayed = l;
+    decayed.stats.cache_policy = 2; decayed.stats.decay_interval = 8;
+    decayed.stats.batches = 8; decayed.stats.epoch = 10;
+    decayed.freq = {3, 2, 0, 0}; decayed.recent = {2, 7};
+    auto decay_cache = cache_state(decayed);
+    decay_cache.advance(decayed.view(), 1, {});
+    // Both frequencies become 1; the older slot, not the smaller original count, loses.
+    GGML_ASSERT(decay_cache.owners[0] == 2 && decay_cache.owners[1] == 1);
+    GGML_ASSERT(decay_cache.batches == 9 && decay_cache.epoch == 11);
+    decayed.stats.batches = 7;
+    auto before_decay = cache_state(decayed);
+    before_decay.advance(decayed.view(), 1, {});
+    GGML_ASSERT(before_decay.owners[0] == 0 && before_decay.owners[1] == 2);
+
+    auto reused = l;
+    reused.stats.cpu_min_tokens = 2; reused.stats.cpu_reuse_window = 1;
+    reused.stats.cpu_step = 5; reused.cpu_last_used = {0, 0, 5, 0};
+    GGML_ASSERT(cache_state(reused).advance(reused.view(), 1, {0, 0, 4}).assignments == 0);
+    reused.cpu_last_used[2] = 4;
+    GGML_ASSERT(cache_state(reused).advance(reused.view(), 1, {0, 0, 4}).assignments == 1);
+
     auto crowded = l;
     crowded.stats.n_ids = 3;
     crowded.stats.ids[0] = 0; crowded.stats.ids[1] = 1; crowded.stats.ids[2] = 2;

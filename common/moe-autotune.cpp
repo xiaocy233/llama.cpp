@@ -115,15 +115,15 @@ struct common_moe_autotune::impl {
         if (std::ifstream(output_path).good()) throw std::runtime_error("autotune output already exists");
         output.open(output_path);
         if (!output) throw std::runtime_error("cannot open autotune output");
-        max_width = env_int("LLAMA_MOE_AUTOTUNE_MAX_PRED", 24, 8, 24);
+        max_width = env_int("LLAMA_MOE_AUTOTUNE_MAX_PREFETCH", 8, 0, 24);
         window = env_int("LLAMA_MOE_AUTOTUNE_WINDOW", 32, 16, 128);
         cost_limit = env_int("LLAMA_MOE_AUTOTUNE_COST_ROUNDS", 48, 0, 96);
         trial_budget = env_int("LLAMA_MOE_AUTOTUNE_TRIAL_BUDGET", 24, 10, 24);
         candidate_warmup = env_int("LLAMA_MOE_AUTOTUNE_WARMUP_REQUESTS", sequential ? 1 : 0, 0, 1);
         candidate_confirm = env_int("LLAMA_MOE_AUTOTUNE_CONFIRM_REQUESTS", sequential ? 0 : 1, 0, 1);
         if (const char * s = std::getenv("LLAMA_MOE_AUTOTUNE_PROFILE")) profile_path = s;
-        if (online) {
-            configured.width = env_int("LLAMA_MOE_AUTOTUNE_NPRED", 0, 0, max_width);
+        {
+            configured.prefetch = env_int("LLAMA_MOE_AUTOTUNE_PREFETCH", 0, 0, max_width);
             configured.cpu = env_int("LLAMA_MOE_AUTOTUNE_CPU_CAP", 0, 0, 8);
             if (const char * value = std::getenv("LLAMA_MOE_AUTOTUNE_THRESHOLD")) {
                 char * end = nullptr;
@@ -131,14 +131,14 @@ struct common_moe_autotune::impl {
                 if (!*value || *end || !std::isfinite(configured.threshold) || configured.threshold < 0 || configured.threshold > 1) throw std::runtime_error("invalid online collection threshold");
             }
         }
-        emit({{"event", "start"}, {"version", 8}, {"mode", mode}, {"spec_type", sequential ? "draft-mtp" : "draft-dflash"}, {"max_draft", max_draft},
+        emit({{"event", "start"}, {"version", 9}, {"mode", mode}, {"spec_type", sequential ? "draft-mtp" : "draft-dflash"}, {"max_draft", max_draft},
               {"collection_only", !adaptive}, {"configured", configured.json()}, {"window_rounds", window},
               {"workload_scope", "whole_request"}, {"max_workload_rounds", max_workload_rounds}, {"max_workload_bytes", max_workload_bytes},
               {"sample_tokens", sampling.interval}, {"sampling_unit", online ? "output_tokens" : "decode_rounds"},
               {"search_at", adaptive ? "request_end" : "disabled"}, {"frequency_scope", "traced_rounds"},
-              {"candidate_trial_budget", trial_budget}, {"candidate_warmup_requests", int(candidate_warmup)}, {"candidate_confirmation_requests", int(candidate_confirm)}, {"candidate_tolerance", candidate_frontier::tolerance}, {"cost_round_budget", cost_limit}, {"built_prediction_width", max_width},
-              {"prediction_semantics", "runtime prefix; predictor graph stays at built width"},
-              {"cache_model", "candidate LFU replay within contiguous semantic segments; reanchor at sampling gaps or changed round starts"}});
+              {"candidate_trial_budget", trial_budget}, {"candidate_warmup_requests", int(candidate_warmup)}, {"candidate_confirmation_requests", int(candidate_confirm)}, {"candidate_tolerance", candidate_frontier::tolerance}, {"cost_round_budget", cost_limit}, {"max_prefetch_budget", max_width}, {"built_prediction_width", env_int("LLAMA_MOE_AUTOTUNE_NPRED", 8, 0, 24)},
+              {"prediction_semantics", "missing-expert copy cap; predictor width is fixed"},
+              {"cache_model", "candidate LFU/decay replay within contiguous semantic segments; reanchor at sampling gaps or changed round starts"}});
     }
 
     void emit(const tune_json & j) {
@@ -164,6 +164,13 @@ struct common_moe_autotune::impl {
                     append_field(serialized, "experts", l.experts);
                     append_field(serialized, "top_k", l.top_k);
                     append_field(serialized, "width", l.width);
+                    append_field(serialized, "cache_policy", l.cache_policy);
+                    append_field(serialized, "decay_interval", l.decay_interval);
+                    append_field(serialized, "batches", l.batches);
+                    append_field(serialized, "epoch", l.epoch);
+                    append_field(serialized, "cpu_step", l.cpu_step);
+                    append_field(serialized, "cpu_min_tokens", l.cpu_min_tokens);
+                    append_field(serialized, "cpu_reuse_window", l.cpu_reuse_window);
                     append_field(serialized, "loads", l.loads);
                     append_field(serialized, "prefetches", l.prefetches);
                     append_field(serialized, "cpu_assignments", l.assignments);
@@ -179,6 +186,8 @@ struct common_moe_autotune::impl {
                     append_numbers(serialized, "types", l.types, 3);
                     append_numbers(serialized, "owners", layer.owners.data(), layer.owners.size());
                     append_numbers(serialized, "lfu", layer.freq.data(), layer.freq.size());
+                    append_numbers(serialized, "recent", layer.recent.data(), layer.recent.size());
+                    append_numbers(serialized, "cpu_last_used", layer.cpu_last_used.data(), layer.cpu_last_used.size());
                     serialized += ",\"prefetchable\":[";
                     for (size_t v = 0; v < layer.prefetchable.size(); ++v) {
                         if (v) serialized += ',';
@@ -199,7 +208,7 @@ struct common_moe_autotune::impl {
     std::string identity(const std::vector<layer_sample> & layers) {
         char description[256];
         llama_model_desc(llama_get_model(target), description, sizeof(description));
-        std::string id = description;
+        std::string id = std::string(description) + "|prefetch-budget-decay-v1";
         llama_model_desc(llama_get_model(draft), description, sizeof(description));
         id += std::string("|") + description;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -240,7 +249,7 @@ struct common_moe_autotune::impl {
         for (const auto & layer : sample.layers) {
             const auto l = layer.view();
             auto & c = model.costs[shape_key(l)];
-            if (executing.width == 0 && l.loads >= 4) {
+            if (executing.prefetch == 0 && l.loads >= 4) {
                 c.transfer.add(l.gate_us / l.loads);
                 c.issue.add(l.fill_us / l.loads);
             }
@@ -371,7 +380,7 @@ bool common_moe_autotune::prepare() {
     }
     s.profiled = s.online ? s.sampling.due() : (s.probing || s.warming || s.round % 8 == 0);
     s.trace_only = s.online && !s.profiled;
-    if (!llama_moe_tune_begin(s.target, s.executing.width, s.executing.cpu, s.profiled, s.online, s.trace_only)) throw std::runtime_error("autotune needs CUDA expert slots >= 4 * top_k, legacy CPU diversion, and LFU");
+    if (!llama_moe_tune_begin(s.target, s.executing.prefetch, s.executing.cpu, s.profiled, s.online, s.trace_only)) throw std::runtime_error("autotune needs CUDA expert slots >= 4 * top_k, legacy CPU diversion, vote-ranked prefetch, and LFU/decay");
     if (!s.trace_only) s.sampling.sampled();
     s.current = {};
     s.current.max_draft = s.max_draft;

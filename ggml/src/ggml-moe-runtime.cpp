@@ -88,7 +88,7 @@ struct ggml_moe_cpu_state {
     uint32_t graph_seq = 0;
     void * tune_timer = nullptr;
     std::vector<int> tune_owners;
-    std::vector<uint64_t> tune_freq;
+    std::vector<uint64_t> tune_freq, tune_recent, tune_last_used;
     std::vector<uint8_t> tune_prefetchable;
 };
 
@@ -166,7 +166,10 @@ struct ggml_moe_worker {
 struct ggml_moe_tune_cache_snapshot {
     std::vector<int32_t> owners, free_slots;
     std::vector<uint32_t> freq;
-    std::vector<uint8_t> pinned, filled, pending_free;
+    std::vector<uint32_t> pinned, filled;
+    std::vector<uint8_t> pending_free;
+    uint32_t epoch = 0;
+    uint64_t batches = 0;
     std::vector<uint64_t> cpu_last_used;
     uint64_t cpu_step = 0;
 };
@@ -180,7 +183,7 @@ struct ggml_moe_runtime {
     bool online_profile = false;
     bool online_timing = false;
     bool online_fixed = false;
-    int online_width = -1;
+    int online_prefetch = -1;
     int online_cpu_restore = 0;
     bool has_moe_gate;
     bool seed_pending = false;
@@ -657,28 +660,16 @@ static void ggml_moe_runtime_prefetch(
 
     const int64_t online_started = sched->online_timing ? ggml_time_us() : 0;
     const uint64_t online_copies = st->n_load_pf;
-    int32_t limited[GGML_MOE_TUNE_IDS];
     if (sched->online_enabled) {
         GGML_ASSERT(n_tokens > 0 && n_experts <= GGML_MOE_TUNE_IDS && n_experts % n_tokens == 0);
         st->online.n_pred = n_experts;
         std::copy(experts, experts + n_experts, st->online.predicted);
     }
-    if (sched->online_enabled || sched->online_fixed) {
-        GGML_ASSERT(n_tokens > 0 && n_experts <= GGML_MOE_TUNE_IDS && n_experts % n_tokens == 0);
-        const int source_width = n_experts / n_tokens;
-        const int keep = std::min(source_width, sched->online_width);
-        if (keep < source_width) {
-            for (int t = 0; t < n_tokens; ++t) {
-                std::copy(experts + t * source_width, experts + t * source_width + keep, limited + t * keep);
-            }
-            experts = limited;
-            n_experts = n_tokens * keep;
-        }
-    }
+    const int prefetch_budget = (sched->online_enabled || sched->online_fixed) ? sched->online_prefetch : st->prefetch_budget;
     st->n_pred_batch = 0;
     std::vector<int> counts;
     const bool cpu_filter = st->cpu && n_tokens <= st->cache.cpu_expert_max_tokens;
-    if (cpu_filter || (st->rank_votes && st->prefetch_budget != 0)) {
+    if (cpu_filter || (st->rank_votes && prefetch_budget != 0)) {
         counts.assign(st->n_expert, 0);
         for (int i = 0; i < n_experts; ++i) {
             if (experts[i] >= 0 && experts[i] < st->n_expert) counts[experts[i]]++;
@@ -709,7 +700,7 @@ static void ggml_moe_runtime_prefetch(
     }
     experts = st->pred_batch;
     n_experts = st->n_pred_batch;
-    if (st->prefetch_budget == 0) {
+    if (prefetch_budget == 0) {
         return;
     }
     std::vector<uint8_t> protected_ids;
@@ -732,7 +723,7 @@ static void ggml_moe_runtime_prefetch(
         if (e < 0 || e >= st->n_expert || st->slot_of_expert[e] >= 0) {
             continue;
         }
-        if (st->prefetch_budget >= 0 && n_copied >= st->prefetch_budget) {
+        if (prefetch_budget >= 0 && n_copied >= prefetch_budget) {
             break;
         }
         int32_t v = ggml_moe_cache_take(st, sched->moe_pass);
@@ -1694,10 +1685,12 @@ bool ggml_moe_runtime_tune_cache(ggml_moe_runtime * sched, bool capture) {
             saved.freq.assign(st->freq, st->freq + st->n_expert);
             saved.free_slots.assign(st->free_slot, st->free_slot + st->free_cnt);
             for (int v = 0; v < st->n_slots; ++v) {
-                saved.pinned.push_back(st->pinned[v] == st->epoch);
-                saved.filled.push_back(st->fill_seq[v] >= st->epoch);
+                saved.pinned.push_back(st->pinned[v]);
+                saved.filled.push_back(st->fill_seq[v]);
                 saved.pending_free.push_back(st->free_pass[v] == sched->moe_pass);
             }
+            saved.epoch = st->epoch;
+            saved.batches = st->n_batches;
             if (st->cpu) { saved.cpu_last_used = st->cpu->last_used; saved.cpu_step = st->cpu->step; }
             sched->tune_cache_snapshot.push_back(std::move(saved));
         }
@@ -1725,13 +1718,14 @@ bool ggml_moe_runtime_tune_cache(ggml_moe_runtime * sched, bool capture) {
         }
         ggml_moe_runtime_sync(sched, backend);
         st->n_bytes_sync = old_bytes;
-        st->epoch = 1;
+        st->epoch = saved.epoch;
+        st->n_batches = saved.batches;
         st->free_cnt = int(saved.free_slots.size());
         std::copy(saved.free_slots.begin(), saved.free_slots.end(), st->free_slot);
         std::copy(saved.freq.begin(), saved.freq.end(), st->freq);
         for (int v = 0; v < st->n_slots; ++v) {
-            st->pinned[v] = saved.pinned[v] ? st->epoch : 0;
-            st->fill_seq[v] = saved.filled[v] ? st->epoch : 0;
+            st->pinned[v] = saved.pinned[v];
+            st->fill_seq[v] = saved.filled[v];
             st->free_pass[v] = saved.pending_free[v] ? sched->moe_pass : 0;
         }
         if (st->cpu) { st->cpu->last_used = saved.cpu_last_used; st->cpu->step = saved.cpu_step; }
@@ -1743,32 +1737,34 @@ bool ggml_moe_runtime_tune_cache(ggml_moe_runtime * sched, bool capture) {
     return true;
 }
 
-bool ggml_moe_runtime_tune_begin(ggml_moe_runtime * sched, int width, int cpu_cap, bool profile, bool fixed, bool trace_only) {
-    if ((trace_only && (profile || !fixed)) || sched->online_enabled || width < 0 || width > 24 || cpu_cap < 0 || cpu_cap > 8 || !sched->n_moe_caches || !sched->cpu_backend || sched->cpu_balance) return false;
-    if (sched->cpu_min_tokens != 9 || sched->cpu_max_tokens != 8 || sched->cpu_reuse_window != 0) return false;
+bool ggml_moe_runtime_tune_begin(ggml_moe_runtime * sched, int prefetch, int cpu_cap, bool profile, bool fixed, bool trace_only) {
+    if ((trace_only && (profile || !fixed)) || sched->online_enabled || prefetch < 0 || prefetch > 24 || cpu_cap < 0 || cpu_cap > 8 || !sched->n_moe_caches || !sched->cpu_backend || sched->cpu_balance) return false;
+    if (sched->cpu_max_tokens != 8) return false;
     if (!trace_only) ggml_moe_runtime_quiesce(sched);
     std::lock_guard<std::mutex> lock(sched->moe_mutex);
     int max_width = 0;
     for (int i = 0; i < sched->n_moe_caches; ++i) {
         auto * st = sched->moe_caches[i];
-        if (!st->cpu || st->cache.cpu_expert_early || st->n_expert_used > GGML_MOE_TUNE_IDS / 8 || st->n_slots < 4 * st->n_expert_used || st->cache_policy != 0) return false;
+        if (!st->cpu || st->cache.cpu_expert_early || st->n_expert_used > GGML_MOE_TUNE_IDS / 8 || st->n_slots < 4 * st->n_expert_used || (st->cache_policy != 0 && st->cache_policy != 2)) return false;
         auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(sched->backends[st->dev_backend_id]));
-        if (st->prefetch_budget >= 0 || !st->rank_votes || !st->protect_predictions) return false;
+        if (!st->rank_votes || !st->protect_predictions) return false;
         if (profile && !ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_tune_timer")) return false;
         max_width = std::max(max_width, std::max(st->cache.n_pred, st->cache.head_n_pred));
     }
-    if (width > max_width) return false;
+    if (prefetch > max_width) return false;
     for (int i = 0; i < sched->n_moe_caches; ++i) {
         auto * st = sched->moe_caches[i];
         st->cpu->tune_owners.resize(st->n_slots);
         st->cpu->tune_freq.resize(st->n_expert);
+        st->cpu->tune_recent.resize(st->n_slots);
+        st->cpu->tune_last_used.resize(st->n_expert);
         st->cpu->tune_prefetchable.resize(st->n_slots);
     }
     sched->online_enabled = true;
     sched->online_profile = profile;
     sched->online_timing = !trace_only;
     sched->online_fixed = fixed;
-    sched->online_width = width;
+    sched->online_prefetch = prefetch;
     sched->online_cpu_restore = sched->cpu_max_experts;
     sched->cpu_max_experts = cpu_cap;
     for (int i = 0; i < sched->n_moe_caches; ++i) {
@@ -1778,6 +1774,13 @@ bool ggml_moe_runtime_tune_begin(ggml_moe_runtime * sched, int width, int cpu_ca
         r.layer = st->cache.layer;
         r.experts = st->n_expert;
         r.slots = st->n_slots;
+        r.cache_policy = st->cache_policy;
+        r.decay_interval = st->decay_interval;
+        r.batches = st->n_batches;
+        r.epoch = st->epoch;
+        r.cpu_step = st->cpu->step;
+        r.cpu_min_tokens = sched->cpu_min_tokens;
+        r.cpu_reuse_window = sched->cpu_reuse_window;
         r.top_k = st->n_expert_used;
         r.width = st->cache.src[0]->ne[0];
         r.service_us = -1;
@@ -1791,6 +1794,10 @@ bool ggml_moe_runtime_tune_begin(ggml_moe_runtime * sched, int width, int cpu_ca
         for (int v = 0; v < st->n_slots; ++v) {
             st->cpu->tune_prefetchable[v] = st->expert_of_slot[v] < 0 ? st->free_pass[v] != sched->moe_pass : st->pinned[v] != st->epoch && st->fill_seq[v] < st->epoch;
         }
+        for (int v = 0; v < st->n_slots; ++v) st->cpu->tune_recent[v] = std::max(st->pinned[v], st->fill_seq[v]);
+        std::copy(st->cpu->last_used.begin(), st->cpu->last_used.end(), st->cpu->tune_last_used.begin());
+        r.recent = st->cpu->tune_recent.data();
+        r.cpu_last_used = st->cpu->tune_last_used.data();
         r.owners = st->cpu->tune_owners.data();
         r.freq = st->cpu->tune_freq.data();
         r.prefetchable = st->cpu->tune_prefetchable.data();

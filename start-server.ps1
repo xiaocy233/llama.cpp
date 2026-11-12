@@ -47,6 +47,12 @@ $prefetch = Get-Setting PREFETCH_BUDGET $prefetch
 $threshold = Get-Setting DRAFT_THRESHOLD $threshold
 $cpu_cap = Get-Setting CPU_CAP $cpu_cap
 
+$nclayers = Get-Setting N_CACHE_LAYERS $nclayers
+$ncslots = Get-Setting N_CACHE_SLOTS $ncslots
+$draft_max = Get-Setting DRAFT_MAX $draft_max
+$mtp_ubatch = Get-Setting MTP_UBATCH $mtp_ubatch
+$reasoning = Get-Setting THINKING $reasoning
+$exportConfig = $false
 $dryRun = $false
 $extra = @()
 $passThrough = $false
@@ -55,7 +61,8 @@ foreach ($arg in $args) {
     switch -CaseSensitive ($arg) {
         { $_ -in '-h', '--help' } {
             @'
-Usage: .\start-server.ps1 [--dry-run] [-- additional llama-server arguments]
+Usage: .\start-server.ps1 [--dry-run | --export-config] [-- additional llama-server arguments]
+--export-config prints the resolved command and environment as JSON without starting a server.
 The server runs in the foreground. Ctrl-C stops it.
 Set environment variables in PowerShell before starting, for example:
   $env:GPU = '0'
@@ -74,6 +81,7 @@ Prediction width and prefetch copy budget are independent.
             exit 0
         }
         '--dry-run' { $dryRun = $true }
+        '--export-config' { $exportConfig = $true }
         '--'        { $passThrough = $true }
         default     { Stop-Launcher "Unknown argument: $arg. Use --help." 2 }
     }
@@ -91,6 +99,12 @@ if ($specType -eq 'draft-dflash' -and !(Test-Path -LiteralPath $draftModel -Path
 $mainThreads = [int]$cpuThreads - [int]$expertThreads
 if ($null -eq $env:CUDA_VISIBLE_DEVICES) { $env:CUDA_VISIBLE_DEVICES = "$gpu" }
 $env:GGML_MOE_HYBRID_MAX_EXPERTS = "$cpu_cap"
+$env:GGML_MOE_HYBRID_POLICY = Get-Setting GGML_MOE_HYBRID_POLICY 'legacy'
+$env:GGML_MOE_HYBRID_MIN_TOKENS = Get-Setting GGML_MOE_HYBRID_MIN_TOKENS '2'
+$env:GGML_MOE_HYBRID_MAX_TOKENS = Get-Setting GGML_MOE_HYBRID_MAX_TOKENS '8'
+$env:GGML_MOE_HYBRID_REUSE_WINDOW = Get-Setting GGML_MOE_HYBRID_REUSE_WINDOW '1'
+$env:GGML_MOE_PREFETCH_RANK = Get-Setting GGML_MOE_PREFETCH_RANK 'votes'
+$env:GGML_MOE_PREFETCH_PROTECT = Get-Setting GGML_MOE_PREFETCH_PROTECT '1'
 $env:GGML_MOE_HYBRID = '0'
 if ([int]$expertThreads -gt 0 -and [int]$cpu_cap -ne 0) {
     $env:GGML_MOE_HYBRID = '1'
@@ -130,6 +144,22 @@ $serverArgs = @(
 if ($specType -eq 'draft-dflash') { $serverArgs += '--spec-draft-model', $draftModel, '--spec-draft-ngl', 'all' }
 if ($specType -eq 'draft-mtp') { $serverArgs += '--spec-mtp-ubatch', $mtp_ubatch }
 $serverArgs += $extra
+if ($exportConfig) {
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    $environment = [ordered]@{}
+    Get-ChildItem Env: | Where-Object { $_.Name -match '^(GGML_|LLAMA_|DFLASH_|CUDA_VISIBLE_DEVICES$|OMP_NUM_THREADS$|OPENBLAS_NUM_THREADS$|MKL_NUM_THREADS$)' } | Sort-Object Name | ForEach-Object { $environment[$_.Name] = $_.Value }
+    [ordered]@{
+        version = 1
+        command = @("$server") + @($serverArgs | ForEach-Object { "$_" })
+        environment = $environment
+        cpu_set = $cpuSet
+        main_threads = $mainThreads
+        expert_threads = [int]$expertThreads
+        prediction_width = [int]$npred
+        selected = [ordered]@{ prefetch_budget = [int]$prefetch; threshold = [double]$threshold; cpu_cap = [int]$cpu_cap }
+    } | ConvertTo-Json -Depth 8
+    exit 0
+}
 "GPU=$env:CUDA_VISIBLE_DEVICES CPUSET=$cpuSet main_threads=$mainThreads expert_threads=$expertThreads hybrid=$env:GGML_MOE_HYBRID cpu_cap=$cpu_cap npred=$npred prefetch=$prefetch"
 $display = (@($server) + $serverArgs) | ForEach-Object { if ("$_" -match '\s') { '"{0}"' -f $_ } else { $_ } }
 "Command: $($display -join ' ')"

@@ -48,13 +48,13 @@ inline double interpolate(const std::array<mean_value, 9> & values, int b, int &
 }
 
 struct configuration {
-    int width = 0;
+    int prefetch = 0;
     float threshold = 0;
     int cpu = 0;
     bool operator==(const configuration & other) const {
-        return width == other.width && threshold == other.threshold && cpu == other.cpu;
+        return prefetch == other.prefetch && threshold == other.threshold && cpu == other.cpu;
     }
-    tune_json json() const { return {{"npred", width}, {"threshold", threshold}, {"cpu_cap", cpu}}; }
+    tune_json json() const { return {{"prefetch_budget", prefetch}, {"threshold", threshold}, {"cpu_cap", cpu}}; }
 };
 
 inline tune_json branch_candidates(const tune_json & ranking, bool complete = true) {
@@ -114,7 +114,7 @@ struct candidate_frontier {
         add(running);
         for (const auto & row : shortlist) {
             const auto & c = row.at("config");
-            add({c.at("npred"), c.at("threshold"), c.at("cpu_cap")});
+            add({c.at("prefetch_budget"), c.at("threshold"), c.at("cpu_cap")});
         }
     }
     bool observe(configuration cfg, double elapsed_us, uint64_t tokens) {
@@ -168,7 +168,7 @@ struct candidate_frontier {
             // A predicted difference contains error from both configurations.
             if (measured + predicted - reference_cost - 2 * error > best_measured * (1 + tolerance)) continue;
             const auto & c = row->at("config");
-            configuration cfg{c.at("npred"), c.at("threshold"), c.at("cpu_cap")};
+            configuration cfg{c.at("prefetch_budget"), c.at("threshold"), c.at("cpu_cap")};
             if (std::none_of(candidates.begin(), candidates.end(), [&](const candidate & entry) { return entry.config == cfg; })) { add(cfg); break; }
         }
     }
@@ -234,11 +234,17 @@ inline std::string shape_key(const ggml_moe_tune_layer & l) {
 struct layer_sample {
     ggml_moe_tune_layer stats{};
     std::vector<int> owners;
-    std::vector<uint64_t> freq;
+    std::vector<uint64_t> freq, recent, cpu_last_used;
     std::vector<uint8_t> prefetchable;
 
     layer_sample() = default;
     explicit layer_sample(const ggml_moe_tune_layer & l) : stats(l), owners(l.owners, l.owners + l.slots), freq(l.freq, l.freq + l.experts), prefetchable(l.prefetchable, l.prefetchable + l.slots) {
+        if (l.recent) recent.assign(l.recent, l.recent + l.slots);
+        else recent.resize(l.slots);
+        if (l.cpu_last_used) cpu_last_used.assign(l.cpu_last_used, l.cpu_last_used + l.experts);
+        else cpu_last_used.resize(l.experts);
+        stats.recent = nullptr;
+        stats.cpu_last_used = nullptr;
         stats.owners = nullptr;
         stats.freq = nullptr;
         stats.prefetchable = nullptr;
@@ -247,6 +253,8 @@ struct layer_sample {
     ggml_moe_tune_layer view() const {
         GGML_ASSERT(owners.size() == size_t(stats.slots) && freq.size() == size_t(stats.experts) && prefetchable.size() == owners.size());
         auto l = stats;
+        l.recent = recent.empty() ? nullptr : recent.data();
+        l.cpu_last_used = cpu_last_used.empty() ? nullptr : cpu_last_used.data();
         l.owners = owners.data();
         l.freq = freq.data();
         l.prefetchable = prefetchable.data();
@@ -265,7 +273,7 @@ struct round_sample {
     size_t storage_bytes() const {
         size_t bytes = sizeof(*this) + confidence.capacity() * sizeof(float) + draft_prefix_us.capacity() * sizeof(double) + layers.capacity() * sizeof(layer_sample);
         for (const auto & layer : layers) {
-            bytes += layer.owners.capacity() * sizeof(int) + layer.freq.capacity() * sizeof(uint64_t) + layer.prefetchable.capacity();
+            bytes += layer.owners.capacity() * sizeof(int) + (layer.freq.capacity() + layer.recent.capacity() + layer.cpu_last_used.capacity()) * sizeof(uint64_t) + layer.prefetchable.capacity();
         }
         return bytes;
     }
@@ -301,10 +309,10 @@ struct layer_workload {
     std::vector<int> count, votes, predicted, actual;
 
     layer_workload() = default;
-    layer_workload(const ggml_moe_tune_layer & l, int b, int width) : count(l.experts), votes(l.experts) {
+    layer_workload(const ggml_moe_tune_layer & l, int b) : count(l.experts), votes(l.experts) {
         const int source_width = l.n_pred / (l.n_ids / l.top_k);
         for (int t = 0; t < b; ++t) {
-            for (int j = 0; j < std::min(width, source_width); ++j) {
+            for (int j = 0; j < source_width; ++j) {
                 const int e = l.predicted[t * source_width + j];
                 if (votes[e]++ == 0) predicted.push_back(e);
             }
@@ -319,18 +327,23 @@ struct layer_workload {
 
 struct cache_state {
     std::vector<int> owners, slots;
-    std::vector<uint64_t> freq;
+    std::vector<uint64_t> freq, recent, cpu_last_used;
     std::vector<uint8_t> prefetchable;
+
+    uint64_t batches = 0, epoch = 0, cpu_step = 0;
 
     cache_state() = default;
     explicit cache_state(const layer_sample & l) : owners(l.owners), slots(l.freq.size(), -1), freq(l.freq), prefetchable(l.prefetchable) {
+        recent = l.recent; recent.resize(l.stats.slots);
+        cpu_last_used = l.cpu_last_used; cpu_last_used.resize(l.stats.experts);
+        batches = l.stats.batches; epoch = l.stats.epoch; cpu_step = l.stats.cpu_step;
         for (size_t v = 0; v < owners.size(); ++v) if (owners[v] >= 0) slots[owners[v]] = int(v);
     }
 
     layer_work advance(const ggml_moe_tune_layer & l, int b, configuration cfg, const layer_workload * prepared = nullptr) {
         if (owners.size() != size_t(l.slots) || freq.size() != size_t(l.experts) || prefetchable.size() != owners.size()) throw std::runtime_error("cache dimensions changed within a trace segment");
         layer_workload local;
-        if (!prepared) { local = layer_workload(l, b, cfg.width); prepared = &local; }
+        if (!prepared) { local = layer_workload(l, b); prepared = &local; }
         const auto & count = prepared->count;
         const auto & votes = prepared->votes;
         const auto & predicted = prepared->predicted;
@@ -338,7 +351,10 @@ struct cache_state {
         auto select_cpu = [&](const std::vector<int> & ids, const std::vector<int> & counts) {
             std::vector<int> result;
             if (!cfg.cpu) return result;
-            for (int e : ids) if (counts[e] < 9 && slots[e] < 0) result.push_back(e);
+            for (int e : ids) {
+                const bool reused = cpu_last_used[e] > 0 && cpu_step + 1 - cpu_last_used[e] <= uint64_t(l.cpu_reuse_window);
+                if (counts[e] < (l.cpu_min_tokens ? l.cpu_min_tokens : 9) && slots[e] < 0 && !reused) result.push_back(e);
+            }
             std::sort(result.begin(), result.end(), [&](int a, int b) { return counts[a] != counts[b] ? counts[a] < counts[b] : a < b; });
             if (int(result.size()) > cfg.cpu) result.resize(cfg.cpu);
             return result;
@@ -357,13 +373,15 @@ struct cache_state {
                 result.push_back(v);
             }
             std::sort(result.begin() + free, result.end(), [&](int a, int b) {
-                return freq[owners[a]] != freq[owners[b]] ? freq[owners[a]] < freq[owners[b]] : a < b;
+                if (freq[owners[a]] != freq[owners[b]]) return freq[owners[a]] < freq[owners[b]];
+                if (l.cache_policy == 2 && recent[a] != recent[b]) return recent[a] < recent[b];
+                return a < b;
             });
             return result;
         };
         auto fill = [&](int e, int v) {
             if (owners[v] >= 0) slots[owners[v]] = -1;
-            owners[v] = e; slots[e] = v; prefetchable[v] = false;
+            owners[v] = e; slots[e] = v; prefetchable[v] = false; recent[v] = epoch;
         };
         layer_work work;
         const bool needs_prefetch = std::any_of(predicted.begin(), predicted.end(), [&](int e) { return protect[e] && slots[e] < 0; });
@@ -371,7 +389,7 @@ struct cache_state {
         size_t next = 0;
         for (int e : predicted) {
             if (!protect[e] || slots[e] >= 0) continue;
-            if (next == prefetch_slots.size()) break;
+            if (work.prefetch >= cfg.prefetch || next == prefetch_slots.size()) break;
             fill(e, prefetch_slots[next++]); ++work.prefetch;
         }
         const auto cpu = select_cpu(prepared->actual, count);
@@ -381,6 +399,11 @@ struct cache_state {
         }
         std::vector<bool> on_cpu(l.experts);
         for (int e : cpu) { on_cpu[e] = true; work.assignments += count[e]; }
+        // Decay happens after prefetch and before demand fills in the runtime.
+        if (l.cache_policy == 2 && batches > 0 && l.decay_interval > 0 && batches % l.decay_interval == 0) {
+            for (auto & value : freq) value >>= 1;
+        }
+        ++batches;
         // Pin all hits before demand fills, as in the runtime.
         for (int e : prepared->actual) if (!on_cpu[e] && slots[e] >= 0) pinned[slots[e]] = true;
         const bool needs_fill = std::any_of(prepared->actual.begin(), prepared->actual.end(), [&](int e) { return !on_cpu[e] && slots[e] < 0; });
@@ -393,8 +416,11 @@ struct cache_state {
                 if (next == demand_slots.size()) throw std::runtime_error("candidate exceeds expert cache capacity");
                 fill(e, demand_slots[next++]); ++work.miss;
             }
-            ++freq[e]; pinned[slots[e]] = true;
+            ++freq[e]; pinned[slots[e]] = true; recent[slots[e]] = epoch;
         }
+        ++cpu_step;
+        for (int e : prepared->actual) cpu_last_used[e] = cpu_step;
+        ++epoch;
         // The runtime advances the epoch after the layer completes.
         std::fill(prefetchable.begin(), prefetchable.end(), true);
         return work;
@@ -550,7 +576,7 @@ struct latency_model {
             const auto l = layer.view();
             const auto it = costs.find(shape_key(l));
             const double gpu = it == costs.end() ? -1 : interpolate(it->second.gpu, b, p.estimated);
-            if (cfg.width > l.n_pred / (l.n_ids / l.top_k) || gpu < 0 || !it->second.transfer.count) { p.supported = false; return p; }
+            if (gpu < 0 || !it->second.transfer.count) { p.supported = false; return p; }
             const auto & c = it->second;
             auto state = states.find(l.layer);
             if (state == states.end()) state = states.emplace(l.layer, cache_state(layer)).first;
@@ -621,7 +647,7 @@ struct latency_model {
                     if (plans == workloads.end()) {
                         std::vector<layer_workload> layers;
                         layers.reserve(sample.layers.size());
-                        for (const auto & layer : sample.layers) layers.emplace_back(layer.view(), b, width);
+                        for (const auto & layer : sample.layers) layers.emplace_back(layer.view(), b);
                         plans = workloads.emplace(key, std::move(layers)).first;
                     }
                     phase = consecutive ? next_execution_phase(b, previous_batch, phase) : 0;
@@ -641,10 +667,10 @@ struct latency_model {
             }
             return rows;
         };
-        // Widths have independent replay states. Merge in configuration order for stable ties.
+        // Copy budgets have independent replay states. Merge in configuration order for stable ties.
         std::vector<std::future<tune_json>> jobs;
-        std::vector<int> widths = {0, 8, 16, 24};
-        if (own_threshold && std::find(widths.begin(), widths.end(), samples.front().executed.width) == widths.end()) widths.push_back(samples.front().executed.width);
+        std::vector<int> widths = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+        if (own_threshold && std::find(widths.begin(), widths.end(), samples.front().executed.prefetch) == widths.end()) widths.push_back(samples.front().executed.prefetch);
         for (int width : widths) if (width <= max_width) {
             jobs.push_back(std::async(std::launch::async, evaluate_width, width));
         }

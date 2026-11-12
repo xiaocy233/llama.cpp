@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -21,12 +22,13 @@ RANKING_METRICS = (
     ("confirmation", "measured_tpot_ms", "Confirmation measurements"),
     ("screening", "screening_tpot_ms", "Screening measurements"),
     ("predicted", "predicted_tpot_ms", "Initial model predictions (not measurements)"),
+    ("production", "tpot_ms", "Ordinary production server measurements (final selection)"),
 )
 
 
 def write_json(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     temporary.replace(path)
 
 
@@ -50,25 +52,6 @@ def cpu_affinity():
             raise ctypes.WinError(ctypes.get_last_error())
         return [cpu for cpu in range(ctypes.sizeof(mask) * 8) if mask.value & (1 << cpu)]
     return None
-
-
-def controls(cpu_cap, gpu):
-    return {
-        "CUDA_VISIBLE_DEVICES": gpu,
-        "GGML_MOE_HYBRID": "1",
-        "GGML_MOE_HYBRID_POLICY": "legacy",
-        "GGML_MOE_HYBRID_MIN_TOKENS": "9",
-        "GGML_MOE_HYBRID_MAX_TOKENS": "8",
-        "GGML_MOE_HYBRID_MAX_EXPERTS": str(cpu_cap),
-        "GGML_MOE_HYBRID_REUSE_WINDOW": "0",
-        "GGML_MOE_HYBRID_THREADS": "8",
-        "GGML_MOE_PREFETCH_BUDGET": "-1",
-        "GGML_MOE_PREFETCH_RANK": "votes",
-        "GGML_MOE_PREFETCH_PROTECT": "1",
-        "GGML_MOE_CACHE_POLICY": "lfu",
-        "GGML_SCHED_MOE_SLOT_STATS": "0",
-        "GGML_SCHED_MOE_KREL": "0",
-    }
 
 
 def environment(overrides):
@@ -98,51 +81,125 @@ def require_idle_gpu(gpu):
         raise RuntimeError(f"Selected GPU has running compute processes; retry when idle:\n{active}")
 
 
+def replace_option(command, option, value):
+    result = list(command)
+    result[result.index(option) + 1] = str(value)
+    return result
+
+
+def apply_cpu_set(cpu_set, threads):
+    if cpu_set == "none":
+        return
+    selected = set()
+    for part in cpu_set.split(","):
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not match:
+            raise ValueError("Invalid production CPUSET")
+        first, last = int(match[1]), int(match[2] or match[1])
+        if last < first or last >= 64:
+            raise ValueError("Invalid production CPUSET range")
+        selected.update(range(first, last + 1))
+    if len(selected) < threads or not selected.issubset(cpu_affinity() or []):
+        raise ValueError("Production CPUSET is unavailable or smaller than the thread budget")
+    if os.name == "nt":
+        import ctypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        mask = sum(1 << cpu for cpu in selected)
+        if not kernel.SetProcessAffinityMask(ctypes.c_void_p(-1), ctypes.c_size_t(mask)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    else:
+        os.sched_setaffinity(0, selected)
+
+
+def deployment(args):
+    # The production launcher is the single source of inference settings.
+    overrides = dict(os.environ)
+    if args.gpu is not None:
+        overrides["CUDA_VISIBLE_DEVICES"] = args.gpu
+    if args.thinking is not None:
+        overrides["THINKING"] = args.thinking
+    result = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                             "-File", str(args.launcher), "--export-config"],
+                            capture_output=True, text=True, encoding="utf-8", env=overrides, check=True)
+    config = json.loads(result.stdout.lstrip("\ufeff"))
+    if config.get("version") != 1:
+        raise ValueError("Unsupported production configuration")
+    if any(k.startswith("LLAMA_MOE_AUTOTUNE") for k in config["environment"]):
+        raise ValueError("Remove LLAMA_MOE_AUTOTUNE variables before exporting a production configuration")
+    command = config["command"]
+    def value(flag):
+        return command[command.index(flag) + 1]
+    args.server = Path(command[0]).resolve(strict=True)
+    args.model = Path(value("-m")).resolve(strict=True)
+    args.spec_type = value("--spec-type")
+    args.draft_model = Path(value("--spec-draft-model")) if "--spec-draft-model" in command else None
+    args.draft_max = int(value("--spec-draft-n-max"))
+    args.ctx = int(value("-c"))
+    args.thinking = value("--reasoning")
+    args.gpu = config["environment"]["CUDA_VISIBLE_DEVICES"]
+    args.npred = int(value("--n-cache-predict"))
+    args.prefetch_budget = config["selected"]["prefetch_budget"]
+    args.threshold = config["selected"]["threshold"]
+    args.cpu_cap = config["selected"]["cpu_cap"]
+    args.threads = config["main_threads"]
+    args.expert_threads = config["expert_threads"]
+    args.slots = int(value("--n-cache-slots"))
+    if args.spec_type not in ("draft-mtp", "draft-dflash"):
+        raise ValueError("Tuning requires MTP or DFlash")
+    if config["environment"]["GGML_MOE_HYBRID_POLICY"] != "legacy":
+        raise ValueError("Tuning currently supports the production legacy CPU policy")
+    return config
+
+
+def production_command(args, port, config, log_path):
+    command = args.deployment["command"]
+    for flag, value in (("--host", "127.0.0.1"), ("--port", port), ("--log-file", log_path),
+                        ("--spec-draft-p-min", config["threshold"])):
+        command = replace_option(command, flag, value)
+    env = dict(args.deployment["environment"])
+    env["GGML_MOE_PREFETCH_BUDGET"] = str(config["prefetch_budget"])
+    env["GGML_MOE_HYBRID_MAX_EXPERTS"] = str(config["cpu_cap"])
+    env["GGML_MOE_HYBRID"] = str(int(config["cpu_cap"] > 0))
+    if config["cpu_cap"]:
+        env["GGML_MOE_HYBRID_THREADS"] = str(args.expert_threads)
+    return command, env
+
+
 def launch(args, port):
     profile = args.profile.resolve() if args.profile else args.output / "costs.json"
-    spec_type = getattr(args, "spec_type", "draft-dflash")
-    draft_max = getattr(args, "draft_max", 7)
     key = {"target": file_identity(args.model), "draft": file_identity(args.draft_model or args.model),
-           "spec_type": spec_type, "draft_max": draft_max,
-           "binary": file_identity(args.server),
+           "binary": file_identity(args.server), "semantics": "copy-budget-decay-v1",
            "runtime_libraries": {p.name: file_identity(p.resolve()) for p in sorted(args.server.parent.glob("*.dll" if os.name == "nt" else "*.so*")) if p.is_file()},
-           "gpu": args.gpu, "threads": args.threads,
-           "expert_threads": args.expert_threads, "cpu_affinity": cpu_affinity()}
-    env = controls(args.cpu_cap if args.action == "serve" else 0, args.gpu)
-    env.update({"LLAMA_MOE_AUTOTUNE": "online" if args.action == "serve" else "offline",
-                "GGML_MOE_HYBRID_THREADS": str(args.expert_threads),
+           "deployment": args.deployment, "cpu_affinity": cpu_affinity()}
+    command, env = production_command(args, port, args.deployment["selected"], args.output / "native-server.log")
+    # Allocate the hybrid runtime for candidate switching; final validation restarts
+    # ordinary servers, including disabling the pool when CPU_CAP is zero.
+    env.update({"GGML_MOE_HYBRID": "1", "GGML_MOE_HYBRID_THREADS": str(args.expert_threads),
+                "LLAMA_MOE_AUTOTUNE": "online" if args.action == "serve" else "offline",
                 "LLAMA_MOE_AUTOTUNE_OUTPUT": str(args.output / "telemetry.jsonl"),
                 "LLAMA_MOE_AUTOTUNE_PROFILE": str(profile),
                 "LLAMA_MOE_AUTOTUNE_PROFILE_KEY": digest(key),
                 "LLAMA_MOE_AUTOTUNE_WINDOW": str(args.window),
                 "LLAMA_MOE_AUTOTUNE_SAMPLE_TOKENS": str(getattr(args, "sample_tokens", 20)),
-                "LLAMA_MOE_AUTOTUNE_ADAPT": str(int((args.action == "serve" and not getattr(args, "observe_only", False)) or getattr(args, "validate_candidates", False))),
+                "LLAMA_MOE_AUTOTUNE_ADAPT": str(int(not getattr(args, "observe_only", False))),
                 "LLAMA_MOE_AUTOTUNE_COST_ROUNDS": str(0 if args.action == "serve" else args.cost_rounds),
-                "LLAMA_MOE_AUTOTUNE_TRIAL_BUDGET": str(getattr(args, "trial_budget", 24)),
-                "LLAMA_MOE_AUTOTUNE_WARMUP_REQUESTS": str(int(getattr(args, "warmup_tokens", 0) > 0)),
-                "LLAMA_MOE_AUTOTUNE_CONFIRM_REQUESTS": str(int(getattr(args, "confirm_tokens", 1024) > getattr(args, "tokens", 1024))),
+                "LLAMA_MOE_AUTOTUNE_TRIAL_BUDGET": str(args.trial_budget),
+                "LLAMA_MOE_AUTOTUNE_WARMUP_REQUESTS": str(int(args.warmup_tokens > 0)),
+                "LLAMA_MOE_AUTOTUNE_CONFIRM_REQUESTS": str(int(args.confirm_tokens > args.tokens)),
                 "LLAMA_MOE_AUTOTUNE_NPRED": str(args.npred),
+                "LLAMA_MOE_AUTOTUNE_PREFETCH": str(args.prefetch_budget),
                 "LLAMA_MOE_AUTOTUNE_THRESHOLD": str(args.threshold),
                 "LLAMA_MOE_AUTOTUNE_CPU_CAP": str(args.cpu_cap),
-                "LLAMA_MOE_AUTOTUNE_MAX_PRED": "24",
-                "LLAMA_MOE_AUTOTUNE_DETAIL": str(int(args.detail or args.action != "serve"))})
-    command = [str(args.server), "-m", str(args.model),
-               "--spec-type", spec_type, "-ngl", "99", "-ngld", "99", "-c", str(args.ctx),
-               "-b", "512", "-ub", "512", "-np", "1", "-t", str(args.threads), "-tb", str(args.threads),
-               "--host", "127.0.0.1", "--port", str(port), "--fit", "off", "--load-mode", "none",
-               "--no-warmup", "--temp", "0", "--ctx-checkpoints", "0", "--reasoning", args.thinking, "--moe-substitute-threshold", "0",
-               "--n-cache-layers", str(args.cache_layers), "--n-cache-slots", str(args.slots),
-               "--n-cache-predict", "24", "--n-cache-pin", "32768",
-               "--spec-draft-n-max", str(draft_max), "--spec-draft-n-min", "0", "--spec-draft-p-min", "0",
-               "--spec-draft-threads", str(args.threads), "--spec-draft-threads-batch", str(args.threads)]
-    if args.draft_model:
-        command += ["-md", str(args.draft_model)]
-    return command, environment(env), {"identity": key, "command": command, "environment": env}
-
+                "LLAMA_MOE_AUTOTUNE_MAX_PREFETCH": str(min(8, args.npred)),
+                "LLAMA_MOE_AUTOTUNE_DETAIL": "1"})
+    command = replace_option(command, "--spec-draft-p-min", 0)
+    return command, environment(env), {"identity": key, "command": command, "environment": env,
+                                      "production": args.deployment,
+                                      "measurement_note": "Native instrumentation screens candidates only; final selection uses ordinary production servers."}
 
 def read_events(path, summaries_only=False):
     events = []
-    with path.open() as file:
+    with path.open(encoding="utf-8") as file:
         for line in file:
             if not line.endswith("\n"):
                 break
@@ -165,36 +222,39 @@ def print_ranking(title, rows, metric, top, selected=None):
     print(f"\n{title}: top {len(shown)} of {len(rows)} (TPOT lower is better; tok/s higher is better)")
     if not shown:
         return
-    print("rank  npred  threshold  cpu_cap    TPOT ms      tok/s  selected")
+    print("rank  copies  threshold  cpu_cap    TPOT ms      tok/s  selected")
     for row in shown:
         cfg = row["config"]
         marker = "*" if cfg == selected else ""
-        print(f"{row['rank']:4}  {cfg['npred']:5}  {cfg['threshold']:9.6g}  {cfg['cpu_cap']:7}  "
+        print(f"{row['rank']:4}  {cfg['prefetch_budget']:5}  {cfg['threshold']:9.6g}  {cfg['cpu_cap']:7}  "
               f"{row[metric]:9.3f}  {row['tokens_per_second']:9.2f}  {marker}")
 
 
 def export_rankings(root, recommendation, numerical_search, top):
     recommendation = recommendation or {}
     frontier = recommendation.get("candidate_frontier", [])
-    selected = recommendation.get("selected") if recommendation.get("status") == "validated" else None
+    session_path = root / "session.json"
+    session = json.loads(session_path.read_text(encoding="utf-8")) if session_path.exists() else {}
+    validation = session.get("production_validation", {})
+    selected = validation.get("selected") if validation.get("status") == "validated" else None
     result = {
-        "status": recommendation.get("status", "predicted"), "selected": selected,
-        "definitions": "Each stage is ranked separately by ascending TPOT in ms/token. tok/s = 1000 / TPOT. Screening and confirmation can use different output lengths. Predictions are not measurements. Missing scores are excluded. The native selection retains its tolerance policy and need not rank first.",
+        "status": validation.get("status", "screened"), "selected": selected, "native_selected": recommendation.get("selected"),
+        "definitions": "Each stage is ranked separately by ascending TPOT in ms/token. tok/s = 1000 / TPOT. Screening and confirmation can use different output lengths. Predictions are not measurements. Missing scores are excluded. Final selection uses ordinary production measurements with a 3 percent incumbent tolerance.",
     }
-    sources = (frontier, frontier, (numerical_search or {}).get("ranking", []))
+    sources = (frontier, frontier, (numerical_search or {}).get("ranking", []), validation.get("ranking", []))
     for (stage, metric, title), rows in zip(RANKING_METRICS, sources):
         result[stage] = rank_candidates(rows, metric)
         print_ranking(title, result[stage], metric, top, selected)
     write_json(root / "ranked-configs.json", result)
     with (root / "ranked-configs.csv").open("w", newline="", encoding="utf-8") as output:
         writer = csv.writer(output)
-        writer.writerow(("stage", "rank", "npred", "threshold", "cpu_cap", "tpot_ms", "tokens_per_second", "selected"))
+        writer.writerow(("stage", "rank", "prefetch_budget", "threshold", "cpu_cap", "tpot_ms", "tokens_per_second", "selected"))
         for stage, metric, _ in RANKING_METRICS:
             for row in result[stage]:
                 cfg = row["config"]
-                writer.writerow((stage, row["rank"], cfg["npred"], cfg["threshold"], cfg["cpu_cap"],
+                writer.writerow((stage, row["rank"], cfg["prefetch_budget"], cfg["threshold"], cfg["cpu_cap"],
                                  row[metric], row["tokens_per_second"], cfg == selected))
-    print("* = native validated selection; stage rankings remain separate.")
+    print("* = ordinary production server selection; stage rankings remain separate.")
     print(f"All ranked configurations: {root / 'ranked-configs.json'}")
     print(f"CSV: {root / 'ranked-configs.csv'}")
 
@@ -204,7 +264,7 @@ def search(tool, trace, output, request=None, top=5):
     if request is not None:
         command.append(str(request))
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
-    result = json.loads(output.read_text())
+    result = json.loads(output.read_text(encoding="utf-8"))
     print("Predicted recommendation:", json.dumps(result["selected"]),
           f"supported candidates={result['supported_candidates']}")
     print(f"Search compute={result['search_ms']:.3f} ms; load and search={result['load_and_search_ms']:.3f} ms")
@@ -220,7 +280,7 @@ def report(root, print_rounds=True, top=5):
     routes = [r for r in events if r["event"] == "route"]
     final = next((r for r in reversed(events) if r["event"] in ("final", "request_end", "window")), None)
     result_path = root / "search.json"
-    numerical_search = json.loads(result_path.read_text()) if result_path.exists() else None
+    numerical_search = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else None
     recommendation = next((r for r in reversed(events) if r["event"] == "recommendation"), numerical_search)
     if not final:
         raise ValueError("No completed calibration report; inspect server.log")
@@ -232,7 +292,7 @@ def report(root, print_rounds=True, top=5):
                "final": final, "recommendation": recommendation, "numerical_search": numerical_search,
                "online_recommendations": [e for e in events if e["event"] == "recommendation"]}
     if (root / "session.json").exists():
-        summary["session"] = json.loads((root / "session.json").read_text())
+        summary["session"] = json.loads((root / "session.json").read_text(encoding="utf-8"))
     write_json(root / "summary.json", summary)
     print(f"\nObserved {summary['sampled_round_count']} of {summary['round_count']} decode rounds (times in ms):")
     print(f"Cache replay records={summary['traced_round_count']}; service samples={summary['sampled_round_count']}")
@@ -281,14 +341,110 @@ def report(root, print_rounds=True, top=5):
     return summary
 
 
+def stop_server(process):
+    if process.poll() is None:
+        try:
+            process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+            process.wait(timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait()
+
+
+def wait_server(process, port, timeout):
+    deadline = time.monotonic() + timeout
+    while process.poll() is None and time.monotonic() < deadline:
+        try:
+            if http(port, "/health", timeout=2).get("status") == "ok":
+                return
+        except (urllib.error.URLError, TimeoutError):
+            pass
+        time.sleep(0.1)
+    raise RuntimeError("Production server did not become ready; inspect its log")
+
+
+def decode_token_count(timing):
+    return timing.get("decode_output_tokens", timing.get("predicted_n", 0))
+
+
+def production_validate(args, request, recommendation, directory_name="production-validation"):
+    baseline = args.deployment["selected"]
+    configs = [baseline]
+    frontier = recommendation["candidate_frontier"]
+    measured = sorted(frontier, key=lambda row: row.get("measured_tpot_ms") or row.get("screening_tpot_ms") or float("inf"))
+    for config in [recommendation["selected"]] + [r["config"] for r in measured[:3]] + [{"prefetch_budget": 0, "threshold": 0, "cpu_cap": 0}]:
+        if config not in configs:
+            configs.append(config)
+    # Timed collection can force a slower CPU fallback than ordinary CUDA graphs.
+    # Keep one CPU-enabled proposal even when instrumentation ranks all of them poorly.
+    search = json.loads((args.output / "search.json").read_text(encoding="utf-8"))
+    cpu_rows = [r for r in search.get("ranking", []) if r["config"]["cpu_cap"] > 0]
+    if cpu_rows:
+        cpu_config = min(cpu_rows, key=lambda r: r["predicted_tpot_ms"])["config"]
+        if cpu_config not in configs:
+            configs.append(cpu_config)
+    root = args.output / directory_name
+    root.mkdir()
+    rows = []
+    started = time.perf_counter()
+    for repeat in range(2):
+        order = range(len(configs)) if repeat == 0 else reversed(range(len(configs)))
+        for index in order:
+            config = configs[index]
+            prefix = root / f"config-{index}-repeat-{repeat + 1}"
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            command, overrides = production_command(args, port, config, prefix.with_suffix(".native.log"))
+            write_json(prefix.with_suffix(".manifest.json"), {"config": config, "command": command, "environment": overrides})
+            process = None
+            try:
+                with prefix.with_suffix(".log").open("w", encoding="utf-8") as log:
+                    process = subprocess.Popen(command, env=environment(overrides), stdout=log, stderr=subprocess.STDOUT,
+                                               creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+                    wait_server(process, port, args.timeout)
+                    warmup = dict(request, n_predict=128)
+                    write_json(prefix.with_suffix(".warmup.json"), http(port, "/completion", warmup, timeout=args.timeout))
+                    response = http(port, "/completion", dict(request, n_predict=args.confirm_tokens), timeout=args.timeout)
+                    write_json(prefix.with_suffix(".response.json"), response)
+                    timing = response.get("timings", {})
+                    n = decode_token_count(timing)
+                    ms = timing.get("predicted_ms", 0)
+                    if n < 64 or not math.isfinite(ms) or ms <= 0 or response.get("error"):
+                        raise ValueError("Invalid production validation response; no configuration will be selected")
+                    row = {"config": config, "repeat": repeat + 1, "timings": timing,
+                           "output_tokens": len(response.get("tokens", [])),
+                           "output_digest": digest(response.get("tokens", [])),
+                           "response": str(prefix.with_suffix(".response.json"))}
+                    rows.append(row)
+                    write_json(root / "measurements.json", rows)
+                    print(f"Production check {len(rows)}/{2 * len(configs)} {config}: "
+                          f"Prefill={timing.get('prompt_per_second', 0):.2f}, Decode={1000 * n / ms:.2f} tok/s", flush=True)
+            finally:
+                if process is not None:
+                    stop_server(process)
+    ranking = []
+    for config in configs:
+        samples = [r for r in rows if r["config"] == config]
+        ms = sum(r["timings"]["predicted_ms"] for r in samples)
+        n = sum(decode_token_count(r["timings"]) for r in samples)
+        ranking.append({"config": config, "tpot_ms": ms / n, "decode_tokens_per_second": 1000 * n / ms,
+                        "output_digests": [r["output_digest"] for r in samples]})
+    ranking.sort(key=lambda r: r["tpot_ms"])
+    incumbent = next(r for r in ranking if r["config"] == baseline)
+    selected = incumbent if incumbent["tpot_ms"] <= ranking[0]["tpot_ms"] * 1.03 else ranking[0]
+    result = {"status": "validated", "selected": selected["config"], "ranking": ranking, "directory": str(root),
+              "repeats": 2, "order": "forward then reverse; fresh server and excluded 128-token warmup per measurement",
+              "selection_rule": "Aggregate decode TPOT; retain incumbent within 3 percent of best measured candidate",
+              "elapsed_seconds": time.perf_counter() - started}
+    write_json(root / "result.json", result)
+    return result
+
+
 def run(args):
     args.output = args.output.resolve()
-    for name in ("server", "model"):
-        setattr(args, name, getattr(args, name).resolve(strict=True))
-    if args.draft_model:
-        args.draft_model = args.draft_model.resolve(strict=True)
-    if args.spec_type == "draft-dflash" and not args.draft_model:
-        raise ValueError("DFlash requires --draft-model")
+    args.deployment = deployment(args)
+    apply_cpu_set(args.deployment["cpu_set"], args.threads + args.expert_threads)
     if not 1 <= args.draft_max <= 7:
         raise ValueError("Draft maximum must be between 1 and 7")
     if args.action != "serve":
@@ -300,8 +456,8 @@ def run(args):
         args.warmup_tokens = 256 if args.spec_type == "draft-mtp" else 0
     if args.confirm_tokens is None:
         args.confirm_tokens = max(1024, args.tokens)
-    if not 0 <= args.npred <= 24 or not 0 <= args.threshold <= 1 or not 0 <= args.cpu_cap <= 8:
-        raise ValueError("Invalid fixed inference configuration")
+    if not 0 <= args.prefetch_budget <= min(8, args.npred) or not 0 <= args.npred <= 24 or not 0 <= args.threshold <= 1 or not 0 <= args.cpu_cap <= 8:
+        raise ValueError("Invalid fixed inference configuration exported by production launcher")
     if not 10 <= args.trial_budget <= 24 or (args.warmup_tokens != 0 and not 65 <= args.warmup_tokens <= 32768):
         raise ValueError("Invalid candidate trial budget or warmup length")
     if not args.tokens <= args.confirm_tokens <= 32768 or args.tokens < 65 or args.tokens > 32768 or args.ctx < 512 or args.threads < 1:
@@ -351,7 +507,7 @@ def run(args):
                     pass
                 time.sleep(0.1)
             session["elapsed_seconds"]["load_and_startup"] = time.perf_counter() - started
-            prompt = args.prompt.read_text()
+            prompt = args.prompt.read_text(encoding="utf-8-sig")
             if not args.raw_prompt:
                 prompt = http(port, "/apply-template", {"messages": [{"role": "user", "content": prompt}]})["prompt"]
             tokens = http(port, "/tokenize", {"content": prompt, "add_special": True})["tokens"]
@@ -359,7 +515,7 @@ def run(args):
                 raise ValueError("Prompt plus output exceeds context")
             session["input_tokens"] = len(tokens)
             session["requested_output_tokens"] = args.tokens
-            request = {"prompt": prompt, "n_predict": args.tokens, "temperature": 0, "seed": 20261027,
+            request = {"prompt": prompt, "n_predict": args.tokens, "temperature": 0, "seed": 42,
                        "cache_prompt": False, "return_tokens": True, "stream": False,
                        "ignore_eos": args.ignore_eos}
             write_json(args.output / "request.json", request)
@@ -429,12 +585,24 @@ def run(args):
         session["elapsed_seconds"]["native_search_total"] = sum(e["search_ms"] for e in events if e["event"] == "recommendation") / 1000
         print("Native recommendation:", json.dumps(session["recommended"]), session["selection_status"])
         session["elapsed_seconds"]["search_compute"] = result["search_ms"] / 1000
+        session["native_recommended"] = session["recommended"]
+        session["prediction_width"] = args.npred
+        session["elapsed_seconds"]["search"] = time.perf_counter() - search_started
+        if session["selection_status"] == "validated":
+            session["selection_status"] = "awaiting_production_validation"
+            session["recommended"] = None
+            write_json(args.output / "session.json", session)
+            validation = production_validate(args, request, recommendation)
+            session["production_validation"] = validation
+            session["elapsed_seconds"]["production_validation"] = validation["elapsed_seconds"]
+            session["recommended"] = validation["selected"]
+            session["selection_status"] = "validated"
         session["status"] = "complete" if session["selection_status"] == "validated" else "incomplete"
     except BaseException as error:
         session.update(status="failed", error=str(error))
         raise
     finally:
-        session["elapsed_seconds"]["search"] = time.perf_counter() - search_started
+        session["elapsed_seconds"].setdefault("search", time.perf_counter() - search_started)
         session["elapsed_seconds"]["total"] = time.perf_counter() - started
         write_json(args.output / "session.json", session)
     report(args.output, top=args.top)
@@ -448,7 +616,7 @@ def main():
         p = sub.add_parser(action, aliases=["calibrate"] if action == "tune" else [],
                            help="Collect calibration data and search in one call" if action == "tune" else "Collect real requests and compare retained configurations after responses")
         p.set_defaults(action=action)
-        p.add_argument("--server", type=Path, required=True)
+        p.add_argument("--launcher", type=Path, default=Path(__file__).resolve().parents[1] / "start-server.ps1", help="Production launcher exporting --export-config")
         p.add_argument("--check-gpu-idle", action="store_true", help="Require an idle GPU before starting")
         if action == "tune":
             p.add_argument("--tool", type=Path, help="Compatibility option; tune uses the native server search")
@@ -456,11 +624,8 @@ def main():
         else:
             p.add_argument("--sample-tokens", type=int, default=20, help="Collect after each N output tokens; default 20, plus the first decode step")
             p.add_argument("--observe-only", action="store_true", help="Collect without selecting a configuration for the next request")
-        p.add_argument("--model", type=Path, required=True)
-        p.add_argument("--spec-type", choices=("draft-dflash", "draft-mtp"), default="draft-dflash")
-        p.add_argument("--draft-max", type=int, default=7, help="Draft limit per session: 1..7, also bounded by the draft model's capacity")
-        p.add_argument("--draft-model", type=Path, help="Required for DFlash; MTP defaults to the heads embedded in --model")
-        p.add_argument("--gpu", required=True)
+
+        p.add_argument("--gpu", help="Override the production CUDA device")
         p.add_argument("--output", type=Path, required=True)
         p.add_argument("--profile", type=Path, help="Read/update a compatible cost profile; default OUTPUT/costs.json")
         p.add_argument("--prompt", type=Path)
@@ -468,15 +633,7 @@ def main():
         p.add_argument("--confirm-tokens", type=int, help="Confirmation output length; defaults to max(1024, --tokens)")
         p.add_argument("--warmup-tokens", type=int, help="Candidate warmup output; defaults to 256 for MTP, zero for DFlash")
         p.add_argument("--trial-budget", type=int, default=24, help="Maximum screening and confirmation requests combined")
-        p.add_argument("--ctx", type=int, default=8192)
-        p.add_argument("--slots", type=int, default=64)
-        p.add_argument("--cache-layers", type=int, default=4)
-        p.add_argument("--threads", type=int, default=4)
-        p.add_argument("--expert-threads", type=int, default=8, help="Hybrid CPU expert pool size")
-        p.add_argument("--thinking", choices=("on", "off"), default="off", help="Enable thinking in chat templates")
-        p.add_argument("--npred", type=int, default=0, help="Initial online prediction prefix width")
-        p.add_argument("--threshold", type=float, default=0, help="Initial online draft threshold")
-        p.add_argument("--cpu-cap", type=int, default=0, help="Initial online CPU expert cap")
+        p.add_argument("--thinking", choices=("on", "off"), default=None, help="Override the production thinking setting")
         p.add_argument("--window", type=int, default=32, help="Collected timing samples per report; search uses the whole request")
         p.add_argument("--cost-rounds", type=int, default=48, help="Measured cost probes after one unmeasured warmup pass; zero disables both")
         p.add_argument("--timeout", type=int, default=600)

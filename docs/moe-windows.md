@@ -68,10 +68,39 @@ $env:PROMPT_FILE = 'D:\prompts\representative.txt'
 ./run-autotune.ps1
 ```
 
-The autotuner exports separate predicted, screened and confirmed rankings.
-Only a configuration that passes native validation is selected. Model predictions
-are not measured throughput. The Python entry point is `scripts/moe_adaptive.py`;
-`--check-gpu-idle` optionally checks for other GPU workloads before starting.
+The autotuner reads `start-server.ps1 --export-config`; it has no separate inference
+defaults. This includes the batch sizes, MTP ubatch, cache slots, decay policy,
+pin budget, CPU affinity and optimized CUDA paths. `NPRED` stays fixed. Search
+varies the missing-expert prefetch copy budget (0 through 8, bounded by `NPRED`),
+draft threshold (0, 0.4, 0.6, 0.8) and CPU expert cap (0, 2, 4, 8). A zero copy
+budget still keeps the fixed prediction graph; it is not the same as `NPRED=0`.
+
+Native instrumentation and the hybrid pool remain enabled while screening, so
+those timings are not final production throughput. The finalists, the incumbent
+and the zero-control configuration are checked with ordinary servers. The best
+model proposal with CPU diversion also gets checked even if instrumentation ranked
+it poorly. These servers have no tuning
+instrumentation, and no hybrid pool at CPU cap zero. Each configuration gets two
+measurements in forward/reverse order, each in a fresh server with an excluded
+128-token warmup. The final selection minimizes aggregate decode ms/token and
+retains the incumbent when it is within 3 percent of the fastest measured candidate.
+Decode uses `decode_output_tokens`, excluding the token produced during prefill.
+This is a local selection for the supplied prompt, not a global optimum.
+
+`selected-config.json` is exported only after ordinary-server validation finishes.
+Apply its `selected.prefetch_budget`, `selected.threshold` and `selected.cpu_cap`
+as `PREFETCH_BUDGET`, `DRAFT_THRESHOLD` and `CPU_CAP`; keep its `prediction_width`
+as `NPRED`. The full resolved deployment is in `manifest.json`. The new trace
+format uses `prefetch_budget`; old prefix-width traces and cost profiles must be
+recollected. `production-validation` contains each complete response, timings,
+command and server log. Rankings distinguish predictions, native screening,
+native confirmation and ordinary production measurements.
+
+The Python entry point is `scripts/moe_adaptive.py`; `--check-gpu-idle` optionally
+checks for other GPU workloads. It now uses `--launcher` and production environment
+overrides instead of a second set of model/cache/batch command-line options.
+Online `serve` still collects instrumented observations; only standalone `tune`
+performs the ordinary-server final check.
 
 Local prompts, generated logs, profiler captures and benchmark outputs are ignored
 by Git. Numerical regression coverage is maintained in `tests/test-backend-ops.cpp`,
