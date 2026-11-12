@@ -2424,6 +2424,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MOE_GATE:
             ggml_cuda_op_moe_gate(ctx, dst, capturing);
             break;
+        case GGML_OP_MOE_CPU:
+            ggml_cuda_op_moe_cpu(ctx, dst, capturing);
+            break;
         case GGML_OP_UPSCALE:
             ggml_cuda_op_upscale(ctx, dst);
             break;
@@ -5753,6 +5756,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            )
                        );
             } break;
+        case GGML_OP_MOE_CPU:
+            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
         case GGML_OP_MOE_GATE:
             return ggml_is_contiguous(op->src[1]) &&
                    (ggml_get_op_params_i32(op, 4) == GGML_MOE_GATE_MODE_NORMAL ||
@@ -6110,6 +6115,17 @@ static int ggml_backend_cuda_moe_cpu_max_tokens(ggml_backend_t backend, ggml_typ
     return ggml_is_quantized(type) ? get_mmvq_mmid_max_batch(type, ggml_cuda_info().devices[ctx->device].cc) : 0;
 }
 
+static void * ggml_backend_cuda_moe_cpu_graph_map(ggml_backend_t backend, ggml_moe_cpu_graph * host) {
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    void * device = nullptr;
+    if (cudaHostGetDevicePointer(&device, host, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return device;
+}
+
 static bool ggml_backend_cuda_moe_cpu_merge_begin(ggml_backend_t backend, ggml_tensor * dst, const float * values, const int32_t * rows, int count, const uint32_t * complete) {
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(ctx->device);
@@ -6132,6 +6148,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_moe_cpu_merge_begin") == 0) {
         return (void *) ggml_backend_cuda_moe_cpu_merge_begin;
+    }
+    if (strcmp(name, "ggml_backend_moe_cpu_graph_map") == 0) {
+        return (void *) ggml_backend_cuda_moe_cpu_graph_map;
     }
     if (strcmp(name, "ggml_backend_moe_cpu_merge") == 0) {
         return (void *) ggml_backend_cuda_moe_cpu_merge;

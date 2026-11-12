@@ -1213,6 +1213,81 @@ static void ggml_moe_tune_gpu_measure(ggml_moe_runtime * sched, ggml_moe_slot_st
     timer(backend, &st->cpu->tune_timer, phase == 1 ? 2 : phase);
 }
 
+bool ggml_moe_runtime_prepare_cpu_graph(ggml_moe_runtime * sched, ggml_backend_t backend, ggml_cgraph * graph, bool allow) {
+    std::lock_guard<std::mutex> lock(sched->moe_mutex);
+    std::unique_lock<std::mutex> cpu_lock;
+    if (sched->cpu_worker) cpu_lock = std::unique_lock<std::mutex>(sched->cpu_worker->mutex);
+    const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    auto map = (ggml_moe_cpu_graph_map_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_cpu_graph_map");
+    const char * enabled = getenv("GGML_MOE_CPU_GRAPH");
+    // Detailed autotune measurements still need host-side timing boundaries.
+    allow = allow && map && !(sched->online_enabled && sched->online_profile) && (!enabled || atoi(enabled) != 0);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto * node = graph->nodes[i];
+        if (node->op == GGML_OP_MOE_CPU) {
+            const int layer = ggml_get_op_params_i32(node, 0);
+            GGML_ASSERT(layer >= 0 && layer < sched->n_moe_caches && sched->moe_caches[layer]->cpu);
+            sched->moe_caches[layer]->cpu->graph_active = false;
+        }
+    }
+    if (!allow) return false;
+    GGML_ASSERT(sched->moe_seq_t && sched->moe_seq_t->data);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        auto * node = graph->nodes[i];
+        if (node->op != GGML_OP_MOE_CPU || ggml_get_op_params_i32(node, 1) == 1) continue;
+        if (ggml_get_op_params_i32(node, 1) == 0 && node->src[0]->op == GGML_OP_MOE_CPU) continue;
+        auto * st = sched->moe_caches[ggml_get_op_params_i32(node, 0)];
+        auto & cpu = *st->cpu;
+        const auto * input = node->src[0];
+        const int max_rows = std::min(GGML_MOE_GATE_MAX_IDS, st->cache.cpu_expert_max_tokens * st->n_expert_used);
+        GGML_ASSERT(input->ne[0] > 0 && input->ne[0] <= INT_MAX / (max_rows + st->cache.cpu_expert_max_tokens));
+        int reserve = max_rows;
+        if (!st->cache.cpu_expert_early && sched->cpu_max_experts >= 0) {
+            reserve = std::max(1, std::min(reserve, sched->cpu_max_experts * std::min(st->cache.cpu_expert_max_tokens, sched->cpu_min_tokens - 1)));
+        }
+        if (cpu.output_pending) {
+            ggml_backend_event_synchronize(cpu.output_done);
+            cpu.output_pending = false;
+        }
+        if (cpu.reserved_count < reserve) {
+            cpu.cold.assign(reserve, 0);
+            const bool ok = ggml_moe_runtime_cpu_buffers(st, backend, input);
+            cpu.cold.clear();
+            if (!ok) return false;
+            cpu.reserved_count = reserve;
+        }
+        if (!cpu.mailbox) {
+            const int input_size = input->ne[0] * st->cache.cpu_expert_max_tokens;
+            GGML_ASSERT(size_t(input_size) + size_t(max_rows) * input->ne[0] <= (SIZE_MAX - sizeof(ggml_moe_cpu_graph)) / sizeof(float));
+            const size_t size = sizeof(ggml_moe_cpu_graph) + (input_size + size_t(max_rows) * input->ne[0]) * sizeof(float);
+            const auto pin = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+            cpu.graph_staging = ggml_backend_buft_alloc_buffer(pin, size);
+            if (!cpu.graph_staging) return false;
+            cpu.mailbox = (ggml_moe_cpu_graph *) ggml_backend_buffer_get_base(cpu.graph_staging);
+            memset(cpu.mailbox, 0, sizeof(*cpu.mailbox));
+            cpu.mailbox->input_size = input_size;
+            cpu.mailbox_device = map(backend, cpu.mailbox);
+        }
+        if (!cpu.mailbox_device) return false;
+        GGML_ASSERT(ggml_nelements(input) <= cpu.mailbox->input_size);
+        cpu.staged_input = input;
+    }
+    if (!sched->cpu_worker) {
+        sched->cpu_worker = new ggml_moe_cpu_worker;
+        sched->cpu_worker->thread = std::thread(ggml_moe_runtime_cpu_worker_run, sched);
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        auto * node = graph->nodes[i];
+        if (node->op != GGML_OP_MOE_CPU) continue;
+        auto & cpu = *sched->moe_caches[ggml_get_op_params_i32(node, 0)]->cpu;
+        cpu.graph_active = true;
+        memcpy(node->op_params + 2, &cpu.mailbox_device, sizeof(cpu.mailbox_device));
+        memcpy(node->op_params + 4, &sched->moe_seq_t->data, sizeof(sched->moe_seq_t->data));
+        memcpy(node->op_params + 6, &cpu.mailbox, sizeof(cpu.mailbox));
+    }
+    return true;
+}
+
 enum ggml_status ggml_moe_runtime_compute_cpu_node(ggml_moe_runtime * sched, ggml_backend_t backend, ggml_tensor * node) {
     GGML_ASSERT(node->op == GGML_OP_MOE_CPU);
     const int layer = ggml_get_op_params_i32(node, 0);
