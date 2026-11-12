@@ -107,6 +107,10 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
+    draft-acceptance-model.h
+    draft-acceptance-gpu.h
+    draft-acceptance-profile.h
+    draft-acceptance-trace.h
     subproc.cpp
     subproc.h
     trie.cpp

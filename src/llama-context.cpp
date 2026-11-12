@@ -1026,6 +1026,30 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
     return j;
 }
 
+bool llama_context::get_draft_acceptance_inputs(ggml_tensor ** logits_out, ggml_tensor ** hidden_out, ggml_backend_t * backend_out) {
+    if (!gf_res_prev_active) {
+        return false;
+    }
+    auto * logits_tensor = gf_res_prev_active->get_logits();
+    auto * hidden_tensor = gf_res_prev_active->get_embd();
+    if (!logits_tensor || !hidden_tensor || logits_tensor->ne[1] != n_outputs || hidden_tensor->ne[1] != n_outputs) {
+        return false;
+    }
+    auto backend = ggml_backend_sched_get_tensor_backend(sched.get(), logits_tensor);
+    if (!backend || backend != ggml_backend_sched_get_tensor_backend(sched.get(), hidden_tensor)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_outputs; ++i) {
+        if (output_resolve_row(i) != i) {
+            return false;
+        }
+    }
+    *logits_out = logits_tensor;
+    *hidden_out = hidden_tensor;
+    *backend_out = backend;
+    return true;
+}
+
 float * llama_context::get_logits_ith(int32_t i) {
     output_reorder();
 
@@ -4095,6 +4119,10 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+bool llama_get_draft_acceptance_inputs(llama_context * ctx, ggml_tensor ** logits, ggml_tensor ** hidden, ggml_backend_t * backend) {
+    return ctx->get_draft_acceptance_inputs(logits, hidden, backend);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

@@ -24,6 +24,7 @@
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
+#include "ggml-cuda/draft-acceptance.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
@@ -6252,6 +6253,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) ggml_backend_cuda_moe_cpu_merge;
     }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_draft_acceptance_init") == 0) {
+        return (void *) ggml_cuda_draft_acceptance_init;
+    }
+#endif
     if (strcmp(name, "ggml_backend_moe_get_caps") == 0) {
         return (void *) ggml_backend_cuda_moe_get_caps;
     }
