@@ -12,6 +12,7 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-context.m
                          ggml-metal-fusion.cpp
                          ggml-metal-moe.m
+                         ggml-metal-prefill.cpp
                          ggml-metal-ops.cpp
                          ggml-metal-tuning.cpp
                         )
@@ -282,3 +283,4 @@ if (NOT GGML_METAL_EMBED_LIBRARY)
     )
 endif()
 
+set_source_files_properties(ggml-metal-prefill.cpp PROPERTIES COMPILE_OPTIONS "-fblocks")

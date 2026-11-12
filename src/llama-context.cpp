@@ -1411,6 +1411,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // prefill layer-ring lifecycle: arm the ring ahead of a prefill graph, stand it down before a
+    // decode graph (decode owns the banks through the slot cache + host gate instead)
+    if (moe_prefill) {
+        if (ubatch.n_seq_tokens > 1) {
+            moe_prefill->prepare_prefill();
+        } else if (moe_prefill->active()) {
+            // the prefill graph's command buffers may still be in flight; drain them so the
+            // sidecar never writes a ring slot the GPU is still reading
+            ggml_backend_sched_synchronize(sched.get());
+            moe_prefill->release_prefill_buffers();
+        }
+    }
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -2608,6 +2621,7 @@ llm_graph_params llama_context::graph_params(
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.moe_prefill =*/ (ubatch.n_seq_tokens > 1) ? moe_prefill.get() : nullptr,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };

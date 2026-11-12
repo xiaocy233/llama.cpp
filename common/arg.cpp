@@ -2787,6 +2787,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        {"--cache-disk"},
+        "streaming layers' expert banks stay in the GGUF file instead of host memory, read on\n"
+        "demand with pread. Halves the RAM footprint on unified-memory machines (Metal).\n"
+        "Only meaningful with -nclayers. Requires --load-mode none.",
+        [](common_params & params) {
+            params.cache_disk = true;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK"));
+    add_opt(common_arg(
+        {"-ncpb", "--n-cache-prefill-buffers"}, "N",
+        string_format("full-layer ring buffers the prefill stage rotates through while streaming\n"
+                      "experts from disk (Metal, needs --cache-disk; default: %d)",
+                      params.n_cache_prefill_buffers > 0 ? params.n_cache_prefill_buffers : 2),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 16) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_cache_prefill_buffers = value;
+        }
+    ).set_env("LLAMA_ARG_N_CACHE_PREFILL_BUFFERS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
