@@ -1,4 +1,5 @@
 #include "moe-gate.cuh"
+#include "../ggml-moe-backend.h"
 
 #include "ggml-backend.h"
 
@@ -41,7 +42,7 @@ static __global__ void moe_gate_kernel(
         int32_t * __restrict__ out,
         const float * __restrict__ probs,
         const int n_ids, const int n_pred, const int layer, const int n_slots,
-        const int n_expert, const float threshold) {
+        const int n_expert, const float threshold, const bool hybrid) {
     const uint32_t seq = (uint32_t) *seq_p;
     const int      t   = threadIdx.x;
 
@@ -71,7 +72,7 @@ static __global__ void moe_gate_kernel(
             box->miss_mask = s_miss;
             box->n_ids     = (uint32_t) n_ids;
             box->n_pred    = (uint32_t) n_pred;
-            box->mode     = probs ? GGML_MOE_GATE_MODE_SUBSTITUTE : GGML_MOE_GATE_MODE_NORMAL;
+            box->mode     = hybrid ? GGML_MOE_GATE_MODE_HYBRID : probs ? GGML_MOE_GATE_MODE_SUBSTITUTE : GGML_MOE_GATE_MODE_NORMAL;
             box->substitute_threshold = threshold;
             uint32_t hash = 0;
             if (probs) {
@@ -112,6 +113,10 @@ static __global__ void moe_gate_kernel(
 
     // The worker selects substitutes and fills all remaining misses before release.
     for (int i = t; i < n_ids; i += blockDim.x) {
+        if (hybrid) {
+            out[i] = ((volatile const int32_t *) box->selected_ids)[i];
+            continue;
+        }
         const int32_t e = probs ? ((volatile const int32_t *) box->selected_ids)[i] : ids_in[i];
         int32_t       p = moe_gate_loc(loc_map, e);
         if (p >= n_slots) {
@@ -155,12 +160,22 @@ void ggml_cuda_op_moe_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst, b
     const int n_ids   = ggml_get_op_params_i32(dst, 1);
     const int n_pred  = ggml_get_op_params_i32(dst, 2);
     const int n_slots = ggml_get_op_params_i32(dst, 3);
+    if (ggml_get_op_params_i32(dst, 4) == GGML_MOE_GATE_MODE_HEAD) {
+        const ggml_cuda_moe_gate_channel & ch = ctx.moe_gate_channel();
+        GGML_ASSERT(n_ids > 0 && n_ids <= GGML_MOE_GATE_MAX_IDS && n_pred <= GGML_MOE_GATE_MAX_IDS);
+        GGML_ASSERT(layer >= 0 && layer < GGML_MOE_GATE_MAX_LAYERS);
+        moe_head_kernel<<<1, 32, 0, ctx.stream()>>>(
+                (const int32_t *) loc_map->data, (const int32_t *) ids_in->data,
+                (const int32_t *) seq->data, ch.ring_dev, (int32_t *) dst->data, layer, n_ids, n_pred);
+        return;
+    }
+    const bool hybrid = ggml_get_op_params_i32(dst, 4) == GGML_MOE_GATE_MODE_HYBRID;
     const bool substitute = ggml_get_op_params_i32(dst, 4) == GGML_MOE_GATE_MODE_SUBSTITUTE;
     const float * probs = substitute ? (const float *) dst->src[3]->data : nullptr;
     const float threshold = substitute ? ggml_get_op_params_f32(dst, 5) : 0.0f;
     const int n_expert = (int) ggml_nelements(loc_map);
 
-    GGML_ASSERT(n_ids > 0 && n_ids <= 32 && n_ids + n_pred <= GGML_MOE_GATE_MAX_IDS);   // miss_mask caps n_ids
+    GGML_ASSERT(n_ids > 0 && (hybrid || n_ids <= n_slots) && n_ids + n_pred <= GGML_MOE_GATE_MAX_IDS);
     GGML_ASSERT(layer < GGML_MOE_GATE_MAX_LAYERS);
 
     const ggml_cuda_moe_gate_channel & ch = ctx.moe_gate_channel();
@@ -168,13 +183,13 @@ void ggml_cuda_op_moe_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst, b
         moe_gate_kernel<true, true><<<1, 32, 0, ctx.stream()>>>(
                 (const int32_t *) loc_map->data, (const int32_t *) ids_in->data,
                 (const int32_t *) seq->data, ch.ring_dev, ch.release_dev, ch.timeout_dev,
-                (int32_t *) dst->data, probs, n_ids, n_pred, layer, n_slots, n_expert, threshold);
+                (int32_t *) dst->data, probs, n_ids, n_pred, layer, n_slots, n_expert, threshold, hybrid);
     } else {
         // A parked kernel can block driver submission before capture. Wait on the host between kernels.
         moe_gate_kernel<true, false><<<1, 32, 0, ctx.stream()>>>(
                 (const int32_t *) loc_map->data, (const int32_t *) ids_in->data,
                 (const int32_t *) seq->data, ch.ring_dev, ch.release_dev, ch.timeout_dev,
-                (int32_t *) dst->data, probs, n_ids, n_pred, layer, n_slots, n_expert, threshold);
+                (int32_t *) dst->data, probs, n_ids, n_pred, layer, n_slots, n_expert, threshold, hybrid);
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
         const uint32_t token = ((volatile const ggml_moe_gate_entry *) ch.ring_host)[layer].seq;
         const int64_t start = ggml_time_us();
@@ -188,6 +203,79 @@ void ggml_cuda_op_moe_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst, b
         moe_gate_kernel<false, true><<<1, 32, 0, ctx.stream()>>>(
                 (const int32_t *) loc_map->data, (const int32_t *) ids_in->data,
                 (const int32_t *) seq->data, ch.ring_dev, ch.release_dev, ch.timeout_dev,
-                (int32_t *) dst->data, probs, n_ids, n_pred, layer, n_slots, n_expert, threshold);
+                (int32_t *) dst->data, probs, n_ids, n_pred, layer, n_slots, n_expert, threshold, hybrid);
     }
+}
+
+static __global__ void moe_cpu_merge_kernel(float * dst, const float * values, const int32_t * rows, int width) {
+    const int row = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < width) {
+        dst[(int64_t) rows[row] * width + col] = values[(int64_t) row * width + col];
+    }
+}
+
+void ggml_cuda_moe_cpu_merge(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float * values, const int32_t * rows, int count) {
+    GGML_ASSERT(count > 0 && ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32);
+    ggml_cuda_pool_alloc<float> values_dev(ctx.pool(), count * dst->ne[0]);
+    ggml_cuda_pool_alloc<int32_t> rows_dev(ctx.pool(), count);
+    CUDA_CHECK(cudaMemcpyAsync(values_dev.get(), values, count * dst->ne[0] * sizeof(float), cudaMemcpyHostToDevice, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(rows_dev.get(), rows, count * sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
+    const dim3 blocks((dst->ne[0] + 255) / 256, count);
+    moe_cpu_merge_kernel<<<blocks, 256, 0, ctx.stream()>>>((float *) dst->data, values_dev.get(), rows_dev.get(), dst->ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static __global__ void moe_cpu_wait_kernel(const volatile uint32_t * complete, uint32_t * status) {
+    const uint64_t start = moe_gate_now_ns();
+    uint32_t value;
+    while ((value = *complete) == 0) {
+        if (moe_gate_now_ns() - start > MOE_GATE_TIMEOUT_NS) {
+            __trap();
+        }
+        moe_gate_relax();
+    }
+    __threadfence_system();
+    *status = value;
+}
+
+struct moe_cpu_row_indices {
+    int32_t ids[32];
+};
+
+static __global__ void moe_cpu_merge_mapped_kernel(float * dst, const float * values, moe_cpu_row_indices rows, int width, const uint32_t * complete) {
+    if (*complete != 1) {
+        return;
+    }
+    const int row = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < width) {
+        dst[(int64_t) rows.ids[row] * width + col] = values[(int64_t) row * width + col];
+    }
+}
+
+bool ggml_cuda_moe_cpu_merge_begin(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float * values, const int32_t * rows, int count, const uint32_t * complete) {
+    GGML_ASSERT(count > 0 && ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32);
+    if (count > 32 || count * dst->ne[0] * sizeof(float) > 65536) {
+        return false;
+    }
+    float * mapped_values = nullptr;
+    uint32_t * mapped_complete = nullptr;
+    cudaError_t result = cudaHostGetDevicePointer((void **) &mapped_values, const_cast<float *>(values), 0);
+    if (result == cudaSuccess) {
+        result = cudaHostGetDevicePointer((void **) &mapped_complete, const_cast<uint32_t *>(complete), 0);
+    }
+    if (result != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    // Queue after the hot experts. The CPU publishes only after writing all results.
+    ggml_cuda_pool_alloc<uint32_t> status_dev(ctx.pool(), 1);
+    moe_cpu_wait_kernel<<<1, 1, 0, ctx.stream()>>>(mapped_complete, status_dev.get());
+    moe_cpu_row_indices indices{};
+    memcpy(indices.ids, rows, count * sizeof(int32_t));
+    const dim3 blocks((dst->ne[0] + 255) / 256, count);
+    moe_cpu_merge_mapped_kernel<<<blocks, 256, 0, ctx.stream()>>>((float *) dst->data, mapped_values, indices, dst->ne[0], status_dev.get());
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
