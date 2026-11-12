@@ -2820,6 +2820,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_PROFILE"));
     add_opt(common_arg(
+        {"--moe-substitute-threshold"}, "N",
+        "replace missing experts below normalized routing weight N with resident experts\n"
+        "Qwen3.5 MoE, CUDA/Metal slot-cache decode only; range [0, 1] (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            size_t end = 0;
+            const float threshold = std::stof(value, &end);
+            if (end != value.size() || !std::isfinite(threshold) || threshold < 0.0f || threshold > 1.0f) {
+                throw std::invalid_argument("moe-substitute-threshold must be finite and in [0, 1]");
+            }
+            params.moe_substitute_threshold = threshold;
+        }
+    ));
+    add_opt(common_arg(
         {"-ncpred", "--n-cache-predict"}, "N",
         string_format("predict N experts one layer ahead and prefetch them into the slot cache\n"
                       "(the next cached layer's router is applied to this layer's hidden state)\n"

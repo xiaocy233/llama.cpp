@@ -116,6 +116,12 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
+    if (!std::isfinite(params.moe_substitute_threshold) ||
+            params.moe_substitute_threshold < 0.0f || params.moe_substitute_threshold > 1.0f) {
+        throw std::invalid_argument("moe_substitute_threshold must be finite and in [0, 1]");
+    }
+    cparams.moe_substitute_threshold = params.moe_substitute_threshold;
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -1327,6 +1333,11 @@ bool llama_context::get_causal_attn() const {
     return cparams.causal_attn;
 }
 
+void llama_context::set_moe_generation_count(llama_seq_id seq_id, int32_t n_generated) {
+    GGML_ASSERT(seq_id >= 0 && n_generated >= 0);
+    moe_generation_counts[seq_id] = n_generated;
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1530,6 +1541,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    if (cparams.moe_substitute_threshold > 0.0f) {
+        constexpr int32_t protected_tokens = 5;
+        bool enabled = ubatch.n_tokens == 1;
+        for (int32_t s = 0; enabled && s < ubatch.n_seq_id[0]; ++s) {
+            const auto it = moe_generation_counts.find(ubatch.seq_id[0][s]);
+            enabled = it != moe_generation_counts.end() && it->second >= protected_tokens;
+        }
+        ggml_backend_sched_set_moe_substitute_enabled(sched.get(), enabled);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -4062,6 +4083,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 bool llama_get_causal_attn(const llama_context * ctx) {
     return ctx->get_causal_attn();
+}
+
+void llama_set_moe_generation_count(llama_context * ctx, llama_seq_id seq_id, int32_t n_generated) {
+    ctx->set_moe_generation_count(seq_id, n_generated);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
