@@ -10646,6 +10646,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Long recurrent prefill: partial input tiles and speculative rollback states.
+    for (int n : { 257, 2048 }) {
+        for (int snapshots : { 1, 4 }) {
+            for (bool permuted : { false, true }) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, n, 2, 2, permuted, false, snapshots));
+            }
+        }
+    }
+
+    // Sparse expert routing with long prefill and partial final tiles.
+    for (ggml_type type : { GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q6_K }) {
+        for (int n : { 257, 2048 }) {
+            for (bool broadcast : { false, true }) {
+                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, broadcast, 128, n, 512));
+            }
+        }
+    }
+
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     // more than 256 experts (hoisted row-id path): 512 as in Qwen3.8-Flash-Next,
