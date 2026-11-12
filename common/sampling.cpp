@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -156,9 +157,37 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+            // Compact only when no consumer needs the full candidate array.
+            // Keep the sampler chain and its random-state advancement unchanged.
+            static const bool compact_greedy = [] {
+                const char * value = std::getenv("LLAMA_COMPACT_GREEDY");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            int32_t n_suppress = 0;
+            if (compact_greedy) {
+                llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+            }
+            const bool can_compact = compact_greedy && n_vocab > 0 &&
+                !grmr && !rbudget && n_suppress == 0 && params.logit_bias.empty() &&
+                params.n_probs == 0 && params.mirostat == 0 && params.temp <= 0.0f &&
+                params.dynatemp_range == 0.0f && params.samplers.size() == 1 &&
+                params.samplers[0] == COMMON_SAMPLER_TYPE_TEMPERATURE;
+            llama_token best = 0;
+            if (can_compact) {
+                for (llama_token i = 1; i < n_vocab; ++i) {
+                    if (logits[i] > logits[best]) {
+                        best = i; // strict comparison preserves the first tied maximum
+                    }
+                }
+            }
+            if (can_compact && std::isfinite(logits[best])) {
+                cur.resize(1);
+                cur[0] = llama_token_data{best, logits[best], 0.0f};
+            } else {
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
             }
         }
 
